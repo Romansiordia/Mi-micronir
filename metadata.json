@@ -1,0 +1,7 @@
+{
+  "name": "MicroNIR Quantum Control",
+  "description": "A professional-grade interface for MicroNIR spectrometers, featuring real-time PLS chemometric analysis, hardware diagnostics, and AI-powered spectral interpretation using Gemini.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
