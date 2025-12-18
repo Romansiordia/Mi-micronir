@@ -78,25 +78,40 @@ const App: React.FC = () => {
   };
 
   const runCalibration = async (type: 'dark' | 'reference') => {
+    if (!isConnected && !simulationMode) {
+      addLog("Conecte el sensor antes de calibrar.", "error");
+      return;
+    }
+
     setIsMeasuring(true);
     const sourceTag = simulationMode ? "[SIM]" : "[HW]";
-    addLog(`${sourceTag} Capturando ${type}...`, "info");
-    const raw = await microNir.readSpectrum();
-    if (raw) {
-      setCalib(prev => {
-        const next = { ...prev, [type]: Array.from(raw) };
-        const hasBoth = (type === 'dark' && !!prev.reference) || (type === 'reference' && !!prev.dark);
-        next.step = hasBoth ? 'ready' : type;
-        return next;
-      });
-      addLog(`${sourceTag} ${type.toUpperCase()} completado.`, "success");
+    addLog(`${sourceTag} Iniciando captura de ${type.toUpperCase()}...`, "info");
+    
+    try {
+      // Para Dark Scan en hardware real, usualmente se apaga la lámpara o se usa tapón negro
+      const raw = await microNir.readSpectrum();
+      
+      if (raw) {
+        setCalib(prev => {
+          const next = { ...prev, [type]: Array.from(raw) };
+          const hasBoth = (type === 'dark' && !!prev.reference) || (type === 'reference' && !!prev.dark);
+          next.step = hasBoth ? 'ready' : type;
+          return next;
+        });
+        addLog(`${sourceTag} Calibración ${type.toUpperCase()} guardada con éxito.`, "success");
+      } else {
+        addLog(`${sourceTag} Error: No se recibieron datos del sensor para ${type}.`, "error");
+      }
+    } catch (err) {
+      addLog(`Fallo crítico en calibración ${type}: ${err}`, "error");
+    } finally {
+      setIsMeasuring(false);
     }
-    setIsMeasuring(false);
   };
 
   const runScan = async () => {
     if (calib.step !== 'ready' && !simulationMode) {
-      addLog("BLOQUEO: Calibración necesaria.", "error");
+      addLog("BLOQUEO: Calibración necesaria (Dark y White).", "error");
       return;
     }
     setIsMeasuring(true);
@@ -109,6 +124,7 @@ const App: React.FC = () => {
       const absData = sample.map((s, i) => {
         const d = calib.dark?.[i] || 0;
         const r = calib.reference?.[i] || 65535;
+        // Cálculo de Absorbancia: -log10((Muestra - Dark) / (Referencia - Dark))
         const refl = Math.min(Math.max((s - d) / Math.max(r - d, 1), 0.0001), 1.0);
         return -Math.log10(refl);
       });
@@ -171,6 +187,50 @@ const App: React.FC = () => {
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
         <aside className="lg:col-span-4 space-y-6">
+          {/* PANEL DE CALIBRACIÓN REINSTALADO */}
+          <div className="glass-panel p-8 rounded-[2.5rem] border-white/5">
+            <h3 className="text-[10px] font-black text-slate-500 uppercase tracking-widest mb-6 flex items-center gap-2">
+              <FlaskConical size={14} className="text-blue-400" /> Protocolo de Calibración
+            </h3>
+            <div className="grid grid-cols-1 gap-3">
+              <button 
+                disabled={!isConnected || isMeasuring} 
+                onClick={() => runCalibration('dark')} 
+                className={`flex items-center justify-between p-4 rounded-2xl border transition-all ${calib.dark ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-400' : 'bg-slate-900/60 border-white/5 text-slate-400 hover:border-blue-500/50'}`}
+              >
+                <div className="flex items-center gap-3">
+                  <Moon size={18} />
+                  <div className="text-left">
+                    <span className="text-[11px] font-black block uppercase">Escaneo Dark</span>
+                    <p className="text-[8px] opacity-60">Ruido de fondo (sin luz)</p>
+                  </div>
+                </div>
+                {calib.dark && <CheckCircle2 size={16} />}
+              </button>
+
+              <button 
+                disabled={!isConnected || isMeasuring} 
+                onClick={() => runCalibration('reference')} 
+                className={`flex items-center justify-between p-4 rounded-2xl border transition-all ${calib.reference ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-400' : 'bg-slate-900/60 border-white/5 text-slate-400 hover:border-blue-500/50'}`}
+              >
+                <div className="flex items-center gap-3">
+                  <Sun size={18} />
+                  <div className="text-left">
+                    <span className="text-[11px] font-black block uppercase">Escaneo White</span>
+                    <p className="text-[8px] opacity-60">Referencia 100% (con luz)</p>
+                  </div>
+                </div>
+                {calib.reference && <CheckCircle2 size={16} />}
+              </button>
+            </div>
+            {!simulationMode && calib.step !== 'ready' && isConnected && (
+              <div className="mt-4 p-3 bg-blue-500/10 border border-blue-500/20 rounded-xl flex items-center gap-2">
+                <Info size={14} className="text-blue-400" />
+                <p className="text-[9px] font-bold text-blue-300 uppercase">Se requiere completar ambos pasos</p>
+              </div>
+            )}
+          </div>
+
           <div className="glass-panel p-8 rounded-[2.5rem] border-white/5">
             <h3 className="text-[10px] font-black text-slate-500 uppercase tracking-widest mb-6 flex items-center gap-2">
               <Zap size={14} className="text-blue-400" /> Diagnóstico de Señal
@@ -281,6 +341,18 @@ const App: React.FC = () => {
               <span className="text-2xl font-black italic tracking-tighter uppercase">Disparo Sensor NIR</span>
             </button>
           </div>
+
+          {aiInsight && (
+            <div className="glass-panel p-8 rounded-[3rem] border-indigo-500/20 bg-indigo-500/5">
+              <div className="flex items-center gap-4 mb-4">
+                <BrainCircuit className="text-indigo-400" size={20} />
+                <h4 className="text-xs font-black text-white uppercase tracking-widest italic">Análisis del Historial</h4>
+              </div>
+              <p className="text-slate-300 leading-relaxed text-sm italic bg-slate-950/40 p-6 rounded-3xl border border-white/5">
+                "{aiInsight}"
+              </p>
+            </div>
+          )}
         </main>
       </div>
       
