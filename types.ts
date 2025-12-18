@@ -2,6 +2,15 @@
 export interface WavelengthPoint {
   nm: number;
   absorbance: number;
+  raw?: number;
+}
+
+export type CalibrationStep = 'none' | 'dark' | 'reference' | 'ready';
+
+export interface CalibrationData {
+  dark: number[] | null;
+  reference: number[] | null;
+  step: CalibrationStep;
 }
 
 export interface ChemometricModel {
