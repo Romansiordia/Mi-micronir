@@ -9,27 +9,29 @@ export const getAIInterpretation = async (
 ) => {
   try {
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+    
+    // Usamos el modelo flash para respuestas rápidas de diagnóstico
     const response = await ai.models.generateContent({
-      model: "gemini-3-pro-preview",
+      model: "gemini-3-flash-preview",
       contents: `
-        Actúa como un experto en Quimiometría y Espectroscopia NIR. 
-        Información de Diagnóstico:
-        - Estado actual de la lámpara: ${lampStatus}
-        - Predicción calculada (Proteína/Humedad): ${prediction || 'N/A'}%
-        - Muestra espectral (primeros 5 puntos): ${JSON.stringify(spectralData.slice(0, 5))}
+        Contexto: Control de Calidad mediante Espectroscopia NIR (MicroNIR).
+        Datos de la sesión:
+        - Lámpara: ${lampStatus}
+        - Resultado Predicho: ${prediction || 'Pendiente'}%
+        - Valores Espectrales (puntos críticos): ${JSON.stringify(spectralData.filter((_, i) => i % 20 === 0))}
         
-        Tareas:
-        1. Si el estado es "error_nan", explica causas técnicas posibles.
-        2. Explica brevemente qué sugiere la curva de absorbancia actual para la calidad del producto.
-        3. Proporciona una recomendación de una frase para el operador.
+        Analiza si hay anomalías:
+        1. Si los valores de absorbancia son negativos o constantes (0), indica que la calibración Dark/White falló.
+        2. Si la curva tiene mucho ruido, sugiere limpiar la ventana de zafiro.
+        3. Da un veredicto de 15 palabras sobre la integridad del hardware.
         
-        Mantén la respuesta técnica pero concisa. Usa Español.
+        Responde en Español, directo y profesional.
       `
     });
 
-    return response.text || "No se pudo generar una interpretación técnica en este momento.";
+    return response.text;
   } catch (error) {
-    console.error("Gemini interpretation error:", error);
-    return "Error al conectar con la inteligencia artificial para diagnóstico.";
+    console.error("AI interpretation error:", error);
+    return "Diagnóstico IA no disponible.";
   }
 };

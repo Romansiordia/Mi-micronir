@@ -2,51 +2,63 @@
 import { USB_CONFIG } from "../constants";
 
 export class MicroNIRDevice {
-  // Use 'any' type to fix "Cannot find name 'USBDevice'" as WebUSB types are not globally available in this context
   private device: any | null = null;
   private inEndpoint: number = 2;
   private outEndpoint: number = 1;
   public isSimulated: boolean = false;
 
+  private async delay(ms: number) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
   async connect(): Promise<boolean> {
     if (this.isSimulated) return true;
     try {
-      // Cast navigator to 'any' to fix "Property 'usb' does not exist on type 'Navigator'"
-      // 1. Solicitar dispositivo
       this.device = await (navigator as any).usb.requestDevice({
         filters: [{ vendorId: USB_CONFIG.vendorId }]
       });
 
       await this.device.open();
 
-      // 2. Configuración estándar FTDI/MicroNIR
       if (this.device.configuration === null) {
         await this.device.selectConfiguration(1);
       }
       
       const interfaceNum = 0;
-      // Liberar si ya estaba reclamada (evita errores de reconexión)
       try {
         await this.device.claimInterface(interfaceNum);
       } catch (e) {
-        // Si ya está reclamada, intentamos continuar
+        console.warn("Interfaz ya reclamada, intentando continuar...");
       }
 
-      // 3. Identificar endpoints dinámicamente
       const endpoints = this.device.configuration?.interfaces[interfaceNum].alternate.endpoints;
       endpoints?.forEach((ep: any) => {
         if (ep.direction === 'in') this.inEndpoint = ep.endpointNumber;
         if (ep.direction === 'out') this.outEndpoint = ep.endpointNumber;
       });
 
-      // 4. Inicialización crítica (Comando de Reset para FTDI)
-      // Muchos MicroNIR no responden si no se limpia el buffer inicial
+      // --- CONFIGURACIÓN DE ALTA PRECISIÓN FTDI ---
+      
+      // 1. Reset SIO
       await this.device.controlTransferOut({
-        requestType: 'vendor',
-        recipient: 'device',
-        request: 0x00, // RESET
-        value: 0x00,
-        index: 0x00
+        requestType: 'vendor', recipient: 'device', request: 0x00, value: 0x00, index: 0x00
+      });
+
+      // 2. Set Baud Rate (115200)
+      // Divisor para 115200 en FT232R es 26 (0x1A). 
+      // El valor se pasa en 'value' y el sub-integer en 'index'
+      await this.device.controlTransferOut({
+        requestType: 'vendor', recipient: 'device', request: 0x03, value: 0x001A, index: 0x0000
+      });
+
+      // 3. Set Flow Control (None)
+      await this.device.controlTransferOut({
+        requestType: 'vendor', recipient: 'device', request: 0x02, value: 0x0000, index: 0x0000
+      });
+
+      // 4. Set Latency Timer (2ms) - Crucial para no perder paquetes pequeños
+      await this.device.controlTransferOut({
+        requestType: 'vendor', recipient: 'device', request: 0x09, value: 0x0002, index: 0x0000
       });
 
       return true;
@@ -75,30 +87,44 @@ export class MicroNIRDevice {
 
   async readSpectrum(): Promise<Uint16Array | null> {
     if (this.isSimulated) {
-      return new Uint16Array(Array.from({ length: 100 }, (_, i) => {
-        const base = 20000 + Math.sin(i / 10) * 5000;
-        return Math.floor(base + Math.random() * 200);
+      return new Uint16Array(Array.from({ length: 128 }, (_, i) => {
+        const base = 25000 + Math.sin(i / 15) * 8000;
+        return Math.floor(base + Math.random() * 500);
       }));
     }
 
     if (!this.device?.opened) return null;
 
     try {
-      // Limpiar buffer de entrada antes de pedir nuevo dato
+      // Limpieza de buffer previa para asegurar datos frescos
       try {
         await this.device.transferIn(this.inEndpoint, 64);
-      } catch(e) { /* ignore timeout */ }
+      } catch (e) {}
 
-      // Comando de disparo (05 es el estándar para disparar escaneo en muchos NIR)
-      const sent = await this.sendRaw("05");
-      if (!sent) return null;
+      // Comando de disparo estándar MicroNIR
+      await this.sendRaw("05");
+      
+      // Tiempo de integración (Ajustable según exposición del sensor)
+      await this.delay(100);
 
-      // Esperar la respuesta (MicroNIR devuelve típicamente 100-128 puntos de 16 bits)
+      // Leemos un bloque lo suficientemente grande (típico espectro 128 px * 2 bytes = 256 bytes)
+      // Sumamos 2 bytes extra por el header de estado de FTDI
       const result = await this.device.transferIn(this.inEndpoint, 512);
       
-      if (result.data && result.data.byteLength >= 128) {
-        // Convertir bytes a Uint16 (Big Endian o Little Endian según firmware)
-        return new Uint16Array(result.data.buffer);
+      if (result.data && result.data.byteLength > 2) {
+        const bytesReceived = result.data.byteLength - 2;
+        const view = new DataView(result.data.buffer, 2); // Saltamos los 2 bytes de estado FTDI
+        
+        // El sensor NIR suele enviar 128 puntos.
+        const numPoints = Math.floor(bytesReceived / 2);
+        const spectrum = new Uint16Array(numPoints);
+        
+        for (let i = 0; i < numPoints; i++) {
+          // Leemos como Big Endian (false) que es el estándar industrial
+          spectrum[i] = view.getUint16(i * 2, false);
+        }
+        
+        return spectrum;
       }
       return null;
     } catch (e) {
@@ -109,13 +135,8 @@ export class MicroNIRDevice {
 
   async setLamp(on: boolean): Promise<boolean> {
     if (this.isSimulated) return true;
-    // Comandos de paquete MicroNIR típicos: [Header, Op, Val, Footer]
-    const cmd = on ? "02 01 01 03" : "02 01 00 03";
-    return this.sendRaw(cmd);
-  }
-
-  setSimulation(enabled: boolean) {
-    this.isSimulated = enabled;
+    // Comandos de control de periféricos MicroNIR (ajustados a protocolo binario)
+    return await this.sendRaw(on ? "02 01 01 03" : "02 01 00 03");
   }
 
   async disconnect() {
