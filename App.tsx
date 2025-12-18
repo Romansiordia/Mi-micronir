@@ -6,7 +6,7 @@ import {
   Cpu, Terminal, BrainCircuit, ShieldCheck,
   Moon, Sun, Gauge, Send, FlaskConical,
   Settings2, Info, AlertTriangle, History, Trash2, TrendingUp,
-  Database, Zap
+  Database, Zap, XCircle
 } from 'lucide-react';
 import { 
   AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer
@@ -27,7 +27,6 @@ const App: React.FC = () => {
   const [prediction, setPrediction] = useState<string | null>(null);
   const [scanHistory, setScanHistory] = useState<{val: number, isReal: boolean}[]>([]);
   const [aiInsight, setAiInsight] = useState<string | null>(null);
-  const [signalError, setSignalError] = useState<string | null>(null);
 
   const stats = useMemo(() => {
     if (scanHistory.length === 0) return { avg: 0, std: 0, cv: 0 };
@@ -43,14 +42,15 @@ const App: React.FC = () => {
   }, []);
 
   const handleConnect = async () => {
+    addLog("USB: Solicitando acceso al hardware...", "info");
     microNir.setSimulation(false);
     const success = await microNir.connect();
     if (success) {
       setIsConnected(true);
       setSimulationMode(false);
-      addLog("HARDWARE REAL: MicroNIR USB conectado y listo.", "success");
+      addLog("HARDWARE REAL: MicroNIR vinculado y canal de datos abierto.", "success");
     } else {
-      addLog("USB: No se encontró el dispositivo 0x0403.", "error");
+      addLog("USB: Error al reclamar interfaz. Asegúrese de que ninguna otra app use el sensor.", "error");
     }
   };
 
@@ -61,49 +61,51 @@ const App: React.FC = () => {
     if (!nextSimState) {
       const hardwareStillThere = microNir.isHardwareReady;
       setIsConnected(hardwareStillThere);
-      addLog(hardwareStillThere ? "SISTEMA: Cambiado a Sensor Físico." : "ADVERTENCIA: Sensor Físico desconectado.", hardwareStillThere ? "info" : "warning");
+      addLog(hardwareStillThere ? "SISTEMA: Conexión recuperada con el sensor físico." : "MODO REAL: No se detecta sensor conectado.", hardwareStillThere ? "info" : "warning");
     } else {
       setIsConnected(true);
-      addLog("SISTEMA: Modo Simulación (Datos Sintéticos).", "warning");
+      addLog("SISTEMA: Entrando en modo de simulación segura.", "warning");
     }
   };
 
   const toggleLamp = async () => {
     const nextOn = lampStatus !== 'ok';
+    addLog(`LAMP: Enviando comando ${nextOn ? 'ON' : 'OFF'}...`, "info");
     const ok = await microNir.setLamp(nextOn);
     if (ok) {
       setLampStatus(nextOn ? 'ok' : 'off');
-      addLog(`LAMP: Comandado ${nextOn ? 'ON' : 'OFF'} vía USB`, "info");
+      addLog(`LAMP: Confirmación de hardware recibida.`, "success");
+    } else {
+      addLog("LAMP: El hardware no respondió al comando de luz.", "error");
     }
   };
 
   const runCalibration = async (type: 'dark' | 'reference') => {
     if (!isConnected && !simulationMode) {
-      addLog("Conecte el sensor antes de calibrar.", "error");
+      addLog("BLOQUEO: Debe vincular el equipo antes de calibrar.", "error");
       return;
     }
 
     setIsMeasuring(true);
     const sourceTag = simulationMode ? "[SIM]" : "[HW]";
-    addLog(`${sourceTag} Iniciando captura de ${type.toUpperCase()}...`, "info");
+    addLog(`${sourceTag} Capturando ${type.toUpperCase()}... No mueva el sensor.`, "info");
     
     try {
-      // Para Dark Scan en hardware real, usualmente se apaga la lámpara o se usa tapón negro
       const raw = await microNir.readSpectrum();
       
-      if (raw) {
+      if (raw && raw.length > 0) {
         setCalib(prev => {
           const next = { ...prev, [type]: Array.from(raw) };
           const hasBoth = (type === 'dark' && !!prev.reference) || (type === 'reference' && !!prev.dark);
           next.step = hasBoth ? 'ready' : type;
           return next;
         });
-        addLog(`${sourceTag} Calibración ${type.toUpperCase()} guardada con éxito.`, "success");
+        addLog(`${sourceTag} ${type.toUpperCase()} guardado correctamente (${raw.length} puntos).`, "success");
       } else {
-        addLog(`${sourceTag} Error: No se recibieron datos del sensor para ${type}.`, "error");
+        addLog(`${sourceTag} ERROR: El sensor devolvió un paquete vacío o inválido.`, "error");
       }
     } catch (err) {
-      addLog(`Fallo crítico en calibración ${type}: ${err}`, "error");
+      addLog(`ERROR CRÍTICO: ${err}`, "error");
     } finally {
       setIsMeasuring(false);
     }
@@ -111,39 +113,50 @@ const App: React.FC = () => {
 
   const runScan = async () => {
     if (calib.step !== 'ready' && !simulationMode) {
-      addLog("BLOQUEO: Calibración necesaria (Dark y White).", "error");
+      addLog("CALIBRACIÓN PENDIENTE: Realice Dark y White scan primero.", "warning");
       return;
     }
     setIsMeasuring(true);
     const isReal = !simulationMode;
     const sourceTag = isReal ? "[HW]" : "[SIM]";
     
-    const raw = await microNir.readSpectrum();
-    if (raw) {
-      const sample = Array.from(raw);
-      const absData = sample.map((s, i) => {
-        const d = calib.dark?.[i] || 0;
-        const r = calib.reference?.[i] || 65535;
-        // Cálculo de Absorbancia: -log10((Muestra - Dark) / (Referencia - Dark))
-        const refl = Math.min(Math.max((s - d) / Math.max(r - d, 1), 0.0001), 1.0);
-        return -Math.log10(refl);
-      });
+    try {
+      const raw = await microNir.readSpectrum();
+      if (raw && raw.length > 0) {
+        const sample = Array.from(raw);
+        const absData = sample.map((s, i) => {
+          const d = calib.dark?.[i] || 0;
+          const r = calib.reference?.[i] || 65535;
+          const refl = Math.min(Math.max((s - d) / Math.max(r - d, 1), 0.0001), 1.0);
+          return -Math.log10(refl);
+        });
 
-      let sum = CDM_MODEL.bias;
-      absData.forEach((val, i) => {
-        if (CDM_MODEL.betaCoefficients[i] !== undefined) {
-          sum += val * CDM_MODEL.betaCoefficients[i];
-        }
-      });
+        let sum = CDM_MODEL.bias;
+        absData.forEach((val, i) => {
+          if (CDM_MODEL.betaCoefficients[i] !== undefined) {
+            sum += val * CDM_MODEL.betaCoefficients[i];
+          }
+        });
 
-      const val = parseFloat(sum.toFixed(2));
-      setPrediction(val.toString());
-      setScanHistory(prev => [{val, isReal}, ...prev].slice(0, 10));
-      setSpectralData(CDM_MODEL.wavelengths.map((nm, i) => ({ nm, absorbance: absData[i] })));
-      addLog(`${sourceTag} Medición: ${val}%`, isReal ? "success" : "warning");
-      getAIInterpretation(spectralData, val.toString(), lampStatus).then(setAiInsight);
+        const val = parseFloat(sum.toFixed(2));
+        setPrediction(val.toString());
+        setScanHistory(prev => [{val, isReal}, ...prev].slice(0, 10));
+        
+        // Fix: Use local variable to avoid stale state in the AI interpretation call
+        const currentSpectralData = CDM_MODEL.wavelengths.map((nm, i) => ({ nm, absorbance: absData[i] }));
+        setSpectralData(currentSpectralData);
+        addLog(`${sourceTag} Medición exitosa: ${val}%`, isReal ? "success" : "warning");
+        
+        // Fix: Await or handle the AI call with the current data directly
+        getAIInterpretation(currentSpectralData, val.toString(), lampStatus).then(setAiInsight);
+      } else {
+        addLog(`${sourceTag} Error: No se pudo obtener el espectro de la muestra.`, "error");
+      }
+    } catch (e) {
+      addLog(`Fallo en escaneo: ${e}`, "error");
+    } finally {
+      setIsMeasuring(false);
     }
-    setIsMeasuring(false);
   };
 
   return (
@@ -157,7 +170,7 @@ const App: React.FC = () => {
           <div>
             <h1 className="text-2xl font-black italic tracking-tighter text-white uppercase">Quantum NIR</h1>
             <p className="text-slate-500 text-[10px] font-bold tracking-[0.3em] uppercase">
-              {simulationMode ? 'MODO LABORATORIO VIRTUAL' : 'CONTROL HARDWARE ACTIVO'}
+              {simulationMode ? 'LABORATORIO VIRTUAL' : isConnected ? 'SENSOR FÍSICO CONECTADO' : 'ESPERANDO HARDWARE'}
             </p>
           </div>
         </div>
@@ -165,20 +178,24 @@ const App: React.FC = () => {
         <div className="flex items-center gap-4 mt-4 md:mt-0">
           <button onClick={toggleSimulation} className={`px-5 py-2.5 rounded-full text-xs font-bold border transition-all ${simulationMode ? 'bg-orange-500/20 border-orange-500/50 text-orange-400' : 'bg-slate-800/50 border-white/5 text-slate-500'}`}>
             <Settings2 size={14} className="inline mr-2" />
-            {simulationMode ? 'SIMULACIÓN' : 'HARDWARE REAL'}
+            {simulationMode ? 'MODO SIMULACIÓN' : 'MODO HARDWARE'}
           </button>
           
-          {!isConnected ? (
-            <button onClick={handleConnect} className="bg-blue-600 hover:bg-blue-500 text-white px-8 py-3 rounded-full font-black text-sm flex items-center gap-3 shadow-lg shadow-blue-500/20 transition-all">
+          {!isConnected && !simulationMode ? (
+            <button onClick={handleConnect} className="bg-blue-600 hover:bg-blue-500 text-white px-8 py-3 rounded-full font-black text-sm flex items-center gap-3 shadow-lg shadow-blue-500/20 transition-all animate-pulse">
               <Usb size={18} /> VINCULAR EQUIPO
             </button>
           ) : (
             <div className="flex items-center gap-3 bg-slate-900/50 p-1.5 rounded-full border border-white/5">
-              <button onClick={toggleLamp} className={`px-6 py-2 rounded-full font-bold text-xs transition-all ${lampStatus === 'ok' ? 'bg-orange-500 text-white shadow-lg shadow-orange-500/30' : 'bg-slate-800 text-slate-500'}`}>
+              <button 
+                disabled={simulationMode}
+                onClick={toggleLamp} 
+                className={`px-6 py-2 rounded-full font-bold text-xs transition-all ${lampStatus === 'ok' ? 'bg-orange-500 text-white shadow-lg shadow-orange-500/30' : 'bg-slate-800 text-slate-500'}`}
+              >
                 {lampStatus === 'ok' ? 'LÁMPARA ON' : 'LÁMPARA OFF'}
               </button>
               <div className="px-5 py-2 text-emerald-400 font-bold text-xs flex items-center gap-2">
-                <Database size={14} /> {simulationMode ? 'SIM-ID-0' : 'USB-FTDI-0403'}
+                <Database size={14} /> {simulationMode ? 'DATA-VIRTUAL' : 'S/N: NIR-0403-X'}
               </div>
             </div>
           )}
@@ -187,14 +204,13 @@ const App: React.FC = () => {
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
         <aside className="lg:col-span-4 space-y-6">
-          {/* PANEL DE CALIBRACIÓN REINSTALADO */}
           <div className="glass-panel p-8 rounded-[2.5rem] border-white/5">
             <h3 className="text-[10px] font-black text-slate-500 uppercase tracking-widest mb-6 flex items-center gap-2">
               <FlaskConical size={14} className="text-blue-400" /> Protocolo de Calibración
             </h3>
             <div className="grid grid-cols-1 gap-3">
               <button 
-                disabled={!isConnected || isMeasuring} 
+                disabled={(!isConnected && !simulationMode) || isMeasuring} 
                 onClick={() => runCalibration('dark')} 
                 className={`flex items-center justify-between p-4 rounded-2xl border transition-all ${calib.dark ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-400' : 'bg-slate-900/60 border-white/5 text-slate-400 hover:border-blue-500/50'}`}
               >
@@ -202,14 +218,14 @@ const App: React.FC = () => {
                   <Moon size={18} />
                   <div className="text-left">
                     <span className="text-[11px] font-black block uppercase">Escaneo Dark</span>
-                    <p className="text-[8px] opacity-60">Ruido de fondo (sin luz)</p>
+                    <p className="text-[8px] opacity-60">Sin luz / Tapa negra</p>
                   </div>
                 </div>
-                {calib.dark && <CheckCircle2 size={16} />}
+                {calib.dark ? <CheckCircle2 size={16} /> : isMeasuring && <RefreshCw size={14} className="animate-spin" />}
               </button>
 
               <button 
-                disabled={!isConnected || isMeasuring} 
+                disabled={(!isConnected && !simulationMode) || isMeasuring} 
                 onClick={() => runCalibration('reference')} 
                 className={`flex items-center justify-between p-4 rounded-2xl border transition-all ${calib.reference ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-400' : 'bg-slate-900/60 border-white/5 text-slate-400 hover:border-blue-500/50'}`}
               >
@@ -217,74 +233,31 @@ const App: React.FC = () => {
                   <Sun size={18} />
                   <div className="text-left">
                     <span className="text-[11px] font-black block uppercase">Escaneo White</span>
-                    <p className="text-[8px] opacity-60">Referencia 100% (con luz)</p>
+                    <p className="text-[8px] opacity-60">Estándar Blanco 99%</p>
                   </div>
                 </div>
-                {calib.reference && <CheckCircle2 size={16} />}
+                {calib.reference ? <CheckCircle2 size={16} /> : isMeasuring && <RefreshCw size={14} className="animate-spin" />}
               </button>
             </div>
-            {!simulationMode && calib.step !== 'ready' && isConnected && (
-              <div className="mt-4 p-3 bg-blue-500/10 border border-blue-500/20 rounded-xl flex items-center gap-2">
-                <Info size={14} className="text-blue-400" />
-                <p className="text-[9px] font-bold text-blue-300 uppercase">Se requiere completar ambos pasos</p>
-              </div>
-            )}
           </div>
 
           <div className="glass-panel p-8 rounded-[2.5rem] border-white/5">
-            <h3 className="text-[10px] font-black text-slate-500 uppercase tracking-widest mb-6 flex items-center gap-2">
-              <Zap size={14} className="text-blue-400" /> Diagnóstico de Señal
+            <h3 className="text-[10px] font-black text-slate-500 uppercase tracking-widest mb-4 flex items-center gap-2">
+              <Terminal size={14} className="text-blue-400" /> Consola de Sistema
             </h3>
-            <div className="space-y-4">
-              <div className="flex justify-between text-[10px] font-bold">
-                <span className="text-slate-500">INTENSIDAD ÓPTICA</span>
-                <span className={isConnected ? 'text-emerald-400' : 'text-slate-600'}>{isConnected ? '94%' : '0%'}</span>
-              </div>
-              <div className="h-2 bg-slate-900 rounded-full overflow-hidden border border-white/5">
-                <div 
-                  className={`h-full transition-all duration-500 ${simulationMode ? 'bg-orange-500' : 'bg-emerald-500'}`} 
-                  style={{ width: isConnected ? '94%' : '0%' }}
-                ></div>
-              </div>
-              <p className="text-[9px] text-slate-600 italic">
-                {simulationMode ? 'Usando generador de ruido blanco matemático.' : 'Leyendo fotones reales desde arreglo InGaAs.'}
-              </p>
-            </div>
-          </div>
-
-          <div className="glass-panel p-8 rounded-[2.5rem] border-white/5 bg-blue-500/5">
-            <div className="flex justify-between items-center mb-6">
-              <h3 className="text-[10px] font-black text-slate-500 uppercase tracking-widest flex items-center gap-2">
-                <History size={14} className="text-blue-400" /> Sesión Actual
-              </h3>
-              <button onClick={() => setScanHistory([])} className="text-slate-600 hover:text-red-400 transition-colors">
-                <Trash2 size={14} />
-              </button>
-            </div>
-            
-            <div className="grid grid-cols-2 gap-4 mb-6">
-              <div className="bg-slate-900/80 p-4 rounded-2xl border border-white/5">
-                <p className="text-[9px] font-bold text-slate-500 uppercase">Media</p>
-                <p className="text-2xl font-black text-white">{stats.avg}%</p>
-              </div>
-              <div className="bg-slate-900/80 p-4 rounded-2xl border border-white/5">
-                <p className="text-[9px] font-bold text-slate-500 uppercase">Estabilidad</p>
-                <p className={`text-2xl font-black ${parseFloat(stats.cv) > 5 ? 'text-orange-400' : 'text-emerald-400'}`}>
-                  {stats.cv}%
-                </p>
-              </div>
-            </div>
-
-            <div className="space-y-2 max-h-[150px] overflow-y-auto pr-2 custom-scrollbar">
-              {scanHistory.map((h, i) => (
-                <div key={i} className={`flex justify-between items-center p-3 rounded-xl border ${h.isReal ? 'bg-emerald-500/5 border-emerald-500/20' : 'bg-orange-500/5 border-orange-500/20'} text-[11px]`}>
-                  <div className="flex items-center gap-2">
-                    <span className={`w-2 h-2 rounded-full ${h.isReal ? 'bg-emerald-500' : 'bg-orange-500'}`}></span>
-                    <span className="text-slate-500 font-mono">#{scanHistory.length - i}</span>
-                  </div>
-                  <span className="font-bold text-white">{h.val.toFixed(2)}%</span>
+            <div className="h-[250px] overflow-y-auto pr-2 custom-scrollbar space-y-2">
+              {logs.map((log, i) => (
+                <div key={i} className={`text-[10px] p-2 rounded-lg border flex gap-2 ${
+                  log.type === 'error' ? 'bg-red-500/5 border-red-500/20 text-red-400' : 
+                  log.type === 'success' ? 'bg-emerald-500/5 border-emerald-500/20 text-emerald-400' :
+                  log.type === 'warning' ? 'bg-orange-500/5 border-orange-500/20 text-orange-400' :
+                  'bg-slate-900/50 border-white/5 text-slate-400'
+                }`}>
+                  <span className="opacity-40 font-mono">[{log.timestamp}]</span>
+                  <span className="font-medium">{log.message}</span>
                 </div>
               ))}
+              {logs.length === 0 && <p className="text-center text-slate-600 text-[10px] mt-10 italic">No hay actividad reciente...</p>}
             </div>
           </div>
         </aside>
@@ -293,24 +266,24 @@ const App: React.FC = () => {
           <div className="glass-panel p-10 rounded-[3rem] border-white/5 relative shadow-2xl overflow-hidden">
             <div className="flex flex-col md:flex-row justify-between items-start mb-10 gap-6">
               <div>
-                <h2 className="text-3xl font-black italic tracking-tighter text-white flex items-center gap-3">
-                  <Activity className="text-blue-500" /> ANÁLISIS
+                <h2 className="text-3xl font-black italic tracking-tighter text-white flex items-center gap-3 uppercase">
+                  <Activity className="text-blue-500" /> Monitoreo Espectral
                 </h2>
                 <div className="flex gap-2 mt-2">
-                  <span className={`px-3 py-1 rounded-full text-[9px] font-black uppercase ${!simulationMode ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' : 'bg-orange-500/20 text-orange-400 border border-orange-500/30'}`}>
-                    {simulationMode ? 'DATOS SIMULADOS' : 'DATOS SENSOR FÍSICO'}
+                  <span className={`px-3 py-1 rounded-full text-[9px] font-black uppercase ${!simulationMode && isConnected ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' : 'bg-slate-800 text-slate-500 border border-white/5'}`}>
+                    {simulationMode ? 'DATOS SINTÉTICOS' : isConnected ? 'HARDWARE ACTIVO' : 'SIN CONEXIÓN'}
                   </span>
                 </div>
               </div>
-              <div className="bg-slate-900/50 p-6 rounded-[2rem] border border-white/5 min-w-[200px] text-center shadow-inner relative">
-                <p className="text-[9px] font-black text-slate-500 uppercase mb-1">PROTEÍNA CALCULADA</p>
-                <div className={`text-6xl font-black transition-all ${parseFloat(stats.cv) > 10 ? 'text-orange-500' : 'text-emerald-400'}`}>
+              <div className="bg-slate-900/50 p-6 rounded-[2rem] border border-white/5 min-w-[240px] text-center shadow-inner relative">
+                <p className="text-[9px] font-black text-slate-500 uppercase mb-1 tracking-widest">Proteína CDM v2.4</p>
+                <div className={`text-6xl font-black transition-all ${parseFloat(stats.cv) > 8 ? 'text-orange-500' : 'text-emerald-400'}`}>
                   {prediction || '--.--'}<span className="text-xl ml-1 opacity-40">%</span>
                 </div>
               </div>
             </div>
 
-            <div className="h-[350px] w-full bg-slate-950/30 rounded-[2rem] p-4 border border-white/5 mb-8">
+            <div className="h-[380px] w-full bg-slate-950/30 rounded-[2rem] p-4 border border-white/5 mb-8">
               <ResponsiveContainer width="100%" height="100%">
                 <AreaChart data={spectralData}>
                   <defs>
@@ -320,45 +293,46 @@ const App: React.FC = () => {
                     </linearGradient>
                   </defs>
                   <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.1} />
-                  <XAxis dataKey="nm" stroke="#475569" fontSize={11} tickFormatter={(v) => `${v}nm`} />
-                  <YAxis stroke="#475569" fontSize={11} />
-                  <Tooltip contentStyle={{ backgroundColor: '#0f172a', border: 'none', borderRadius: '16px' }} />
-                  <Area type="monotone" dataKey="absorbance" stroke={simulationMode ? "#f97316" : "#3b82f6"} fillOpacity={1} fill="url(#colorAbs)" strokeWidth={4} />
+                  <XAxis dataKey="nm" stroke="#475569" fontSize={10} tickFormatter={(v) => `${v}nm`} />
+                  <YAxis stroke="#475569" fontSize={10} domain={[0, 'auto']} />
+                  <Tooltip contentStyle={{ backgroundColor: '#0f172a', border: 'none', borderRadius: '16px', fontSize: '12px' }} />
+                  <Area type="monotone" dataKey="absorbance" stroke={simulationMode ? "#f97316" : "#3b82f6"} fillOpacity={1} fill="url(#colorAbs)" strokeWidth={3} />
                 </AreaChart>
               </ResponsiveContainer>
             </div>
 
+            {/* AI Insights Display */}
+            {aiInsight && (
+              <div className="mb-8 p-6 bg-blue-500/10 border border-blue-500/30 rounded-[2rem] flex gap-4 transition-all">
+                <BrainCircuit className="text-blue-400 shrink-0" size={24} />
+                <div className="space-y-1">
+                  <h4 className="text-[10px] font-black text-blue-400 uppercase tracking-widest">Inteligencia Quantum Gemini</h4>
+                  <p className="text-sm text-slate-300 leading-relaxed whitespace-pre-wrap">{aiInsight}</p>
+                </div>
+              </div>
+            )}
+
             <button
-              disabled={!isConnected || isMeasuring || (calib.step !== 'ready' && !simulationMode)}
+              disabled={(!isConnected && !simulationMode) || isMeasuring || (calib.step !== 'ready' && !simulationMode)}
               onClick={runScan}
               className={`w-full py-8 rounded-[2rem] transition-all flex items-center justify-center gap-5 shadow-2xl relative group ${
-                (!isConnected || isMeasuring || (calib.step !== 'ready' && !simulationMode))
-                ? 'bg-slate-800 text-slate-600 opacity-40' 
-                : 'bg-white text-black hover:bg-blue-600 hover:text-white active:scale-[0.98]'
+                ((!isConnected && !simulationMode) || isMeasuring || (calib.step !== 'ready' && !simulationMode))
+                ? 'bg-slate-800 text-slate-600 cursor-not-allowed' 
+                : 'bg-white text-black hover:bg-emerald-500 hover:text-white active:scale-[0.98]'
               }`}
             >
               {isMeasuring ? <RefreshCw className="animate-spin" size={28} /> : <Play size={28} fill="currentColor" />}
-              <span className="text-2xl font-black italic tracking-tighter uppercase">Disparo Sensor NIR</span>
+              <span className="text-2xl font-black italic tracking-tighter uppercase">Disparo Analítico NIR</span>
             </button>
           </div>
-
-          {aiInsight && (
-            <div className="glass-panel p-8 rounded-[3rem] border-indigo-500/20 bg-indigo-500/5">
-              <div className="flex items-center gap-4 mb-4">
-                <BrainCircuit className="text-indigo-400" size={20} />
-                <h4 className="text-xs font-black text-white uppercase tracking-widest italic">Análisis del Historial</h4>
-              </div>
-              <p className="text-slate-300 leading-relaxed text-sm italic bg-slate-950/40 p-6 rounded-3xl border border-white/5">
-                "{aiInsight}"
-              </p>
-            </div>
-          )}
         </main>
       </div>
       
       <style>{`
         .custom-scrollbar::-webkit-scrollbar { width: 4px; }
         .custom-scrollbar::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 10px; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.7; } }
+        .animate-pulse { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
       `}</style>
     </div>
   );
