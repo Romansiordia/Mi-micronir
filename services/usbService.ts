@@ -37,6 +37,9 @@ function calculateCrc8(data: Uint8Array): number {
   return crc;
 }
 
+/**
+ * Los chips FTDI insertan 2 bytes de estado cada 64 bytes de transferencia USB.
+ */
 function decapsulateFtdi(data: Uint8Array): Uint8Array {
   const blockSize = 64;
   const result = new Uint8Array(data.length); 
@@ -62,19 +65,6 @@ export class MicroNIRDevice {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
-  /**
-   * Intenta limpiar el buffer sin bloquear el flujo si no hay datos.
-   */
-  async clearBuffer() {
-    if (!this.device?.opened) return;
-    try {
-      // Usamos un transferIn pequeño con la esperanza de que si está vacío falle rápido
-      await this.device.transferIn(this.inEndpoint, 64);
-    } catch (e) {
-      // Ignorar errores de buffer vacío
-    }
-  }
-
   async connect(): Promise<boolean> {
     if (this.isSimulated) return true;
     try {
@@ -88,7 +78,7 @@ export class MicroNIRDevice {
       const interfaceNum = 0;
       try { await this.device.claimInterface(interfaceNum); } catch (e) {}
 
-      // Configuración inicial FTDI
+      // Configuración mínima FTDI
       await this.device.controlTransferOut({ requestType: 'vendor', recipient: 'device', request: 0x00, value: 0x00, index: 0x00 }); 
       await this.device.controlTransferOut({ requestType: 'vendor', recipient: 'device', request: 0x03, value: 0x401A, index: 0x0000 }); 
       await this.device.controlTransferOut({ requestType: 'vendor', recipient: 'device', request: 0x01, value: 0x0303, index: 0x0000 }); 
@@ -102,10 +92,6 @@ export class MicroNIRDevice {
     }
   }
 
-  /**
-   * Envía un comando y retorna éxito si el hardware aceptó el paquete.
-   * No espera respuesta (ACK) para evitar bloqueos en comandos de control (lámpara).
-   */
   async sendCommand(opcode: number, payload: number[] = []): Promise<boolean> {
     if (!this.device?.opened) return false;
     try {
@@ -117,7 +103,6 @@ export class MicroNIRDevice {
       const result = await this.device.transferOut(this.outEndpoint, packet);
       return result.status === 'ok';
     } catch (e) {
-      console.error("Command sending failed:", e);
       return false;
     }
   }
@@ -130,24 +115,19 @@ export class MicroNIRDevice {
 
   async getTemperature(): Promise<number | null> {
     if (this.isSimulated) return 24.5 + Math.random();
-    try {
-      await this.clearBuffer();
-      const packet = new Uint8Array([0x02, 0x01, 0x06, calculateCrc8(new Uint8Array([0x01, 0x06])), 0x03]);
-      await this.device.transferOut(this.outEndpoint, packet);
-      await this.delay(100);
-      
-      const result = await this.device.transferIn(this.inEndpoint, 64);
-      if (result.data && result.data.byteLength >= 4) {
-        const clean = decapsulateFtdi(new Uint8Array(result.data.buffer));
-        for (let i = 0; i < clean.length - 4; i++) {
-          if (clean[i] === 0x02 && clean[i+2] === 0x06) {
-            const view = new DataView(clean.buffer, clean.byteOffset + i + 3, 2);
-            // Factor de escala corregido (25763 -> 25.76C)
-            return view.getUint16(0, false) / 1000.0;
-          }
+    await this.sendCommand(OPCODES.GET_TEMPERATURE);
+    await this.delay(100);
+    
+    const result = await this.device.transferIn(this.inEndpoint, 64);
+    if (result.data && result.data.byteLength >= 4) {
+      const clean = decapsulateFtdi(new Uint8Array(result.data.buffer));
+      for (let i = 0; i < clean.length - 4; i++) {
+        if (clean[i] === 0x02 && clean[i+2] === 0x06) {
+          const view = new DataView(clean.buffer, clean.byteOffset + i + 3, 2);
+          return view.getUint16(0, false) / 1000.0;
         }
       }
-    } catch(e) {}
+    }
     return null;
   }
 
@@ -156,15 +136,13 @@ export class MicroNIRDevice {
     if (!this.device?.opened) return null;
 
     try {
-      await this.clearBuffer();
-      const packet = new Uint8Array([0x02, 0x01, 0x05, calculateCrc8(new Uint8Array([0x01, 0x05])), 0x03]);
-      await this.device.transferOut(this.outEndpoint, packet);
+      await this.sendCommand(OPCODES.PERFORM_SCAN);
       await this.delay(650); 
 
       let rawAccumulated = new Uint8Array(0);
       const startTime = Date.now();
       
-      while (Date.now() - startTime < 4000) {
+      while (Date.now() - startTime < 3000) {
         const result = await this.device.transferIn(this.inEndpoint, 1024);
         if (result.status === 'ok' && result.data.byteLength > 0) {
           const chunk = new Uint8Array(result.data.buffer);
@@ -182,6 +160,7 @@ export class MicroNIRDevice {
         if (clean[i] === 0x02) {
           let dataStart = -1;
           let dataLength = 0;
+
           if (clean[i+2] === 0x05) { 
             dataStart = i + 3;
             dataLength = clean[i+1] - 1;
@@ -189,6 +168,7 @@ export class MicroNIRDevice {
             dataStart = i + 4;
             dataLength = (clean[i+1] << 8 | clean[i+2]) - 1;
           }
+
           if (dataStart !== -1 && dataLength > 100) {
             const points = Math.floor(dataLength / 2);
             const spectrum = new Uint16Array(points);
@@ -207,12 +187,7 @@ export class MicroNIRDevice {
   }
 
   async setLamp(on: boolean): Promise<boolean> {
-    const success = await this.sendCommand(OPCODES.SET_LAMP, [on ? 0x01 : 0x00]);
-    // Intentamos limpiar cualquier eco residual después de un comando de lámpara
-    if (success) {
-      setTimeout(() => this.clearBuffer(), 50);
-    }
-    return success;
+    return await this.sendCommand(OPCODES.SET_LAMP, [on ? 0x01 : 0x00]);
   }
 
   async disconnect() {
