@@ -28,7 +28,7 @@ export class MicroNIRDevice {
       try {
         await this.device.claimInterface(interfaceNum);
       } catch (e) {
-        console.warn("Interfaz ya reclamada, intentando continuar...");
+        console.warn("Interfaz ya reclamada");
       }
 
       const endpoints = this.device.configuration?.interfaces[interfaceNum].alternate.endpoints;
@@ -37,28 +37,29 @@ export class MicroNIRDevice {
         if (ep.direction === 'out') this.outEndpoint = ep.endpointNumber;
       });
 
-      // --- CONFIGURACIÓN DE ALTA PRECISIÓN FTDI ---
+      // --- CONFIGURACIÓN DE HARDWARE FTDI ULTRA-ESTABLE ---
       
       // 1. Reset SIO
       await this.device.controlTransferOut({
         requestType: 'vendor', recipient: 'device', request: 0x00, value: 0x00, index: 0x00
       });
 
-      // 2. Set Baud Rate (115200)
-      // Divisor para 115200 en FT232R es 26 (0x1A). 
-      // El valor se pasa en 'value' y el sub-integer en 'index'
+      // 2. Set Baud Rate (115200) - Usando divisor exacto 0x401A para FT232R
       await this.device.controlTransferOut({
-        requestType: 'vendor', recipient: 'device', request: 0x03, value: 0x001A, index: 0x0000
+        requestType: 'vendor', recipient: 'device', request: 0x03, value: 0x401A, index: 0x0000
       });
 
-      // 3. Set Flow Control (None)
+      // 3. SET DTR & RTS HIGH (Esencial para alimentar el sensor)
       await this.device.controlTransferOut({
-        requestType: 'vendor', recipient: 'device', request: 0x02, value: 0x0000, index: 0x0000
+        requestType: 'vendor', recipient: 'device', request: 0x01, value: 0x0101, index: 0x0000
+      });
+      await this.device.controlTransferOut({
+        requestType: 'vendor', recipient: 'device', request: 0x01, value: 0x0202, index: 0x0000
       });
 
-      // 4. Set Latency Timer (2ms) - Crucial para no perder paquetes pequeños
+      // 4. Set Latency Timer (a 1ms para máxima velocidad de respuesta)
       await this.device.controlTransferOut({
-        requestType: 'vendor', recipient: 'device', request: 0x09, value: 0x0002, index: 0x0000
+        requestType: 'vendor', recipient: 'device', request: 0x09, value: 0x0001, index: 0x0000
       });
 
       return true;
@@ -66,10 +67,6 @@ export class MicroNIRDevice {
       console.error("USB Connect Error:", error);
       return false;
     }
-  }
-
-  get isHardwareReady(): boolean {
-    return this.device !== null && this.device.opened;
   }
 
   async sendRaw(hexString: string): Promise<boolean> {
@@ -87,55 +84,70 @@ export class MicroNIRDevice {
 
   async readSpectrum(): Promise<Uint16Array | null> {
     if (this.isSimulated) {
-      return new Uint16Array(Array.from({ length: 128 }, (_, i) => {
-        const base = 25000 + Math.sin(i / 15) * 8000;
-        return Math.floor(base + Math.random() * 500);
-      }));
+      return new Uint16Array(Array.from({ length: 128 }, (_, i) => 25000 + Math.floor(Math.random() * 5000)));
     }
 
     if (!this.device?.opened) return null;
 
     try {
-      // Limpieza de buffer previa para asegurar datos frescos
-      try {
-        await this.device.transferIn(this.inEndpoint, 64);
-      } catch (e) {}
+      // 1. LIMPIEZA AGRESIVA (Flush)
+      for(let i=0; i<5; i++) {
+        try { await this.device.transferIn(this.inEndpoint, 64); } catch(e) { break; }
+      }
 
-      // Comando de disparo estándar MicroNIR
-      await this.sendRaw("05");
-      
-      // Tiempo de integración (Ajustable según exposición del sensor)
-      await this.delay(100);
+      // 2. WAKE-UP CALL: Enviamos un byte nulo para "despertar" el puerto
+      await this.sendRaw("00");
+      await this.delay(50);
 
-      // Leemos un bloque lo suficientemente grande (típico espectro 128 px * 2 bytes = 256 bytes)
-      // Sumamos 2 bytes extra por el header de estado de FTDI
-      const result = await this.device.transferIn(this.inEndpoint, 512);
+      // 3. DISPARO: STX (02) + SCAN (05) + ETX (03)
+      await this.sendRaw("02 05 03");
       
-      if (result.data && result.data.byteLength > 2) {
-        const bytesReceived = result.data.byteLength - 2;
-        const view = new DataView(result.data.buffer, 2); // Saltamos los 2 bytes de estado FTDI
+      // 4. ESPERA DE INTEGRACIÓN: El sensor necesita tiempo para "cocinar" el espectro
+      await this.delay(300);
+
+      let allData = new Uint8Array(0);
+      const startTime = Date.now();
+      
+      // 5. BUCLE DE CAPTURA (Hasta 1.5 segundos para no perder paquetes lentos)
+      while (Date.now() - startTime < 1500) {
+        const result = await this.device.transferIn(this.inEndpoint, 512);
         
-        // El sensor NIR suele enviar 128 puntos.
-        const numPoints = Math.floor(bytesReceived / 2);
+        // El chip FTDI siempre devuelve 2 bytes de estado. Datos reales vienen después.
+        if (result.data && result.data.byteLength > 2) {
+          const chunk = new Uint8Array(result.data.buffer, 2);
+          const combined = new Uint8Array(allData.length + chunk.length);
+          combined.set(allData);
+          combined.set(chunk, allData.length);
+          allData = combined;
+
+          // Un espectro típico de MicroNIR tiene ~128 píxeles (256 bytes)
+          if (allData.length >= 256) break;
+        }
+        await this.delay(30);
+      }
+
+      // 6. PROCESAMIENTO DE BYTES A 16-BIT
+      if (allData.length >= 20) {
+        const numPoints = Math.floor(allData.length / 2);
         const spectrum = new Uint16Array(numPoints);
+        const view = new DataView(allData.buffer, allData.byteOffset, allData.byteLength);
         
         for (let i = 0; i < numPoints; i++) {
-          // Leemos como Big Endian (false) que es el estándar industrial
+          // MicroNIR usa Big Endian (el byte más significativo primero)
           spectrum[i] = view.getUint16(i * 2, false);
         }
-        
         return spectrum;
       }
+      
       return null;
     } catch (e) {
-      console.error("Read Error:", e);
+      console.error("Critical Read Error:", e);
       return null;
     }
   }
 
   async setLamp(on: boolean): Promise<boolean> {
     if (this.isSimulated) return true;
-    // Comandos de control de periféricos MicroNIR (ajustados a protocolo binario)
     return await this.sendRaw(on ? "02 01 01 03" : "02 01 00 03");
   }
 
