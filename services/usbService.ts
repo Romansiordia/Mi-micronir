@@ -1,7 +1,6 @@
 
 import { USB_CONFIG } from "../constants";
 
-// Opcodes y constantes derivados del comportamiento del SDK JDSU/Viavi MicroNIR
 const OPCODES = {
   SET_LAMP: 0x01,
   SET_INTEGRATION: 0x02,
@@ -11,13 +10,6 @@ const OPCODES = {
   RESET: 0x0F
 };
 
-const RESPONSE_CODES = {
-  SUCCESS: 0x00,
-  TIMEOUT: 0x01,
-  ABORTED: 0x04
-};
-
-// Tabla CRC8 (Polinomio 0x31 - Dallas/Maxim)
 const CRC8_TABLE = new Uint8Array([
   0x00, 0x5e, 0xbc, 0xe2, 0x61, 0x3f, 0xdd, 0x83, 0xc2, 0x9c, 0x7e, 0x20, 0xa3, 0xfd, 0x1f, 0x41,
   0x9d, 0xc3, 0x21, 0x7f, 0xfc, 0xa2, 0x40, 0x1e, 0x5f, 0x01, 0xe3, 0xbd, 0x3e, 0x60, 0x82, 0xdc,
@@ -45,6 +37,25 @@ function calculateCrc8(data: Uint8Array): number {
   return crc;
 }
 
+/**
+ * Los chips FTDI insertan 2 bytes de estado cada 64 bytes de transferencia USB.
+ * Esta función elimina esos bytes para obtener el stream de datos real.
+ */
+function decapsulateFtdi(data: Uint8Array): Uint8Array {
+  const blockSize = 64;
+  const result = new Uint8Array(data.length); 
+  let destOffset = 0;
+  for (let i = 0; i < data.length; i += blockSize) {
+    const remaining = Math.min(blockSize, data.length - i);
+    if (remaining > 2) {
+      const chunk = data.slice(i + 2, i + remaining);
+      result.set(chunk, destOffset);
+      destOffset += chunk.length;
+    }
+  }
+  return result.slice(0, destOffset);
+}
+
 export class MicroNIRDevice {
   private device: any | null = null;
   private inEndpoint: number = 2;
@@ -68,21 +79,13 @@ export class MicroNIRDevice {
       const interfaceNum = 0;
       try { await this.device.claimInterface(interfaceNum); } catch (e) {}
 
-      const endpoints = this.device.configuration?.interfaces[interfaceNum].alternate.endpoints;
-      endpoints?.forEach((ep: any) => {
-        if (ep.direction === 'in') this.inEndpoint = ep.endpointNumber;
-        if (ep.direction === 'out') this.outEndpoint = ep.endpointNumber;
-      });
+      // FTDI Chip Configuration (Baudrate 115200, Latency 1ms)
+      await this.device.controlTransferOut({ requestType: 'vendor', recipient: 'device', request: 0x00, value: 0x00, index: 0x00 }); 
+      await this.device.controlTransferOut({ requestType: 'vendor', recipient: 'device', request: 0x03, value: 0x401A, index: 0x0000 }); 
+      await this.device.controlTransferOut({ requestType: 'vendor', recipient: 'device', request: 0x01, value: 0x0303, index: 0x0000 }); 
+      await this.device.controlTransferOut({ requestType: 'vendor', recipient: 'device', request: 0x09, value: 0x0001, index: 0x0000 }); 
 
-      // FTDI Chip Configuration
-      await this.device.controlTransferOut({ requestType: 'vendor', recipient: 'device', request: 0x00, value: 0x00, index: 0x00 }); // Reset
-      await this.device.controlTransferOut({ requestType: 'vendor', recipient: 'device', request: 0x03, value: 0x401A, index: 0x0000 }); // 115200 baud
-      await this.device.controlTransferOut({ requestType: 'vendor', recipient: 'device', request: 0x01, value: 0x0303, index: 0x0000 }); // DTR/RTS High
-      await this.device.controlTransferOut({ requestType: 'vendor', recipient: 'device', request: 0x09, value: 0x0001, index: 0x0000 }); // 1ms Latency
-
-      // Handshake inicial: Reset + Set Integration
-      await this.setIntegrationTime(10000); // 10ms
-
+      await this.setIntegrationTime(10000); 
       return true;
     } catch (error) {
       console.error("USB Connect Error:", error);
@@ -90,22 +93,16 @@ export class MicroNIRDevice {
     }
   }
 
-  /**
-   * Envía un comando siguiendo el protocolo CCP:
-   * [STX] [Length] [Opcode] [Payload] [CRC8] [ETX]
-   */
   async sendCommand(opcode: number, payload: number[] = []): Promise<boolean> {
     if (!this.device?.opened) return false;
     try {
-      const payloadLength = 1 + payload.length; // Opcode + Payload
+      const payloadLength = 1 + payload.length; 
       const crcBuffer = new Uint8Array([payloadLength, opcode, ...payload]);
       const crc = calculateCrc8(crcBuffer);
-      
       const packet = new Uint8Array([0x02, payloadLength, opcode, ...payload, crc, 0x03]);
       const result = await this.device.transferOut(this.outEndpoint, packet);
       return result.status === 'ok';
     } catch (e) {
-      console.error("Send Command Error:", e);
       return false;
     }
   }
@@ -119,14 +116,19 @@ export class MicroNIRDevice {
   async getTemperature(): Promise<number | null> {
     if (this.isSimulated) return 24.5 + Math.random();
     await this.sendCommand(OPCODES.GET_TEMPERATURE);
-    await this.delay(50);
+    await this.delay(100);
+    
     const result = await this.device.transferIn(this.inEndpoint, 64);
-    if (result.data && result.data.byteLength > 4) {
-      // Los primeros 2 bytes suelen ser status de FTDI
-      // El 3er byte es la longitud de respuesta
-      // El 4to byte es el Opcode retornado
-      const view = new DataView(result.data.buffer, 4); 
-      return view.getUint16(0, false) / 10.0;
+    if (result.data && result.data.byteLength >= 4) {
+      const clean = decapsulateFtdi(new Uint8Array(result.data.buffer));
+      // Buscar el inicio del paquete CCP [02][LEN][06][DATA_H][DATA_L]
+      for (let i = 0; i < clean.length - 4; i++) {
+        if (clean[i] === 0x02 && clean[i+2] === 0x06) {
+          const view = new DataView(clean.buffer, clean.byteOffset + i + 3, 2);
+          // Dividimos por 1000 para corregir el error de escala (25763 -> 25.76)
+          return view.getUint16(0, false) / 1000.0;
+        }
+      }
     }
     return null;
   }
@@ -136,55 +138,62 @@ export class MicroNIRDevice {
     if (!this.device?.opened) return null;
 
     try {
-      // Limpiar buffer
-      for(let i=0; i<3; i++) { await this.device.transferIn(this.inEndpoint, 64); }
+      // Limpiar buffer de entrada
+      await this.device.transferIn(this.inEndpoint, 1024);
 
       await this.sendCommand(OPCODES.PERFORM_SCAN);
-      await this.delay(450); // Tiempo para integración y conversión ADC
+      await this.delay(600); // Dar tiempo suficiente para la integración
 
-      let accumulated = new Uint8Array(0);
-      const start = Date.now();
+      let rawAccumulated = new Uint8Array(0);
+      const startTime = Date.now();
       
-      while (Date.now() - start < 3000) {
+      // Capturamos hasta obtener suficientes bytes (considerando overhead FTDI)
+      while (Date.now() - startTime < 3000) {
         const result = await this.device.transferIn(this.inEndpoint, 1024);
-        if (result.status === 'ok' && result.data.byteLength > 2) {
-          const chunk = new Uint8Array(result.data.buffer, 2); // Omitir 2 bytes de status FTDI
-          const next = new Uint8Array(accumulated.length + chunk.length);
-          next.set(accumulated);
-          next.set(chunk, accumulated.length);
-          accumulated = next;
-
-          // Detectar si el paquete está completo (288 o 512 bytes son típicos)
-          if (accumulated.length >= 288) break; 
+        if (result.status === 'ok' && result.data.byteLength > 0) {
+          const chunk = new Uint8Array(result.data.buffer);
+          const next = new Uint8Array(rawAccumulated.length + chunk.length);
+          next.set(rawAccumulated);
+          next.set(chunk, rawAccumulated.length);
+          rawAccumulated = next;
+          if (rawAccumulated.length >= 320) break;
         }
-        await this.delay(30);
+        await this.delay(50);
       }
 
-      if (accumulated.length >= 256) {
-        // Encontrar el inicio de los datos (buscamos el opcode de respuesta 0x05)
-        let dataStart = 0;
-        for (let i = 0; i < accumulated.length - 2; i++) {
-          if (accumulated[i] === 0x05) { // Respuesta al Opcode 0x05
-             dataStart = i + 1;
-             break;
+      const clean = decapsulateFtdi(rawAccumulated);
+      
+      // Buscar la cabecera del espectro: [02] [LEN_MSB] [LEN_LSB] [05] ... 
+      // O [02] [LEN] [05] dependiendo de la versión del firmware
+      for (let i = 0; i < clean.length - 10; i++) {
+        if (clean[i] === 0x02) {
+          let dataStart = -1;
+          let dataLength = 0;
+
+          if (clean[i+2] === 0x05) { // Formato Length de 1 byte
+            dataStart = i + 3;
+            dataLength = clean[i+1] - 1;
+          } else if (clean[i+3] === 0x05) { // Formato Length de 2 bytes
+            dataStart = i + 4;
+            dataLength = (clean[i+1] << 8 | clean[i+2]) - 1;
+          }
+
+          if (dataStart !== -1 && dataLength > 100) {
+            const points = Math.floor(dataLength / 2);
+            const spectrum = new Uint16Array(points);
+            const view = new DataView(clean.buffer, clean.byteOffset + dataStart, dataLength);
+            
+            for (let j = 0; j < points; j++) {
+              spectrum[j] = view.getUint16(j * 2, false); // Big Endian
+            }
+            // Validamos que los datos tengan sentido (no sean todo ceros)
+            if (spectrum[10] > 0) return spectrum;
           }
         }
-
-        const dataBytes = accumulated.slice(dataStart);
-        const points = Math.floor(dataBytes.length / 2);
-        const spectrum = new Uint16Array(points);
-        const view = new DataView(dataBytes.buffer, dataBytes.byteOffset, dataBytes.byteLength);
-        
-        for (let i = 0; i < points; i++) {
-          try {
-            spectrum[i] = view.getUint16(i * 2, false); // Big Endian
-          } catch(e) { break; }
-        }
-        return spectrum.filter(v => v !== 0);
       }
       return null;
     } catch (e) {
-      console.error("Read Spectrum Error:", e);
+      console.error("Read Spectrum Critical Error:", e);
       return null;
     }
   }
