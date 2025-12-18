@@ -1,5 +1,6 @@
 
-import React, { useState, useCallback, useEffect } from 'react';
+// Fix: Added React to imports to provide the React namespace required for React.FC type definition
+import React, { useState, useCallback } from 'react';
 import { 
   Usb, Activity, CheckCircle2, 
   Play, RefreshCw, Cpu, Terminal, BrainCircuit,
@@ -55,11 +56,17 @@ const App: React.FC = () => {
   };
 
   const toggleLamp = async () => {
-    const nextOn = lampStatus !== 'ok';
-    const ok = await microNir.setLamp(nextOn);
+    const isCurrentlyOn = lampStatus === 'ok';
+    const nextState = !isCurrentlyOn;
+    
+    addLog(`Cambiando lámpara a ${nextState ? 'ON' : 'OFF'}...`, "info");
+    const ok = await microNir.setLamp(nextState);
+    
     if (ok) {
-      setLampStatus(nextOn ? 'ok' : 'off');
-      addLog(`Lámpara ${nextOn ? 'ENCENDIDA' : 'APAGADA'}`, "success");
+      setLampStatus(nextState ? 'ok' : 'off');
+      addLog(`Lámpara ${nextState ? 'ENCENDIDA' : 'APAGADA'}`, "success");
+    } else {
+      addLog("Error al comunicar con la lámpara.", "error");
     }
   };
 
@@ -136,8 +143,11 @@ const App: React.FC = () => {
             </button>
           ) : (
             <div className="flex items-center gap-2">
-               <button onClick={toggleLamp} className={`px-5 py-2.5 rounded-full font-bold text-xs border transition-all ${lampStatus === 'ok' ? 'bg-orange-500/20 border-orange-500/50 text-orange-400' : 'bg-slate-800 border-white/5 text-slate-500'}`}>
-                {lampStatus === 'ok' ? 'LÁMPARA ON' : 'LÁMPARA OFF'}
+               <button 
+                  onClick={toggleLamp} 
+                  className={`px-5 py-2.5 rounded-full font-bold text-xs border transition-all ${lampStatus === 'ok' ? 'bg-orange-500 text-white border-orange-400' : 'bg-slate-800 border-white/5 text-slate-500 hover:text-white'}`}
+                >
+                {lampStatus === 'ok' ? 'APAGAR LÁMPARA' : 'ENCENDER LÁMPARA'}
               </button>
               <button onClick={updateHardwareStatus} className="p-2.5 rounded-full bg-slate-800 text-slate-400 border border-white/5 hover:text-white transition-colors">
                 <RefreshCw size={18} />
@@ -149,7 +159,6 @@ const App: React.FC = () => {
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
         <aside className="lg:col-span-4 space-y-6">
-          {/* Hardware Diagnostic Card */}
           <div className="glass-panel p-6 rounded-3xl border-white/5 shadow-lg">
             <h3 className="text-[10px] font-black text-slate-500 uppercase mb-5 flex items-center gap-2 tracking-widest">
               <ShieldCheck size={14} className="text-emerald-500" /> Diagnóstico de Hardware

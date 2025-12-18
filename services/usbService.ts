@@ -37,10 +37,6 @@ function calculateCrc8(data: Uint8Array): number {
   return crc;
 }
 
-/**
- * Los chips FTDI insertan 2 bytes de estado cada 64 bytes de transferencia USB.
- * Esta función elimina esos bytes para obtener el stream de datos real.
- */
 function decapsulateFtdi(data: Uint8Array): Uint8Array {
   const blockSize = 64;
   const result = new Uint8Array(data.length); 
@@ -66,6 +62,16 @@ export class MicroNIRDevice {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
+  /**
+   * Limpia el buffer de entrada del USB para evitar que datos antiguos interfieran.
+   */
+  async clearBuffer() {
+    if (!this.device?.opened) return;
+    try {
+      await this.device.transferIn(this.inEndpoint, 64);
+    } catch (e) {}
+  }
+
   async connect(): Promise<boolean> {
     if (this.isSimulated) return true;
     try {
@@ -79,7 +85,6 @@ export class MicroNIRDevice {
       const interfaceNum = 0;
       try { await this.device.claimInterface(interfaceNum); } catch (e) {}
 
-      // FTDI Chip Configuration (Baudrate 115200, Latency 1ms)
       await this.device.controlTransferOut({ requestType: 'vendor', recipient: 'device', request: 0x00, value: 0x00, index: 0x00 }); 
       await this.device.controlTransferOut({ requestType: 'vendor', recipient: 'device', request: 0x03, value: 0x401A, index: 0x0000 }); 
       await this.device.controlTransferOut({ requestType: 'vendor', recipient: 'device', request: 0x01, value: 0x0303, index: 0x0000 }); 
@@ -96,11 +101,19 @@ export class MicroNIRDevice {
   async sendCommand(opcode: number, payload: number[] = []): Promise<boolean> {
     if (!this.device?.opened) return false;
     try {
+      // Limpiar antes de enviar
+      await this.clearBuffer();
+      
       const payloadLength = 1 + payload.length; 
       const crcBuffer = new Uint8Array([payloadLength, opcode, ...payload]);
       const crc = calculateCrc8(crcBuffer);
       const packet = new Uint8Array([0x02, payloadLength, opcode, ...payload, crc, 0x03]);
       const result = await this.device.transferOut(this.outEndpoint, packet);
+      
+      // Esperar brevemente y consumir el ACK del equipo
+      await this.delay(20);
+      await this.device.transferIn(this.inEndpoint, 64);
+      
       return result.status === 'ok';
     } catch (e) {
       return false;
@@ -115,21 +128,24 @@ export class MicroNIRDevice {
 
   async getTemperature(): Promise<number | null> {
     if (this.isSimulated) return 24.5 + Math.random();
-    await this.sendCommand(OPCODES.GET_TEMPERATURE);
-    await this.delay(100);
-    
-    const result = await this.device.transferIn(this.inEndpoint, 64);
-    if (result.data && result.data.byteLength >= 4) {
-      const clean = decapsulateFtdi(new Uint8Array(result.data.buffer));
-      // Buscar el inicio del paquete CCP [02][LEN][06][DATA_H][DATA_L]
-      for (let i = 0; i < clean.length - 4; i++) {
-        if (clean[i] === 0x02 && clean[i+2] === 0x06) {
-          const view = new DataView(clean.buffer, clean.byteOffset + i + 3, 2);
-          // Dividimos por 1000 para corregir el error de escala (25763 -> 25.76)
-          return view.getUint16(0, false) / 1000.0;
+    // Para temperatura no usamos sendCommand genérico para tener control total del flujo
+    try {
+      await this.clearBuffer();
+      const packet = new Uint8Array([0x02, 0x01, 0x06, calculateCrc8(new Uint8Array([0x01, 0x06])), 0x03]);
+      await this.device.transferOut(this.outEndpoint, packet);
+      await this.delay(100);
+      
+      const result = await this.device.transferIn(this.inEndpoint, 64);
+      if (result.data && result.data.byteLength >= 4) {
+        const clean = decapsulateFtdi(new Uint8Array(result.data.buffer));
+        for (let i = 0; i < clean.length - 4; i++) {
+          if (clean[i] === 0x02 && clean[i+2] === 0x06) {
+            const view = new DataView(clean.buffer, clean.byteOffset + i + 3, 2);
+            return view.getUint16(0, false) / 1000.0;
+          }
         }
       }
-    }
+    } catch(e) {}
     return null;
   }
 
@@ -138,17 +154,15 @@ export class MicroNIRDevice {
     if (!this.device?.opened) return null;
 
     try {
-      // Limpiar buffer de entrada
-      await this.device.transferIn(this.inEndpoint, 1024);
-
-      await this.sendCommand(OPCODES.PERFORM_SCAN);
-      await this.delay(600); // Dar tiempo suficiente para la integración
+      await this.clearBuffer();
+      const packet = new Uint8Array([0x02, 0x01, 0x05, calculateCrc8(new Uint8Array([0x01, 0x05])), 0x03]);
+      await this.device.transferOut(this.outEndpoint, packet);
+      await this.delay(650); 
 
       let rawAccumulated = new Uint8Array(0);
       const startTime = Date.now();
       
-      // Capturamos hasta obtener suficientes bytes (considerando overhead FTDI)
-      while (Date.now() - startTime < 3000) {
+      while (Date.now() - startTime < 4000) {
         const result = await this.device.transferIn(this.inEndpoint, 1024);
         if (result.status === 'ok' && result.data.byteLength > 0) {
           const chunk = new Uint8Array(result.data.buffer);
@@ -162,38 +176,30 @@ export class MicroNIRDevice {
       }
 
       const clean = decapsulateFtdi(rawAccumulated);
-      
-      // Buscar la cabecera del espectro: [02] [LEN_MSB] [LEN_LSB] [05] ... 
-      // O [02] [LEN] [05] dependiendo de la versión del firmware
       for (let i = 0; i < clean.length - 10; i++) {
         if (clean[i] === 0x02) {
           let dataStart = -1;
           let dataLength = 0;
-
-          if (clean[i+2] === 0x05) { // Formato Length de 1 byte
+          if (clean[i+2] === 0x05) { 
             dataStart = i + 3;
             dataLength = clean[i+1] - 1;
-          } else if (clean[i+3] === 0x05) { // Formato Length de 2 bytes
+          } else if (clean[i+3] === 0x05) { 
             dataStart = i + 4;
             dataLength = (clean[i+1] << 8 | clean[i+2]) - 1;
           }
-
           if (dataStart !== -1 && dataLength > 100) {
             const points = Math.floor(dataLength / 2);
             const spectrum = new Uint16Array(points);
             const view = new DataView(clean.buffer, clean.byteOffset + dataStart, dataLength);
-            
             for (let j = 0; j < points; j++) {
-              spectrum[j] = view.getUint16(j * 2, false); // Big Endian
+              spectrum[j] = view.getUint16(j * 2, false); 
             }
-            // Validamos que los datos tengan sentido (no sean todo ceros)
             if (spectrum[10] > 0) return spectrum;
           }
         }
       }
       return null;
     } catch (e) {
-      console.error("Read Spectrum Critical Error:", e);
       return null;
     }
   }
