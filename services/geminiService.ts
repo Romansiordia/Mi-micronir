@@ -2,39 +2,28 @@
 import { GoogleGenAI } from "@google/genai";
 import { WavelengthPoint, LampStatus } from "../types";
 
-// Inicialización diferida para mayor seguridad
-let aiInstance: GoogleGenAI | null = null;
-
-const getAI = () => {
-  if (!aiInstance) {
-    const apiKey = process.env.API_KEY || (window as any).process?.env?.API_KEY;
-    aiInstance = new GoogleGenAI({ apiKey: apiKey });
-  }
-  return aiInstance;
-};
-
 export const getAIInterpretation = async (
   spectralData: WavelengthPoint[], 
   prediction: string | null,
   lampStatus: LampStatus
 ) => {
   try {
-    const ai = getAI();
+    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
     const response = await ai.models.generateContent({
       model: "gemini-3-pro-preview",
       contents: `
-        Act as a Chemometrics and NIR Spectroscopy expert. 
-        Diagnostic Information:
-        - Current Lamp Status: ${lampStatus}
-        - Prediction (Protein/Moisture): ${prediction || 'N/A'}%
-        - Spectral Sample (first 5 points): ${JSON.stringify(spectralData.slice(0, 5))}
+        Actúa como un experto en Quimiometría y Espectroscopia NIR. 
+        Información de Diagnóstico:
+        - Estado actual de la lámpara: ${lampStatus}
+        - Predicción calculada (Proteína/Humedad): ${prediction || 'N/A'}%
+        - Muestra espectral (primeros 5 puntos): ${JSON.stringify(spectralData.slice(0, 5))}
         
-        Tasks:
-        1. If status is "error_nan", explain technical causes (e.g., USB power sag, ftdi driver issues).
-        2. Briefly explain what the current absorbance curve suggests for pig feed quality.
-        3. Provide a one-sentence recommendation for the operator.
+        Tareas:
+        1. Si el estado es "error_nan", explica causas técnicas posibles.
+        2. Explica brevemente qué sugiere la curva de absorbancia actual para la calidad del producto.
+        3. Proporciona una recomendación de una frase para el operador.
         
-        Keep the response technical but concise. Use Spanish.
+        Mantén la respuesta técnica pero concisa. Usa Español.
       `
     });
 

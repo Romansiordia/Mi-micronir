@@ -90,8 +90,7 @@ const App: React.FC = () => {
       } else {
         setCalib(prev => {
           const next = { ...prev, [type]: Array.from(raw) };
-          // Una calibración es válida si ambos están presentes
-          const hasBoth = (type === 'dark' && prev.reference) || (type === 'reference' && prev.dark);
+          const hasBoth = (type === 'dark' && !!prev.reference) || (type === 'reference' && !!prev.dark);
           next.step = hasBoth ? 'ready' : type;
           return next;
         });
@@ -162,10 +161,6 @@ const App: React.FC = () => {
     setIsMeasuring(false);
   };
 
-  // El botón debe estar activo si:
-  // 1. Hay conexión (real o simulada)
-  // 2. No estamos midiendo ya
-  // 3. (Estamos en simulación) O (Calibración está 'ready')
   const isScanDisabled = !isConnected || isMeasuring || (calib.step !== 'ready' && !simulationMode);
 
   return (
@@ -352,4 +347,22 @@ const App: React.FC = () => {
                 <div className="bg-indigo-500/20 p-3 rounded-2xl">
                   <BrainCircuit className="text-indigo-400" size={24} />
                 </div>
-                <h4 className
+                <h4 className="text-sm font-black text-white uppercase tracking-widest italic">Diagnóstico Inteligente</h4>
+              </div>
+              <p className="text-slate-300 leading-relaxed text-sm italic bg-slate-950/40 p-6 rounded-3xl border border-white/5 shadow-inner">
+                "{aiInsight}"
+              </p>
+            </div>
+          )}
+        </main>
+      </div>
+      
+      <style>{`
+        .custom-scrollbar::-webkit-scrollbar { width: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 10px; }
+      `}</style>
+    </div>
+  );
+};
+
+export default App;
