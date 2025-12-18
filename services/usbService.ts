@@ -63,13 +63,16 @@ export class MicroNIRDevice {
   }
 
   /**
-   * Limpia el buffer de entrada del USB para evitar que datos antiguos interfieran.
+   * Intenta limpiar el buffer sin bloquear el flujo si no hay datos.
    */
   async clearBuffer() {
     if (!this.device?.opened) return;
     try {
+      // Usamos un transferIn pequeño con la esperanza de que si está vacío falle rápido
       await this.device.transferIn(this.inEndpoint, 64);
-    } catch (e) {}
+    } catch (e) {
+      // Ignorar errores de buffer vacío
+    }
   }
 
   async connect(): Promise<boolean> {
@@ -85,6 +88,7 @@ export class MicroNIRDevice {
       const interfaceNum = 0;
       try { await this.device.claimInterface(interfaceNum); } catch (e) {}
 
+      // Configuración inicial FTDI
       await this.device.controlTransferOut({ requestType: 'vendor', recipient: 'device', request: 0x00, value: 0x00, index: 0x00 }); 
       await this.device.controlTransferOut({ requestType: 'vendor', recipient: 'device', request: 0x03, value: 0x401A, index: 0x0000 }); 
       await this.device.controlTransferOut({ requestType: 'vendor', recipient: 'device', request: 0x01, value: 0x0303, index: 0x0000 }); 
@@ -98,24 +102,22 @@ export class MicroNIRDevice {
     }
   }
 
+  /**
+   * Envía un comando y retorna éxito si el hardware aceptó el paquete.
+   * No espera respuesta (ACK) para evitar bloqueos en comandos de control (lámpara).
+   */
   async sendCommand(opcode: number, payload: number[] = []): Promise<boolean> {
     if (!this.device?.opened) return false;
     try {
-      // Limpiar antes de enviar
-      await this.clearBuffer();
-      
       const payloadLength = 1 + payload.length; 
       const crcBuffer = new Uint8Array([payloadLength, opcode, ...payload]);
       const crc = calculateCrc8(crcBuffer);
       const packet = new Uint8Array([0x02, payloadLength, opcode, ...payload, crc, 0x03]);
+      
       const result = await this.device.transferOut(this.outEndpoint, packet);
-      
-      // Esperar brevemente y consumir el ACK del equipo
-      await this.delay(20);
-      await this.device.transferIn(this.inEndpoint, 64);
-      
       return result.status === 'ok';
     } catch (e) {
+      console.error("Command sending failed:", e);
       return false;
     }
   }
@@ -128,7 +130,6 @@ export class MicroNIRDevice {
 
   async getTemperature(): Promise<number | null> {
     if (this.isSimulated) return 24.5 + Math.random();
-    // Para temperatura no usamos sendCommand genérico para tener control total del flujo
     try {
       await this.clearBuffer();
       const packet = new Uint8Array([0x02, 0x01, 0x06, calculateCrc8(new Uint8Array([0x01, 0x06])), 0x03]);
@@ -141,6 +142,7 @@ export class MicroNIRDevice {
         for (let i = 0; i < clean.length - 4; i++) {
           if (clean[i] === 0x02 && clean[i+2] === 0x06) {
             const view = new DataView(clean.buffer, clean.byteOffset + i + 3, 2);
+            // Factor de escala corregido (25763 -> 25.76C)
             return view.getUint16(0, false) / 1000.0;
           }
         }
@@ -205,7 +207,12 @@ export class MicroNIRDevice {
   }
 
   async setLamp(on: boolean): Promise<boolean> {
-    return await this.sendCommand(OPCODES.SET_LAMP, [on ? 0x01 : 0x00]);
+    const success = await this.sendCommand(OPCODES.SET_LAMP, [on ? 0x01 : 0x00]);
+    // Intentamos limpiar cualquier eco residual después de un comando de lámpara
+    if (success) {
+      setTimeout(() => this.clearBuffer(), 50);
+    }
+    return success;
   }
 
   async disconnect() {
