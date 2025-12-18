@@ -2,7 +2,16 @@
 import { GoogleGenAI } from "@google/genai";
 import { WavelengthPoint, LampStatus } from "../types";
 
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+// Inicialización diferida para mayor seguridad
+let aiInstance: GoogleGenAI | null = null;
+
+const getAI = () => {
+  if (!aiInstance) {
+    const apiKey = process.env.API_KEY || (window as any).process?.env?.API_KEY;
+    aiInstance = new GoogleGenAI({ apiKey: apiKey });
+  }
+  return aiInstance;
+};
 
 export const getAIInterpretation = async (
   spectralData: WavelengthPoint[], 
@@ -10,7 +19,7 @@ export const getAIInterpretation = async (
   lampStatus: LampStatus
 ) => {
   try {
-    // Fix: Upgraded to 'gemini-3-pro-preview' for advanced reasoning and STEM tasks like NIR spectroscopy analysis.
+    const ai = getAI();
     const response = await ai.models.generateContent({
       model: "gemini-3-pro-preview",
       contents: `
@@ -29,7 +38,6 @@ export const getAIInterpretation = async (
       `
     });
 
-    // Fix: Directly accessing the .text property from GenerateContentResponse as it is not a method.
     return response.text || "No se pudo generar una interpretación técnica en este momento.";
   } catch (error) {
     console.error("Gemini interpretation error:", error);
