@@ -35,6 +35,11 @@ export class MicroNIRDevice {
     }
   }
 
+  // Verifica si el hardware real está activo
+  get isHardwareReady(): boolean {
+    return this.device !== null && this.device.opened;
+  }
+
   async sendRaw(hexString: string): Promise<boolean> {
     if (this.isSimulated) return true;
     if (!this.device?.opened) return false;
@@ -50,7 +55,6 @@ export class MicroNIRDevice {
 
   async readSpectrum(): Promise<Uint16Array | null> {
     if (this.isSimulated) {
-      // Espectro base de proteína (~15%) con variaciones reales
       return new Uint16Array(Array.from({ length: 100 }, (_, i) => {
         const base = 20000 + Math.sin(i / 10) * 5000;
         return Math.floor(base + Math.random() * 200);
@@ -60,15 +64,12 @@ export class MicroNIRDevice {
     if (!this.device?.opened) return null;
 
     try {
-      // Limpiar buffer previo antes de pedir nuevo espectro
       await this.device.transferIn(this.inEndpoint, 512).catch(() => {});
-      
       await this.sendRaw("05"); 
       const result = await this.device.transferIn(this.inEndpoint, 512);
       
       if (result.data && result.data.byteLength >= 200) {
         const data = new Uint16Array(result.data.buffer);
-        // Validación extra: ¿Hay señal real?
         const sum = data.reduce((a, b) => a + b, 0);
         if (sum === 0) return null;
         return data;
