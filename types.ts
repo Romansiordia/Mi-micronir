@@ -22,11 +22,12 @@ export interface ChemometricModel {
 
 export type LampStatus = 'ok' | 'error_nan' | 'off' | 'unknown';
 
-export interface ScanResult {
-  timestamp: string;
-  data: WavelengthPoint[];
-  prediction: string;
-  modelUsed: string;
+export interface DeviceInfo {
+  serialNumber: string;
+  model: string;
+  temperature: number;
+  firmware: string;
+  pixelCount: number;
 }
 
 export interface LogEntry {
