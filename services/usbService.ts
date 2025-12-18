@@ -1,7 +1,7 @@
 
 import { USB_CONFIG } from "../constants";
 
-// Opcodes basados en el análisis del SDK JDSU.MicroNir.Api
+// Opcodes y constantes derivados del comportamiento del SDK JDSU/Viavi MicroNIR
 const OPCODES = {
   SET_LAMP: 0x01,
   SET_INTEGRATION: 0x02,
@@ -10,6 +10,40 @@ const OPCODES = {
   GET_TEMPERATURE: 0x06,
   RESET: 0x0F
 };
+
+const RESPONSE_CODES = {
+  SUCCESS: 0x00,
+  TIMEOUT: 0x01,
+  ABORTED: 0x04
+};
+
+// Tabla CRC8 (Polinomio 0x31 - Dallas/Maxim)
+const CRC8_TABLE = new Uint8Array([
+  0x00, 0x5e, 0xbc, 0xe2, 0x61, 0x3f, 0xdd, 0x83, 0xc2, 0x9c, 0x7e, 0x20, 0xa3, 0xfd, 0x1f, 0x41,
+  0x9d, 0xc3, 0x21, 0x7f, 0xfc, 0xa2, 0x40, 0x1e, 0x5f, 0x01, 0xe3, 0xbd, 0x3e, 0x60, 0x82, 0xdc,
+  0x23, 0x7d, 0x9f, 0xc1, 0x42, 0x1c, 0xfe, 0xa0, 0xe1, 0xbf, 0x5d, 0x03, 0x80, 0xde, 0x3c, 0x62,
+  0xbe, 0xe0, 0x02, 0x5c, 0xdf, 0x81, 0x63, 0x3d, 0x7c, 0x22, 0xc0, 0x9e, 0x1d, 0x43, 0xa1, 0xff,
+  0x46, 0x18, 0xfa, 0xa4, 0x27, 0x79, 0x9b, 0xc5, 0x84, 0xda, 0x38, 0x66, 0xe5, 0xbb, 0x59, 0x07,
+  0xdb, 0x85, 0x67, 0x39, 0xba, 0xe4, 0x06, 0x58, 0x19, 0x47, 0xa5, 0xfb, 0x78, 0x26, 0xc4, 0x9a,
+  0x65, 0x3b, 0xd9, 0x87, 0x04, 0x5a, 0xb8, 0xe6, 0xa7, 0xf9, 0x1b, 0x45, 0xc6, 0x98, 0x7a, 0x24,
+  0xf8, 0xa6, 0x44, 0x1a, 0x99, 0xc7, 0x25, 0x7b, 0x3a, 0x64, 0x86, 0xd8, 0x5b, 0x05, 0xe7, 0xb9,
+  0x8c, 0xd2, 0x30, 0x6e, 0xed, 0xb3, 0x51, 0x0f, 0x4e, 0x10, 0xf2, 0xac, 0x2f, 0x71, 0x93, 0xcd,
+  0x11, 0x4f, 0xad, 0xf3, 0x70, 0x2e, 0xcc, 0x92, 0xd3, 0x8d, 0x6f, 0x31, 0x8f, 0xd1, 0x50, 0x0e,
+  0xaf, 0xf1, 0x13, 0x4d, 0xce, 0x90, 0x72, 0x2c, 0x6d, 0x33, 0x81, 0xdf, 0x0c, 0x52, 0xb0, 0xee,
+  0x32, 0x6c, 0x8e, 0xd0, 0x53, 0x0d, 0xef, 0xb1, 0xf0, 0xae, 0x4c, 0x12, 0x91, 0xcf, 0x2d, 0x73,
+  0xca, 0x94, 0x76, 0x28, 0xab, 0xf5, 0x17, 0x49, 0x08, 0x56, 0xb4, 0xea, 0x69, 0x37, 0x85, 0xdb,
+  0x57, 0x09, 0xeb, 0xb5, 0x36, 0x68, 0x8a, 0xd4, 0x95, 0xcb, 0x29, 0x77, 0xf4, 0xaa, 0x48, 0x16,
+  0xe9, 0xb7, 0x55, 0x0b, 0x88, 0xd6, 0x34, 0x6a, 0x2b, 0x75, 0x97, 0xc9, 0x4a, 0x14, 0xf6, 0xa8,
+  0x74, 0x2a, 0xc8, 0x96, 0x15, 0x4b, 0xa9, 0xf7, 0xb6, 0xe8, 0x0a, 0x54, 0xd7, 0x89, 0x6b, 0x35
+]);
+
+function calculateCrc8(data: Uint8Array): number {
+  let crc = 0;
+  for (let i = 0; i < data.length; i++) {
+    crc = CRC8_TABLE[crc ^ data[i]];
+  }
+  return crc;
+}
 
 export class MicroNIRDevice {
   private device: any | null = null;
@@ -40,14 +74,14 @@ export class MicroNIRDevice {
         if (ep.direction === 'out') this.outEndpoint = ep.endpointNumber;
       });
 
-      // --- CONFIGURACIÓN FTDI ---
+      // FTDI Chip Configuration
       await this.device.controlTransferOut({ requestType: 'vendor', recipient: 'device', request: 0x00, value: 0x00, index: 0x00 }); // Reset
       await this.device.controlTransferOut({ requestType: 'vendor', recipient: 'device', request: 0x03, value: 0x401A, index: 0x0000 }); // 115200 baud
       await this.device.controlTransferOut({ requestType: 'vendor', recipient: 'device', request: 0x01, value: 0x0303, index: 0x0000 }); // DTR/RTS High
       await this.device.controlTransferOut({ requestType: 'vendor', recipient: 'device', request: 0x09, value: 0x0001, index: 0x0000 }); // 1ms Latency
 
-      // Inicializar integración (10ms = 10000us)
-      await this.setIntegrationTime(10000);
+      // Handshake inicial: Reset + Set Integration
+      await this.setIntegrationTime(10000); // 10ms
 
       return true;
     } catch (error) {
@@ -56,17 +90,27 @@ export class MicroNIRDevice {
     }
   }
 
+  /**
+   * Envía un comando siguiendo el protocolo CCP:
+   * [STX] [Length] [Opcode] [Payload] [CRC8] [ETX]
+   */
   async sendCommand(opcode: number, payload: number[] = []): Promise<boolean> {
     if (!this.device?.opened) return false;
     try {
-      const bytes = new Uint8Array([0x02, opcode, ...payload, 0x03]);
-      const result = await this.device.transferOut(this.outEndpoint, bytes);
+      const payloadLength = 1 + payload.length; // Opcode + Payload
+      const crcBuffer = new Uint8Array([payloadLength, opcode, ...payload]);
+      const crc = calculateCrc8(crcBuffer);
+      
+      const packet = new Uint8Array([0x02, payloadLength, opcode, ...payload, crc, 0x03]);
+      const result = await this.device.transferOut(this.outEndpoint, packet);
       return result.status === 'ok';
-    } catch (e) { return false; }
+    } catch (e) {
+      console.error("Send Command Error:", e);
+      return false;
+    }
   }
 
   async setIntegrationTime(us: number): Promise<boolean> {
-    // El payload son 2 bytes (MSB, LSB)
     const msb = (us >> 8) & 0xFF;
     const lsb = us & 0xFF;
     return await this.sendCommand(OPCODES.SET_INTEGRATION, [msb, lsb]);
@@ -77,9 +121,12 @@ export class MicroNIRDevice {
     await this.sendCommand(OPCODES.GET_TEMPERATURE);
     await this.delay(50);
     const result = await this.device.transferIn(this.inEndpoint, 64);
-    if (result.data && result.data.byteLength > 3) {
-      const view = new DataView(result.data.buffer, 2); // Saltamos 2 bytes FTDI
-      return view.getUint16(1, false) / 10.0; // Típico factor MicroNIR
+    if (result.data && result.data.byteLength > 4) {
+      // Los primeros 2 bytes suelen ser status de FTDI
+      // El 3er byte es la longitud de respuesta
+      // El 4to byte es el Opcode retornado
+      const view = new DataView(result.data.buffer, 4); 
+      return view.getUint16(0, false) / 10.0;
     }
     return null;
   }
@@ -89,42 +136,57 @@ export class MicroNIRDevice {
     if (!this.device?.opened) return null;
 
     try {
-      // Purgar buffer
-      for(let i=0; i<5; i++) { await this.device.transferIn(this.inEndpoint, 64); }
+      // Limpiar buffer
+      for(let i=0; i<3; i++) { await this.device.transferIn(this.inEndpoint, 64); }
 
-      // Disparar Escaneo
       await this.sendCommand(OPCODES.PERFORM_SCAN);
-      await this.delay(400); // Tiempo de integración + procesamiento hardware
+      await this.delay(450); // Tiempo para integración y conversión ADC
 
       let accumulated = new Uint8Array(0);
       const start = Date.now();
       
-      while (Date.now() - start < 2000) {
+      while (Date.now() - start < 3000) {
         const result = await this.device.transferIn(this.inEndpoint, 1024);
         if (result.status === 'ok' && result.data.byteLength > 2) {
-          const chunk = new Uint8Array(result.data.buffer, 2);
+          const chunk = new Uint8Array(result.data.buffer, 2); // Omitir 2 bytes de status FTDI
           const next = new Uint8Array(accumulated.length + chunk.length);
           next.set(accumulated);
           next.set(chunk, accumulated.length);
           accumulated = next;
 
-          // On-Site-W suele enviar BINARY_SCAN512 (512 bytes = 256 píxeles)
-          if (accumulated.length >= 512) break;
+          // Detectar si el paquete está completo (288 o 512 bytes son típicos)
+          if (accumulated.length >= 288) break; 
         }
-        await this.delay(20);
+        await this.delay(30);
       }
 
       if (accumulated.length >= 256) {
-        const points = Math.floor(accumulated.length / 2);
-        const spectrum = new Uint16Array(points);
-        const view = new DataView(accumulated.buffer, accumulated.byteOffset, accumulated.byteLength);
-        for (let i = 0; i < points; i++) {
-          spectrum[i] = view.getUint16(i * 2, false); // Big Endian
+        // Encontrar el inicio de los datos (buscamos el opcode de respuesta 0x05)
+        let dataStart = 0;
+        for (let i = 0; i < accumulated.length - 2; i++) {
+          if (accumulated[i] === 0x05) { // Respuesta al Opcode 0x05
+             dataStart = i + 1;
+             break;
+          }
         }
-        return spectrum;
+
+        const dataBytes = accumulated.slice(dataStart);
+        const points = Math.floor(dataBytes.length / 2);
+        const spectrum = new Uint16Array(points);
+        const view = new DataView(dataBytes.buffer, dataBytes.byteOffset, dataBytes.byteLength);
+        
+        for (let i = 0; i < points; i++) {
+          try {
+            spectrum[i] = view.getUint16(i * 2, false); // Big Endian
+          } catch(e) { break; }
+        }
+        return spectrum.filter(v => v !== 0);
       }
       return null;
-    } catch (e) { return null; }
+    } catch (e) {
+      console.error("Read Spectrum Error:", e);
+      return null;
+    }
   }
 
   async setLamp(on: boolean): Promise<boolean> {
