@@ -165,18 +165,16 @@ export class MicroNIRBLEDriver {
       this.isConnected = true;
       this.rxBuffer = new Uint8Array(0);
 
-      // --- ESTRATEGIA DE CONEXIÓN V4 (Reset & Full Config w/ Gain) ---
+      // --- ESTRATEGIA DE CONEXIÓN V5 (Fix NAK: Big Endian & Correct Order) ---
       
-      // 1. Reset Soft
-      console.log("Enviando RESET (0x0F)...");
-      await this.send(CMD.RESET, [], true);
-      await this.sleep(500); 
+      // Nota: Se eliminó el RESET (0x0F) ya que provocaba NAK.
 
-      // 2. Inicialización: Configurar Integración + Scan Count + Gain
+      // 1. Inicialización: Configurar Scans + Integración + Gain
+      // Usando orden definido en XML: ConfigureScan(int scans, int integrationTime, GainValue gain)
       console.log("Inicializando Sensor (Config Completa)...");
       await this.initializeSensor();
       
-      // 3. Handshake Final
+      // 2. Handshake Final
       console.log("Verificando Estado (GET INFO)...");
       await this.send(CMD.GET_INFO, [], true); 
 
@@ -193,33 +191,31 @@ export class MicroNIRBLEDriver {
   }
 
   private async initializeSensor() {
-    // Comando 0x02: Set Config
-    // CORRECCIÓN APLICADA: El sensor espera 9 bytes.
-    // Bytes 0-3: Integration Time (µs) - Little Endian
-    // Bytes 4-7: Scan Count (Número de promedios) - Little Endian
-    // Byte 8: Gain (0=Low, 1=High) - Enumerado en documentación
-
-    const integrationTime = 6800; // 6800us
+    // Comando 0x02: ConfigureScan
+    // CORRECCIÓN V5:
+    // 1. Endianness: El dispositivo usa Big Endian (Network Order).
+    // 2. Orden de Parámetros: Scans (4B) -> Integration (4B) -> Gain (1B).
+    
     const scanCount = 50;         // 50 promedios
+    const integrationTime = 6800; // 6800us
     const gain = 0x00;            // Low Gain
 
-    // Serializar Little Endian
-    // Time
-    const t0 = (integrationTime) & 0xFF;
-    const t1 = (integrationTime >> 8) & 0xFF;
-    const t2 = (integrationTime >> 16) & 0xFF;
-    const t3 = (integrationTime >> 24) & 0xFF;
+    // SCANS (Big Endian)
+    const c0 = (scanCount >> 24) & 0xFF;
+    const c1 = (scanCount >> 16) & 0xFF;
+    const c2 = (scanCount >> 8) & 0xFF;
+    const c3 = (scanCount) & 0xFF;
 
-    // Count
-    const c0 = (scanCount) & 0xFF;
-    const c1 = (scanCount >> 8) & 0xFF;
-    const c2 = (scanCount >> 16) & 0xFF;
-    const c3 = (scanCount >> 24) & 0xFF;
+    // TIME (Big Endian)
+    const t0 = (integrationTime >> 24) & 0xFF;
+    const t1 = (integrationTime >> 16) & 0xFF;
+    const t2 = (integrationTime >> 8) & 0xFF;
+    const t3 = (integrationTime) & 0xFF;
 
-    // Payload de 9 bytes
-    const payload = [t0, t1, t2, t3, c0, c1, c2, c3, gain];
+    // Payload de 9 bytes: [SCANS] + [TIME] + [GAIN]
+    const payload = [c0, c1, c2, c3, t0, t1, t2, t3, gain];
 
-    console.log(`Enviando Config [${payload.join(', ')}]`);
+    console.log(`Enviando Config BE [${payload.join(', ')}]`);
     await this.send(CMD.SET_CONFIG, payload, true); 
     await this.sleep(500); 
   }
