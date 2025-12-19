@@ -1,4 +1,3 @@
-
 import { BLE_CONFIG } from "../constants";
 
 // Definiciones de tipos para Web Bluetooth API
@@ -181,13 +180,11 @@ export class MicroNIRBLEDriver {
       this.isConnected = true;
       this.rxBuffer = new Uint8Array(0);
 
-      // --- ESTRATEGIA DE CONEXIÓN V11 (16 Bytes Little Endian) ---
-      // We must use 16 bytes to satisfy the firmware struct size, even if it pushes BLE limits.
-      // If this fails on BLE with 'GATT operation failed', it means the browser MTU is strictly 20 bytes.
+      // --- ESTRATEGIA DE CONEXIÓN V12 (PRUEBA DE LÁMPARA DIRECTA) ---
+      // Omitimos el comando de configuración (0x02) para establecer una conexión básica
+      // y verificar si otros comandos simples funcionan.
       
-      // 1. Inicialización: Configuración completa
-      this.log("Inicializando Sensor (Set Config V11)...");
-      await this.initializeSensor();
+      this.log("V12: Conexión básica establecida. Omitiendo configuración inicial.");
       
       // 2. Handshake Final
       this.log("Verificando Estado (GET INFO)...");
@@ -207,25 +204,7 @@ export class MicroNIRBLEDriver {
   }
 
   private async initializeSensor() {
-    // Comando 0x02: Set Config V11
-    // Firmware rejected 8 and 12 bytes. It likely requires 16 bytes.
-    // Scans (4) + Time (4) + Padding (8)
-    
-    const scanCount = 500; 
-    const integrationTime = 12500; // 12.5ms = 12500us
-
-    const payload = [
-        // Scans (LE)
-        scanCount & 0xFF, (scanCount >> 8) & 0xFF, (scanCount >> 16) & 0xFF, (scanCount >> 24) & 0xFF,
-        // Time (LE)
-        integrationTime & 0xFF, (integrationTime >> 8) & 0xFF, (integrationTime >> 16) & 0xFF, (integrationTime >> 24) & 0xFF,
-        // Padding (8 Bytes to reach 16 bytes)
-        0, 0, 0, 0, 0, 0, 0, 0
-    ];
-
-    this.log(`Enviando Config V11 (LE 16 Bytes) [${payload.join(', ')}]`);
-    await this.send(CMD.SET_CONFIG, payload, true); 
-    await this.sleep(500); 
+    // ESTA FUNCIÓN QUEDA INTENCIONALMENTE VACÍA EN LA V12
   }
 
   async disconnect(): Promise<void> {

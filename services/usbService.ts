@@ -1,4 +1,3 @@
-
 import { USB_CONFIG } from "../constants";
 
 // Comandos del Protocolo MicroNIR
@@ -111,23 +110,10 @@ export class MicroNIRDriver {
       await this.sleep(200);
       await this.flushRx();
       
-      // --- WAKE UP SENSOR (Little Endian Strategy 16 Bytes - V11) ---
-      // Sending 16 Bytes: Scans (4) + Time (4) + Padding (8)
-      // Values from XML: Scans=500, Time=12.5ms (12500us)
-      const scanCount = 500;
-      const integrationTime = 12500;
-
-      const payload = [
-          // Scans Count (Little Endian)
-          scanCount & 0xFF, (scanCount >> 8) & 0xFF, (scanCount >> 16) & 0xFF, (scanCount >> 24) & 0xFF,
-          // Integration Time (Little Endian)
-          integrationTime & 0xFF, (integrationTime >> 8) & 0xFF, (integrationTime >> 16) & 0xFF, (integrationTime >> 24) & 0xFF,
-          // Padding (8 Bytes to reach 16 bytes struct)
-          0, 0, 0, 0, 0, 0, 0, 0
-      ];
-      
-      this.log(`Enviando Init V11 (LE 16 Bytes): [${payload.join(',')}]`);
-      await this.send(CMD.SET_INTEGRATION, payload);
+      // --- V12: OMITIMOS EL COMANDO DE CONFIGURACIÓN INICIAL ---
+      // El objetivo es establecer una conexión básica y probar comandos simples (lámpara)
+      // para validar la capa de comunicación antes de atacar el problema del payload.
+      this.log("V12: Conexión básica establecida. Omitiendo configuración inicial.");
       
       return "OK";
     } catch (error: any) {
