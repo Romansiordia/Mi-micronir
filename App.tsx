@@ -2,7 +2,7 @@
 import React, { useState, useEffect } from 'react';
 import { 
   Usb, Activity, RefreshCw, Zap, AlertCircle, CheckCircle2, 
-  BarChart3, Settings2, ShieldCheck, Thermometer
+  BarChart3, Settings2, ShieldCheck, Thermometer, Power
 } from 'lucide-react';
 import { 
   AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer
@@ -14,11 +14,11 @@ import { WavelengthPoint } from './types';
 
 export default function App() {
   const [status, setStatus] = useState<'disconnected' | 'connecting' | 'ready' | 'error'>('disconnected');
-  const [statusMsg, setStatusMsg] = useState("Esperando dispositivo USB...");
+  const [statusMsg, setStatusMsg] = useState("Listo para conectar");
   const [temp, setTemp] = useState<number | null>(null);
   const [lamp, setLamp] = useState(false);
+  const [isBusy, setIsBusy] = useState(false);
   
-  // Datos Espectrales
   const [darkRef, setDarkRef] = useState<Uint16Array | null>(null);
   const [whiteRef, setWhiteRef] = useState<Uint16Array | null>(null);
   const [spectrum, setSpectrum] = useState<WavelengthPoint[]>([]);
@@ -28,91 +28,110 @@ export default function App() {
   const log = (msg: string) => setStatusMsg(msg);
 
   const connect = async () => {
+    if (isBusy) return;
+    setIsBusy(true);
     setStatus('connecting');
-    log("Solicitando permiso USB...");
+    log("Iniciando secuencia de arranque USB...");
     
-    const res = await device.connect();
-    if (res === "OK") {
-      log("Puerto abierto. Verificando sensor...");
-      // Verificar vida del sensor leyendo temperatura
-      const t = await device.getTemperature();
-      if (t !== null) {
-        setTemp(t);
-        setStatus('ready');
-        log(`Conectado. Temp: ${t.toFixed(1)}°C`);
+    try {
+      const res = await device.connect();
+      if (res === "OK") {
+        log("Chip FTDI Inicializado. Buscando sensor...");
+        
+        // Intentar leer temperatura varias veces si es necesario
+        const t = await device.getTemperature();
+        
+        if (t !== null) {
+          setTemp(t);
+          setStatus('ready');
+          log(`En línea. Temp: ${t.toFixed(1)}°C`);
+        } else {
+          setStatus('error');
+          log("Error: Sensor no responde. Desconecte y reconecte el USB.");
+          // Intentar cerrar para permitir reintento limpio
+          await device.disconnect();
+        }
       } else {
         setStatus('error');
-        log("Error: Sensor no responde (Revise DTR/Power)");
+        log(`Error USB: ${res}`);
       }
-    } else {
+    } catch (e) {
       setStatus('error');
-      log(`Fallo conexión: ${res}`);
+      log("Excepción crítica en driver.");
     }
+    setIsBusy(false);
   };
 
   const toggleLamp = async () => {
-    if (status !== 'ready') return;
+    if (status !== 'ready' || isBusy) return;
+    setIsBusy(true);
     const newState = !lamp;
-    log(newState ? "Encendiendo Lámpara..." : "Apagando...");
+    log(newState ? "Calentando lámpara..." : "Apagando lámpara...");
     
     const ok = await device.setLamp(newState);
     if (ok) {
       setLamp(newState);
-      log(newState ? "Lámpara ON (Estable)" : "Lámpara OFF");
+      log(newState ? "Lámpara ESTABLE" : "Lámpara OFF");
     } else {
-      log("Error enviando comando Lámpara");
+      log("Error: Fallo al cambiar estado de lámpara");
     }
+    setIsBusy(false);
   };
 
   const calibrate = async (type: 'dark' | 'white') => {
-    log(`Adquiriendo referencia ${type.toUpperCase()}...`);
+    if (isBusy) return;
+    setIsBusy(true);
+    log(`Capturando referencia ${type.toUpperCase()}...`);
+    
     const data = await device.scan();
     if (data) {
       if (type === 'dark') setDarkRef(data);
       else setWhiteRef(data);
-      log(`Referencia ${type} guardada (${data.length} px)`);
+      log(`Referencia ${type} guardada OK.`);
     } else {
-      log("Error de lectura: Paquete vacío");
+      log("Error de lectura (Timeout o datos corruptos)");
     }
+    setIsBusy(false);
   };
 
   const measure = async () => {
-    if (!darkRef || !whiteRef) {
-      log("Error: Se requieren referencias Dark/White");
+    if (!darkRef || !whiteRef || isBusy) {
+      log("Falta calibración o el dispositivo está ocupado");
       return;
     }
     
-    log("Escaneando muestra...");
+    setIsBusy(true);
+    log("Midiendo muestra...");
     const raw = await device.scan();
     
     if (raw) {
-      // Procesamiento Chemométrico: Absorbancia = -log10((Sample - Dark) / (White - Dark))
       const plotData: WavelengthPoint[] = [];
       const absData: number[] = [];
       
       for(let i=0; i<raw.length; i++) {
-        // Evitar división por cero
-        const denominator = Math.max((whiteRef[i] - darkRef[i]), 1);
-        const numerator = (raw[i] - darkRef[i]);
-        let r = numerator / denominator;
+        // Cálculo de Absorbancia con protección contra división por cero
+        const d = darkRef[i];
+        const w = whiteRef[i];
+        const s = raw[i];
         
-        // Limites físicos de reflectancia
-        if (r <= 0) r = 0.0001;
-        if (r > 1.2) r = 1.2;
+        // Evitar ceros y negativos en logaritmo
+        const denominator = Math.max((w - d), 1.0);
+        let reflectance = (s - d) / denominator;
+        
+        // Clampear reflectancia a valores físicos razonables
+        reflectance = Math.max(0.0001, Math.min(reflectance, 1.5));
 
-        const abs = -Math.log10(r);
+        const abs = -Math.log10(reflectance);
         absData.push(abs);
         
-        // Mapear a longitudes de onda (Aprox 908nm inicio + 6.2nm/pixel)
         const wl = 908 + (i * 6.25);
         plotData.push({ nm: Math.round(wl), absorbance: abs });
       }
 
       setSpectrum(plotData);
 
-      // Calculo PLS Simple (Producto Punto con coeficientes Beta)
+      // Modelo PLS
       let score = CDM_MODEL.bias;
-      // Usamos los primeros N coeficientes disponibles
       const limit = Math.min(absData.length, CDM_MODEL.betaCoefficients.length);
       for(let i=0; i<limit; i++) {
         score += absData[i] * CDM_MODEL.betaCoefficients[i];
@@ -120,135 +139,161 @@ export default function App() {
       
       const result = score.toFixed(2);
       setPrediction(result);
-      log(`Medición Exitosa. Proteína: ${result}%`);
+      log("Análisis completado.");
 
-      // Consulta AI
       getAIInterpretation(plotData, result, lamp ? 'ok' : 'off').then(setAiAnalysis);
     } else {
-      log("Error crítico: Lectura fallida");
+      log("Error en escaneo de muestra.");
     }
+    setIsBusy(false);
   };
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-200 p-6 font-sans">
-      {/* Header */}
-      <header className="flex justify-between items-center mb-8 bg-slate-900/50 p-6 rounded-2xl border border-white/5">
-        <div>
+    <div className="min-h-screen bg-slate-950 text-slate-200 p-4 md:p-8 font-sans">
+      <header className="flex flex-col md:flex-row justify-between items-center mb-8 bg-slate-900/80 backdrop-blur p-6 rounded-2xl border border-slate-800 shadow-xl">
+        <div className="mb-4 md:mb-0">
           <h1 className="text-2xl font-black text-white tracking-tight flex items-center gap-3">
-            MicroNIR <span className="text-blue-500 bg-blue-500/10 px-2 rounded text-lg">PRO LINK</span>
+            <ShieldCheck className="text-blue-500" />
+            MicroNIR <span className="text-blue-400 bg-blue-500/10 px-2 rounded text-lg border border-blue-500/20">QUANTUM</span>
           </h1>
-          <p className="text-xs text-slate-500 font-mono mt-1 uppercase">Driver v3.0 (Strict Hardware)</p>
+          <p className="text-xs text-slate-500 font-mono mt-1 uppercase ml-1">v4.0.1 Stable • FTDI Native</p>
         </div>
+        
         <div className="flex gap-4 items-center">
-          <div className="text-right">
-            <p className="text-xs font-bold text-slate-400 uppercase">Estado</p>
-            <p className={`text-sm font-bold ${status==='ready' ? 'text-emerald-400' : 'text-amber-400'}`}>
+          <div className="text-right mr-2 hidden md:block">
+            <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Sistema</p>
+            <p className={`text-xs font-bold ${status==='ready' ? 'text-emerald-400' : status==='error' ? 'text-red-400' : 'text-amber-400'}`}>
               {statusMsg}
             </p>
           </div>
+          
           {status === 'disconnected' || status === 'error' ? (
-            <button onClick={connect} className="bg-blue-600 hover:bg-blue-500 text-white px-6 py-3 rounded-xl font-bold flex items-center gap-2 transition-all">
-              <Usb size={20} /> Conectar USB
+            <button onClick={connect} disabled={isBusy} className="bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white px-6 py-3 rounded-xl font-bold flex items-center gap-2 transition-all shadow-lg shadow-blue-900/20">
+              {isBusy ? <RefreshCw className="animate-spin" size={20}/> : <Usb size={20} />} 
+              {status === 'error' ? 'REINTENTAR USB' : 'CONECTAR'}
             </button>
           ) : (
-            <div className="flex gap-2">
-              <button onClick={toggleLamp} className={`px-4 py-2 rounded-lg font-bold border ${lamp ? 'bg-orange-500 text-white border-orange-500' : 'bg-slate-800 border-slate-700'}`}>
+            <div className="flex gap-3">
+              <button 
+                onClick={toggleLamp} 
+                disabled={isBusy}
+                className={`px-5 py-3 rounded-xl font-bold border flex items-center gap-2 transition-all ${lamp ? 'bg-orange-500 text-white border-orange-400 shadow-lg shadow-orange-900/20' : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-white'}`}
+              >
+                <Zap size={18} fill={lamp ? "currentColor" : "none"} />
                 {lamp ? 'LÁMPARA ON' : 'LÁMPARA OFF'}
               </button>
-              <div className="bg-slate-800 px-4 py-2 rounded-lg flex items-center gap-2 border border-slate-700">
-                <Thermometer size={16} className="text-blue-400"/>
-                <span className="font-mono font-bold">{temp ? temp.toFixed(1) : '--'}°C</span>
+              
+              <div className="bg-slate-800 px-5 py-3 rounded-xl flex items-center gap-2 border border-slate-700 shadow-inner">
+                <Thermometer size={18} className="text-emerald-400"/>
+                <span className="font-mono font-bold text-lg">{temp ? temp.toFixed(1) : '--'}°C</span>
               </div>
             </div>
           )}
         </div>
       </header>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        {/* Controles */}
-        <div className="space-y-4">
-          <div className="bg-slate-900/50 p-6 rounded-2xl border border-white/5">
-            <h3 className="text-xs font-black text-slate-500 uppercase tracking-widest mb-4 flex gap-2 items-center">
-              <Settings2 size={14} /> Calibración
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+        {/* Panel de Control */}
+        <div className="lg:col-span-4 space-y-6">
+          {/* Calibración */}
+          <div className="bg-slate-900/50 p-6 rounded-3xl border border-slate-800 relative overflow-hidden group">
+            <div className="absolute top-0 right-0 p-4 opacity-10 group-hover:opacity-20 transition-opacity">
+              <Settings2 size={100} />
+            </div>
+            <h3 className="text-xs font-black text-slate-500 uppercase tracking-widest mb-6 flex gap-2 items-center relative z-10">
+              <Settings2 size={14} /> Secuencia de Calibración
             </h3>
-            <div className="grid grid-cols-2 gap-3">
+            
+            <div className="space-y-3 relative z-10">
               <button 
-                disabled={status !== 'ready' || !lamp}
+                disabled={status !== 'ready' || !lamp || isBusy}
                 onClick={() => calibrate('dark')}
-                className={`p-4 rounded-xl border flex flex-col items-center justify-center gap-2 transition-all ${darkRef ? 'bg-emerald-500/10 border-emerald-500/50 text-emerald-400' : 'bg-slate-800 border-white/5 hover:border-blue-500/50'}`}
+                className={`w-full p-4 rounded-xl border flex items-center justify-between transition-all ${darkRef ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-400' : 'bg-slate-800 border-white/5 hover:border-blue-500/30 text-slate-400'}`}
               >
-                <div className="w-8 h-8 rounded-full bg-black border border-slate-700 mb-1"></div>
-                <span className="text-xs font-bold uppercase">Ref. Oscura</span>
+                <div className="flex items-center gap-3">
+                  <div className="w-3 h-3 rounded-full bg-slate-950 border border-slate-700"></div>
+                  <span className="font-bold text-sm">REFERENCIA OSCURA</span>
+                </div>
+                {darkRef ? <CheckCircle2 size={18} /> : <span className="text-[10px] opacity-50">REQUERIDO</span>}
               </button>
+
               <button 
-                 disabled={status !== 'ready' || !lamp}
+                disabled={status !== 'ready' || !lamp || isBusy}
                 onClick={() => calibrate('white')}
-                className={`p-4 rounded-xl border flex flex-col items-center justify-center gap-2 transition-all ${whiteRef ? 'bg-emerald-500/10 border-emerald-500/50 text-emerald-400' : 'bg-slate-800 border-white/5 hover:border-blue-500/50'}`}
+                className={`w-full p-4 rounded-xl border flex items-center justify-between transition-all ${whiteRef ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-400' : 'bg-slate-800 border-white/5 hover:border-blue-500/30 text-slate-400'}`}
               >
-                <div className="w-8 h-8 rounded-full bg-white mb-1"></div>
-                <span className="text-xs font-bold uppercase">Ref. Blanca</span>
+                <div className="flex items-center gap-3">
+                  <div className="w-3 h-3 rounded-full bg-white border border-slate-200"></div>
+                  <span className="font-bold text-sm">REFERENCIA BLANCA</span>
+                </div>
+                {whiteRef ? <CheckCircle2 size={18} /> : <span className="text-[10px] opacity-50">REQUERIDO</span>}
               </button>
             </div>
           </div>
 
+          {/* Botón Principal */}
           <button 
-            disabled={!darkRef || !whiteRef || !lamp}
+            disabled={!darkRef || !whiteRef || !lamp || isBusy}
             onClick={measure}
-            className={`w-full py-6 rounded-2xl font-black text-lg uppercase tracking-wide shadow-xl transition-all flex items-center justify-center gap-3
-              ${(darkRef && whiteRef && lamp) 
-                ? 'bg-blue-600 hover:bg-blue-500 text-white shadow-blue-900/20' 
-                : 'bg-slate-800 text-slate-600 cursor-not-allowed border border-white/5'}`}
+            className={`w-full py-8 rounded-3xl font-black text-xl uppercase tracking-wider shadow-2xl transition-all flex items-center justify-center gap-3 relative overflow-hidden
+              ${(darkRef && whiteRef && lamp && !isBusy) 
+                ? 'bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white shadow-blue-900/30 transform hover:scale-[1.02]' 
+                : 'bg-slate-800 text-slate-600 cursor-not-allowed border border-slate-700 grayscale opacity-70'}`}
           >
-            <Activity size={24} /> ANALIZAR MUESTRA
+            {isBusy ? <RefreshCw className="animate-spin" size={28} /> : <Activity size={28} />}
+            {isBusy ? 'Procesando...' : 'Analizar Muestra'}
           </button>
 
-           {prediction !== "--" && (
-            <div className="bg-slate-900 p-6 rounded-2xl border border-white/10 text-center relative overflow-hidden">
-               <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-blue-500 to-emerald-500"></div>
-               <span className="text-xs text-slate-500 font-bold uppercase tracking-widest">Resultado (Proteína)</span>
-               <div className="text-6xl font-black text-white mt-2 tracking-tighter">
-                 {prediction}<span className="text-2xl text-slate-600 ml-1">%</span>
+           {/* Resultado */}
+           <div className={`bg-slate-900 p-8 rounded-3xl border text-center transition-all duration-500 ${prediction !== "--" ? 'border-emerald-500/30 bg-emerald-900/10' : 'border-slate-800'}`}>
+               <span className="text-xs text-slate-500 font-bold uppercase tracking-widest block mb-2">Contenido de Proteína</span>
+               <div className="flex items-baseline justify-center gap-1">
+                 <span className={`text-7xl font-black tracking-tighter ${prediction !== "--" ? 'text-white' : 'text-slate-700'}`}>{prediction}</span>
+                 <span className="text-2xl text-slate-600 font-bold">%</span>
                </div>
+               {prediction !== "--" && <div className="mt-4 text-[10px] text-emerald-500 font-bold uppercase tracking-widest bg-emerald-500/10 inline-block px-3 py-1 rounded-full">Análisis Completado</div>}
             </div>
-           )}
         </div>
 
         {/* Gráfico */}
-        <div className="lg:col-span-2 bg-slate-900/50 p-6 rounded-2xl border border-white/5 flex flex-col">
-          <div className="flex justify-between items-center mb-6">
+        <div className="lg:col-span-8 bg-slate-900/50 p-6 rounded-3xl border border-slate-800 flex flex-col min-h-[500px]">
+          <div className="flex justify-between items-center mb-6 px-2">
             <h3 className="text-xs font-black text-slate-500 uppercase tracking-widest flex gap-2 items-center">
-              <BarChart3 size={14} /> Espectro NIR
+              <BarChart3 size={14} /> Espectro de Absorbancia (NIR)
             </h3>
             {aiAnalysis && (
-              <div className="bg-blue-500/10 px-3 py-1 rounded-full border border-blue-500/20 flex items-center gap-2">
-                 <Zap size={12} className="text-blue-400" />
-                 <span className="text-[10px] text-blue-300 font-medium italic truncate max-w-[300px]">{aiAnalysis}</span>
+              <div className="bg-blue-500/10 px-4 py-2 rounded-xl border border-blue-500/20 flex items-center gap-3 max-w-md">
+                 <div className="bg-blue-500 rounded-full p-1"><Zap size={10} className="text-white" /></div>
+                 <span className="text-[11px] text-blue-200 font-medium leading-tight">{aiAnalysis}</span>
               </div>
             )}
           </div>
           
-          <div className="flex-1 min-h-[300px] w-full bg-slate-950/50 rounded-xl border border-white/5 p-2">
+          <div className="flex-1 w-full bg-slate-950/30 rounded-2xl border border-slate-800/50 p-4 relative">
              <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={spectrum}>
+                <AreaChart data={spectrum} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
                   <defs>
                     <linearGradient id="colorAbs" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.3}/>
+                      <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.4}/>
                       <stop offset="95%" stopColor="#3b82f6" stopOpacity={0}/>
                     </linearGradient>
                   </defs>
                   <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} />
-                  <XAxis dataKey="nm" stroke="#475569" fontSize={10} tickFormatter={v => `${v}nm`} />
-                  <YAxis stroke="#475569" fontSize={10} domain={[0, 'auto']} />
+                  <XAxis dataKey="nm" stroke="#475569" fontSize={10} tickLine={false} axisLine={false} tickFormatter={v => `${v} nm`} />
+                  <YAxis stroke="#475569" fontSize={10} tickLine={false} axisLine={false} domain={[0, 'auto']} />
                   <Tooltip 
-                    contentStyle={{ background: '#0f172a', border: '1px solid #1e293b', borderRadius: '8px' }}
-                    itemStyle={{ color: '#3b82f6' }}
+                    contentStyle={{ background: 'rgba(15, 23, 42, 0.9)', border: '1px solid #334155', borderRadius: '12px', boxShadow: '0 10px 15px -3px rgba(0, 0, 0, 0.5)' }}
+                    itemStyle={{ color: '#60a5fa' }}
+                    labelStyle={{ color: '#94a3b8', fontSize: '10px', marginBottom: '4px', textTransform: 'uppercase', letterSpacing: '1px' }}
                   />
-                  <Area type="monotone" dataKey="absorbance" stroke="#3b82f6" fill="url(#colorAbs)" strokeWidth={2} />
+                  <Area type="monotone" dataKey="absorbance" stroke="#3b82f6" strokeWidth={3} fill="url(#colorAbs)" animationDuration={1500} />
                 </AreaChart>
               </ResponsiveContainer>
+              
               {spectrum.length === 0 && (
-                <div className="h-full flex items-center justify-center text-slate-700 text-sm font-medium italic">
-                  No hay datos espectrales. Realice una medición.
+                <div className="absolute inset-0 flex flex-col items-center justify-center text-slate-700 pointer-events-none">
+                  <Activity size={48} className="mb-4 opacity-20" />
+                  <p className="text-sm font-bold uppercase tracking-widest opacity-40">Esperando adquisición de datos</p>
                 </div>
               )}
           </div>
