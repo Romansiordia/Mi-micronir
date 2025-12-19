@@ -1,3 +1,4 @@
+
 import { BLE_CONFIG } from "../constants";
 
 // Definiciones de tipos para Web Bluetooth API
@@ -116,44 +117,58 @@ export class MicroNIRBLEDriver {
       // 3. Obtener Servicio
       const service = await this.server.getPrimaryService(BLE_CONFIG.serviceUUID);
 
-      // 4. DETECCIÓN AUTOMÁTICA DE CARACTERÍSTICAS
-      // En lugar de asumir UUIDs fijos, buscamos por capacidad (Write vs Notify)
-      console.log("Detectando características...");
-      const chars = await service.getCharacteristics();
-      
-      for (const c of chars) {
-        console.log(`Char ${c.uuid} props:`, c.properties);
-        
-        // Buscar canal de escritura (Comandos)
-        if (c.properties.write || c.properties.writeWithoutResponse) {
-          this.txChar = c;
-          console.log(`TX Char asignado: ${c.uuid}`);
-        }
-        
-        // Buscar canal de lectura (Notificaciones)
-        if (c.properties.notify || c.properties.indicate) {
-          this.rxChar = c;
-          console.log(`RX Char asignado: ${c.uuid}`);
-        }
-      }
+      // 4. CONFIGURACIÓN INTELIGENTE DE UUIDs
+      // Obtenemos explícitamente las dos características conocidas (B1 y B2)
+      console.log("Configurando canales de comunicación...");
+      const char1 = await service.getCharacteristic(BLE_CONFIG.txCharUUID); // Termina en c9b1
+      const char2 = await service.getCharacteristic(BLE_CONFIG.rxCharUUID); // Termina en c9b2
 
-      if (!this.txChar || !this.rxChar) {
-        // Fallback a los definidos en config si la detección falla
-        console.warn("Autodetección incompleta, probando UUIDs de config...");
-        if (!this.txChar) this.txChar = await service.getCharacteristic(BLE_CONFIG.txCharUUID);
-        if (!this.rxChar) this.rxChar = await service.getCharacteristic(BLE_CONFIG.rxCharUUID);
+      const char1Props = char1.properties;
+      const char2Props = char2.properties;
+
+      const char1CanWrite = char1Props.write || char1Props.writeWithoutResponse;
+      const char1CanNotify = char1Props.notify || char1Props.indicate;
+      
+      const char2CanWrite = char2Props.write || char2Props.writeWithoutResponse;
+      const char2CanNotify = char2Props.notify || char2Props.indicate;
+
+      console.log(`Char B1 (${char1.uuid.slice(-4)}): Write=${char1CanWrite}, Notify=${char1CanNotify}`);
+      console.log(`Char B2 (${char2.uuid.slice(-4)}): Write=${char2CanWrite}, Notify=${char2CanNotify}`);
+
+      // Lógica de decisión:
+      if (char1CanWrite && !char1CanNotify && char2CanNotify) {
+        // Caso Claro 1: B1 es TX, B2 es RX
+        this.txChar = char1;
+        this.rxChar = char2;
+      } else if (char2CanWrite && !char2CanNotify && char1CanNotify) {
+        // Caso Claro 2 (Invertido): B2 es TX, B1 es RX
+        this.txChar = char2;
+        this.rxChar = char1;
+      } else {
+        // Caso Ambiguo (ambos pueden hacer todo): Usamos B1 para TX y B2 para RX por defecto
+        console.warn("Propiedades ambiguas, usando asignación estándar B1->TX, B2->RX");
+        this.txChar = char1;
+        this.rxChar = char2;
       }
+      
+      console.log(`ASIGNADO: TX -> ${this.txChar?.uuid.slice(-4)}, RX -> ${this.rxChar?.uuid.slice(-4)}`);
 
       // 5. Habilitar Notificaciones (Lectura de datos)
-      await this.rxChar.startNotifications();
-      this.rxChar.addEventListener('characteristicvaluechanged', this.handleNotifications);
+      if (this.rxChar) {
+        await this.rxChar.startNotifications();
+        this.rxChar.addEventListener('characteristicvaluechanged', this.handleNotifications);
+        console.log("Notificaciones habilitadas");
+      }
 
       this.isConnected = true;
-      console.log("Conexión BLE establecida y configurada");
       
       // Limpiar buffer por si acaso
       this.rxBuffer = new Uint8Array(0);
+      this.lastPacket = null;
       
+      // Espera de estabilización
+      await this.sleep(300);
+
       return "OK";
     } catch (error: any) {
       console.error("BLE Error:", error);
@@ -200,7 +215,7 @@ export class MicroNIRBLEDriver {
   async send(opcode: number, data: number[] = []): Promise<boolean> {
     if (!this.isConnected || !this.txChar) return false;
 
-    // Limpiar paquete anterior recibido
+    // Limpiar paquete anterior recibido para asegurar que la respuesta corresponde a este comando
     this.lastPacket = null;
     this.rxBuffer = new Uint8Array(0);
 
@@ -235,22 +250,32 @@ export class MicroNIRBLEDriver {
   }
 
   async getTemperature(): Promise<number | null> {
-    if (!await this.send(CMD.GET_TEMP)) return null;
-    
-    // Esperar respuesta (puede venir en varios chunks BLE, aunque temp es corta)
-    const resp = await this.waitForPacket(2000); // Aumentado timeout a 2s
-    
-    if (resp && resp.length >= 5) {
-      // Buscar Opcode 0x06
-      for(let i=0; i<resp.length-2; i++) {
-        if (resp[i] === 0x06) {
-          const view = new DataView(resp.buffer);
-          if (i + 2 < resp.length) {
-            const rawTemp = view.getUint16(i+1, false); // Big Endian
-            return rawTemp / 1000.0;
+    // Reintentos automáticos para robustez en la conexión inicial
+    for (let attempt = 0; attempt < 3; attempt++) {
+        if (!await this.send(CMD.GET_TEMP)) {
+            await this.sleep(200);
+            continue;
+        }
+        
+        // Esperar respuesta (puede venir en varios chunks BLE, aunque temp es corta)
+        const resp = await this.waitForPacket(2000); // Timeout generoso
+        
+        if (resp && resp.length >= 5) {
+          // Buscar Opcode 0x06
+          for(let i=0; i<resp.length-2; i++) {
+            if (resp[i] === 0x06) {
+              const view = new DataView(resp.buffer);
+              if (i + 2 < resp.length) {
+                const rawTemp = view.getUint16(i+1, false); // Big Endian
+                return rawTemp / 1000.0;
+              }
+            }
           }
         }
-      }
+        
+        // Si falló, esperar antes de reintentar
+        console.warn(`Intento ${attempt + 1} de leer temperatura fallido, reintentando...`);
+        await this.sleep(300);
     }
     return null;
   }
