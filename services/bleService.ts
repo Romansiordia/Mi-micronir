@@ -16,9 +16,20 @@ interface BluetoothRemoteGATTServer {
 
 interface BluetoothRemoteGATTService {
   getCharacteristic(characteristic: string): Promise<BluetoothRemoteGATTCharacteristic>;
+  getCharacteristics(): Promise<BluetoothRemoteGATTCharacteristic[]>;
+}
+
+interface BluetoothCharacteristicProperties {
+  write: boolean;
+  writeWithoutResponse: boolean;
+  notify: boolean;
+  indicate: boolean;
+  read: boolean;
 }
 
 interface BluetoothRemoteGATTCharacteristic extends EventTarget {
+  uuid: string;
+  properties: BluetoothCharacteristicProperties;
   value?: DataView;
   writeValue(value: BufferSource): Promise<void>;
   startNotifications(): Promise<BluetoothRemoteGATTCharacteristic>;
@@ -103,20 +114,42 @@ export class MicroNIRBLEDriver {
       this.server = await this.device.gatt!.connect();
 
       // 3. Obtener Servicio
-      // Intentamos obtener el servicio primario. Puede variar según el firmware, 
-      // pero usaremos el UUID configurado o buscaremos uno genérico.
       const service = await this.server.getPrimaryService(BLE_CONFIG.serviceUUID);
 
-      // 4. Obtener Características RX (Notify) y TX (Write)
-      this.rxChar = await service.getCharacteristic(BLE_CONFIG.rxCharUUID);
-      this.txChar = await service.getCharacteristic(BLE_CONFIG.txCharUUID);
+      // 4. DETECCIÓN AUTOMÁTICA DE CARACTERÍSTICAS
+      // En lugar de asumir UUIDs fijos, buscamos por capacidad (Write vs Notify)
+      console.log("Detectando características...");
+      const chars = await service.getCharacteristics();
+      
+      for (const c of chars) {
+        console.log(`Char ${c.uuid} props:`, c.properties);
+        
+        // Buscar canal de escritura (Comandos)
+        if (c.properties.write || c.properties.writeWithoutResponse) {
+          this.txChar = c;
+          console.log(`TX Char asignado: ${c.uuid}`);
+        }
+        
+        // Buscar canal de lectura (Notificaciones)
+        if (c.properties.notify || c.properties.indicate) {
+          this.rxChar = c;
+          console.log(`RX Char asignado: ${c.uuid}`);
+        }
+      }
+
+      if (!this.txChar || !this.rxChar) {
+        // Fallback a los definidos en config si la detección falla
+        console.warn("Autodetección incompleta, probando UUIDs de config...");
+        if (!this.txChar) this.txChar = await service.getCharacteristic(BLE_CONFIG.txCharUUID);
+        if (!this.rxChar) this.rxChar = await service.getCharacteristic(BLE_CONFIG.rxCharUUID);
+      }
 
       // 5. Habilitar Notificaciones (Lectura de datos)
       await this.rxChar.startNotifications();
       this.rxChar.addEventListener('characteristicvaluechanged', this.handleNotifications);
 
       this.isConnected = true;
-      console.log("Conexión BLE establecida");
+      console.log("Conexión BLE establecida y configurada");
       
       // Limpiar buffer por si acaso
       this.rxBuffer = new Uint8Array(0);
@@ -147,7 +180,6 @@ export class MicroNIRBLEDriver {
     this.rxBuffer = newBuffer;
 
     // Verificar si tenemos un paquete completo (Termina en ETX 0x03)
-    // Nota: El protocolo MicroNIR termina en 0x03.
     if (this.rxBuffer.length > 0 && this.rxBuffer[this.rxBuffer.length - 1] === 0x03) {
       // Guardar como último paquete válido y limpiar buffer para el siguiente
       this.lastPacket = this.rxBuffer;
@@ -180,9 +212,6 @@ export class MicroNIRBLEDriver {
     const packet = new Uint8Array([0x02, ...rawPayload, crc, 0x03]);
 
     try {
-      // BLE tiene límite de MTU (generalmente 20 bytes por defecto).
-      // Si el paquete es largo, hay que fragmentarlo.
-      // Los comandos suelen ser cortos (< 20 bytes), así que enviamos directo.
       await this.txChar.writeValue(packet);
       return true;
     } catch (e) {
@@ -209,7 +238,7 @@ export class MicroNIRBLEDriver {
     if (!await this.send(CMD.GET_TEMP)) return null;
     
     // Esperar respuesta (puede venir en varios chunks BLE, aunque temp es corta)
-    const resp = await this.waitForPacket(1000);
+    const resp = await this.waitForPacket(2000); // Aumentado timeout a 2s
     
     if (resp && resp.length >= 5) {
       // Buscar Opcode 0x06
@@ -227,7 +256,6 @@ export class MicroNIRBLEDriver {
   }
 
   async setLamp(on: boolean): Promise<boolean> {
-    // La lámpara consume mucha batería en BLE, cuidado.
     const ok = await this.send(CMD.LAMP_CONTROL, [on ? 1 : 0]);
     if (ok) await this.sleep(on ? 1500 : 200);
     return ok;
@@ -237,8 +265,7 @@ export class MicroNIRBLEDriver {
     if (!await this.send(CMD.SCAN)) return null;
 
     // Esperar a que lleguen todos los chunks BLE y se reensamble el paquete
-    // Esto puede tardar varios segundos vía BLE
-    const raw = await this.waitForPacket(4000);
+    const raw = await this.waitForPacket(5000); // Aumentado timeout para scan BLE
     
     if (!raw) return null;
 
