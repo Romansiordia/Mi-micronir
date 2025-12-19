@@ -76,9 +76,10 @@ function calculateCrc8(data: Uint8Array): number {
 const CMD = {
   LAMP_CONTROL: 0x01,
   SET_CONFIG: 0x02, 
-  GET_INFO: 0x03, // Handshake / Serial Number
+  GET_INFO: 0x03, 
   SCAN: 0x05,
   GET_TEMP: 0x06,
+  RESET: 0x0F // Comando Reset
 };
 
 export class MicroNIRBLEDriver {
@@ -164,16 +165,21 @@ export class MicroNIRBLEDriver {
       this.isConnected = true;
       this.rxBuffer = new Uint8Array(0);
 
-      // --- ESTRATEGIA DE CONEXIÓN V2 ---
-      // 1. Handshake: Pedir Info primero para validar conexión
-      console.log("Enviando Handshake (GET INFO)...");
-      await this.send(CMD.GET_INFO, [], true); 
-      await this.sleep(300);
+      // --- ESTRATEGIA DE CONEXIÓN V4 (Reset & Full Config w/ Gain) ---
+      
+      // 1. Reset Soft
+      console.log("Enviando RESET (0x0F)...");
+      await this.send(CMD.RESET, [], true);
+      await this.sleep(500); 
 
-      // 2. Inicialización: Configurar integración
-      console.log("Inicializando Sensor...");
+      // 2. Inicialización: Configurar Integración + Scan Count + Gain
+      console.log("Inicializando Sensor (Config Completa)...");
       await this.initializeSensor();
       
+      // 3. Handshake Final
+      console.log("Verificando Estado (GET INFO)...");
+      await this.send(CMD.GET_INFO, [], true); 
+
       this.startKeepAlive();
       
       console.log("BLE Listo.");
@@ -187,21 +193,34 @@ export class MicroNIRBLEDriver {
   }
 
   private async initializeSensor() {
-    // Comando 0x02: Set Config / Integration Time
-    // Payload: 4 bytes (Uint32).
-    // CAMBIO: Enviamos LITTLE ENDIAN (estándar MicroNIR 1700/2200 firmware).
-    // Antes enviábamos Big Endian y el sensor rechazaba (NAK).
-    
-    const integrationTime = 6800; // 6800us
-    
-    // Little Endian: LSB primero
-    const b0 = (integrationTime) & 0xFF;        // 0x90
-    const b1 = (integrationTime >> 8) & 0xFF;   // 0x1A
-    const b2 = (integrationTime >> 16) & 0xFF;  // 0x00
-    const b3 = (integrationTime >> 24) & 0xFF;  // 0x00
+    // Comando 0x02: Set Config
+    // CORRECCIÓN APLICADA: El sensor espera 9 bytes.
+    // Bytes 0-3: Integration Time (µs) - Little Endian
+    // Bytes 4-7: Scan Count (Número de promedios) - Little Endian
+    // Byte 8: Gain (0=Low, 1=High) - Enumerado en documentación
 
-    console.log(`Enviando Config (LE): [${b0}, ${b1}, ${b2}, ${b3}]`);
-    await this.send(CMD.SET_CONFIG, [b0, b1, b2, b3], true); 
+    const integrationTime = 6800; // 6800us
+    const scanCount = 50;         // 50 promedios
+    const gain = 0x00;            // Low Gain
+
+    // Serializar Little Endian
+    // Time
+    const t0 = (integrationTime) & 0xFF;
+    const t1 = (integrationTime >> 8) & 0xFF;
+    const t2 = (integrationTime >> 16) & 0xFF;
+    const t3 = (integrationTime >> 24) & 0xFF;
+
+    // Count
+    const c0 = (scanCount) & 0xFF;
+    const c1 = (scanCount >> 8) & 0xFF;
+    const c2 = (scanCount >> 16) & 0xFF;
+    const c3 = (scanCount >> 24) & 0xFF;
+
+    // Payload de 9 bytes
+    const payload = [t0, t1, t2, t3, c0, c1, c2, c3, gain];
+
+    console.log(`Enviando Config [${payload.join(', ')}]`);
+    await this.send(CMD.SET_CONFIG, payload, true); 
     await this.sleep(500); 
   }
 
@@ -241,8 +260,7 @@ export class MicroNIRBLEDriver {
     if (!value) return;
 
     const chunk = new Uint8Array(value.buffer);
-    // Logging detallado del chunk para debug
-    console.log("RX Chunk RAW:", Array.from(chunk).map(b => b.toString(16).padStart(2, '0')).join(' '));
+    // console.log("RX:", Array.from(chunk).map(b => b.toString(16).padStart(2, '0')).join(' '));
 
     const newBuffer = new Uint8Array(this.rxBuffer.length + chunk.length);
     newBuffer.set(this.rxBuffer);
@@ -269,21 +287,20 @@ export class MicroNIRBLEDriver {
             
             // Validar NAK (0x15)
             if (candidate.length > 1 && candidate[1] === 0x15) {
-                console.warn("Sensor NAK (0x15) recibido. Detalles:", candidate);
+                console.warn("Sensor NAK (0x15) - Comando Rechazado");
                 this.pendingResponse = false; 
                 this.rxBuffer = this.rxBuffer.slice(i + 1);
                 packetFound = true;
                 break; 
             }
 
-            // Validar CRC
             if (candidate.length >= 4) {
                 const payloadForCrc = candidate.slice(1, candidate.length - 2);
                 const packetCrc = candidate[candidate.length - 2];
                 const calcCrc = calculateCrc8(payloadForCrc);
 
                 if (calcCrc === packetCrc) {
-                    console.log("Paquete CRC OK:", candidate);
+                    // console.log("Paquete CRC OK:", candidate);
                     this.lastPacket = candidate;
                     this.pendingResponse = false;
                     this.rxBuffer = this.rxBuffer.slice(i + 1);
@@ -331,6 +348,7 @@ export class MicroNIRBLEDriver {
         return pkt;
       }
       if (!this.pendingResponse && !this.lastPacket) {
+          // Si pendingResponse se volvió false (por NAK u otro), salir.
           return null; 
       }
       await this.sleep(20);
@@ -350,8 +368,6 @@ export class MicroNIRBLEDriver {
         if (resp && resp.length >= 5) {
             if (resp[2] === 0x06) { 
                 const view = new DataView(resp.buffer);
-                // Ajuste para leer temperatura correctamente
-                // Formato suele ser [02, len, 06, MSB, LSB, CRC, 03] (Big Endian)
                 const val = view.getUint16(3, false); 
                 return val / 1000.0;
             }
@@ -375,18 +391,19 @@ export class MicroNIRBLEDriver {
 
     let spectrum: Uint16Array | null = null;
 
+    // Detectar si es respuesta válida de escaneo (Opcode 0x05)
+    // Formato corto: [02, LEN, 05, ...DATA..., CRC, 03]
     if (raw.length > 3 && raw[2] === 0x05) {
         const len = raw[1] - 1;
         spectrum = this.parseSpectrum(raw, 3, len/2);
     }
+    // Formato largo (Extended Length): [02, HI, LO, 05, ...DATA..., CRC, 03]
     else if (raw.length > 4 && raw[3] === 0x05) {
         const len = (raw[1] << 8 | raw[2]) - 1;
         spectrum = this.parseSpectrum(raw, 4, len/2);
     }
-    else if (raw.length < 100) {
-        return null;
-    }
-    else {
+    // Fallback simple por tamaño
+    else if (raw.length >= 256) {
         spectrum = this.parseSpectrum(raw, 0, 128);
     }
 
@@ -401,7 +418,10 @@ export class MicroNIRBLEDriver {
     const s = new Uint16Array(targetPixels);
     const view = new DataView(buffer.buffer);
     for(let j=0; j<targetPixels; j++) {
-       s[j] = view.getUint16(offset + (j*2), false); 
+       // Offset + j*2 debe ser < buffer.length - overhead
+       if (offset + (j*2) + 1 < buffer.length) {
+         s[j] = view.getUint16(offset + (j*2), false); 
+       }
     }
     return s;
   }
