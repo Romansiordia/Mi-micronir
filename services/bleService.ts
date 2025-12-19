@@ -1,3 +1,4 @@
+
 import { BLE_CONFIG } from "../constants";
 
 // Definiciones de tipos para Web Bluetooth API
@@ -211,7 +212,7 @@ export class MicroNIRBLEDriver {
     if (!value) return;
 
     const chunk = new Uint8Array(value.buffer);
-    console.log("BLE RX Chunk:", chunk); // DEBUG CRÍTICO: Ver qué llega
+    console.log("RX Chunk:", chunk);
 
     // Concatenar
     const newBuffer = new Uint8Array(this.rxBuffer.length + chunk.length);
@@ -223,34 +224,54 @@ export class MicroNIRBLEDriver {
   };
 
   private scanForPackets() {
-    // Buscar inicio (0x02)
+    // 1. Buscar STX (0x02)
     const stxIndex = this.rxBuffer.indexOf(0x02);
     if (stxIndex === -1) {
-        // Si el buffer es enorme y no tiene STX, límpialo para no explotar memoria
-        if (this.rxBuffer.length > 2048) this.rxBuffer = new Uint8Array(0);
+       // Si el buffer crece demasiado sin STX, limpiar para evitar fugas de memoria
+       if (this.rxBuffer.length > 2048) this.rxBuffer = new Uint8Array(0);
+       return;
+    }
+
+    // 2. Necesitamos al menos 2 bytes para leer la LONGITUD (STX + LEN)
+    if (stxIndex + 1 >= this.rxBuffer.length) {
+        return; // Esperar más datos
+    }
+
+    // 3. Leer Longitud del Payload (Byte 1)
+    const len = this.rxBuffer[stxIndex + 1];
+    
+    // 4. Calcular tamaño total esperado del paquete
+    // Estructura: [STX(1), LEN(1), OPCODE(1), DATA(n), CRC(1), ETX(1)]
+    // Según protocolo MicroNIR: LEN = length(OPCODE + DATA).
+    // Total Bytes = 1(STX) + 1(LEN) + LEN + 1(CRC) + 1(ETX) = LEN + 4.
+    const totalPacketSize = len + 4;
+
+    // 5. Verificar si tenemos todos los bytes en el buffer
+    if (this.rxBuffer.length < stxIndex + totalPacketSize) {
+        // console.log(`Esperando datos... Tenemos ${this.rxBuffer.length}, Necesitamos ${stxIndex + totalPacketSize}`);
+        return; // Esperar más fragmentos BLE
+    }
+
+    // 6. Verificar ETX (0x03) en la posición calculada
+    const etxIndex = stxIndex + totalPacketSize - 1;
+    if (this.rxBuffer[etxIndex] !== 0x03) {
+        console.warn("Error de Trama: ETX no encontrado donde debería. Saltando STX.");
+        // El STX encontrado era falso (basura), avanzamos el buffer y reintentamos
+        this.rxBuffer = this.rxBuffer.slice(stxIndex + 1);
+        this.scanForPackets();
         return;
     }
 
-    // Buscar fin (0x03) DESPUÉS del inicio
-    let etxIndex = -1;
-    for(let i = stxIndex + 1; i < this.rxBuffer.length; i++) {
-        if (this.rxBuffer[i] === 0x03) {
-            etxIndex = i;
-            break;
-        }
-    }
+    // 7. ¡Paquete Validado! Extraerlo.
+    const packet = this.rxBuffer.slice(stxIndex, etxIndex + 1);
+    this.rxBuffer = this.rxBuffer.slice(etxIndex + 1); // Remover del buffer
+    
+    console.log("Paquete Reensamblado OK:", packet);
+    this.lastPacket = packet;
 
-    if (etxIndex !== -1) {
-        // ¡Paquete encontrado!
-        const packet = this.rxBuffer.slice(stxIndex, etxIndex + 1);
-        console.log("Packet Validated:", packet);
-        this.lastPacket = packet;
-        
-        // Eliminar este paquete del buffer y seguir buscando
-        this.rxBuffer = this.rxBuffer.slice(etxIndex + 1);
-        
-        // Recursión por si llegaron dos paquetes juntos
-        if (this.rxBuffer.length > 0) this.scanForPackets();
+    // 8. Buscar si hay más paquetes en el buffer restante
+    if (this.rxBuffer.length > 0) {
+        this.scanForPackets();
     }
   }
 
@@ -269,7 +290,7 @@ export class MicroNIRBLEDriver {
 
     if (!silent) {
         this.lastPacket = null;
-        this.rxBuffer = new Uint8Array(0); // Limpiar buffer antiguo para evitar colisiones
+        this.rxBuffer = new Uint8Array(0); // Limpiar buffer antiguo
         this.pendingResponse = true;
     }
 
@@ -315,14 +336,16 @@ export class MicroNIRBLEDriver {
         
         const resp = await this.waitForPacket(2500);
         if (resp && resp.length >= 5) {
-            // Validar opcode 0x06 dentro del paquete
-            // [02, LEN, 06, MSB, LSB, CRC, 03]
+            // Validar opcode 0x06 (Temperatura)
+            // Estructura: [02, LEN, OPCODE, MSB, LSB, CRC, 03]
+            // Index Opcode = 2
             if (resp[2] === 0x06) { 
                 const view = new DataView(resp.buffer);
                 const val = view.getUint16(3, false); // Big Endian
                 return val / 1000.0;
+            } else {
+                console.warn(`Opcode inesperado en getTemperature: ${resp[2]} (dec: ${resp[2]})`);
             }
-            // A veces el offset cambia si LEN > 255 (formato largo), pero para TEMP es corto
         }
         await this.sleep(200);
     }
@@ -358,8 +381,6 @@ export class MicroNIRBLEDriver {
     }
     // Fallback: Si el paquete es ~256 bytes de payload directo
     else if (raw.length >= 256) {
-        // Intentar encontrar el inicio de los datos
-        // Si hay header 02..05, saltarlo. Si no, desde 0.
         spectrum = this.parseSpectrum(raw, 0, 128);
     }
 
