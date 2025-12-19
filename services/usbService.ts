@@ -111,8 +111,8 @@ export class MicroNIRDriver {
       await this.sleep(200);
       await this.flushRx();
       
-      // --- WAKE UP SENSOR (Little Endian Strategy 12 Bytes - V10) ---
-      // Sending 12 Bytes to match BLE safety.
+      // --- WAKE UP SENSOR (Little Endian Strategy 16 Bytes - V11) ---
+      // Sending 16 Bytes: Scans (4) + Time (4) + Padding (8)
       // Values from XML: Scans=500, Time=12.5ms (12500us)
       const scanCount = 500;
       const integrationTime = 12500;
@@ -122,11 +122,11 @@ export class MicroNIRDriver {
           scanCount & 0xFF, (scanCount >> 8) & 0xFF, (scanCount >> 16) & 0xFF, (scanCount >> 24) & 0xFF,
           // Integration Time (Little Endian)
           integrationTime & 0xFF, (integrationTime >> 8) & 0xFF, (integrationTime >> 16) & 0xFF, (integrationTime >> 24) & 0xFF,
-          // Padding (4 Bytes to reach 12 bytes struct)
-          0, 0, 0, 0
+          // Padding (8 Bytes to reach 16 bytes struct)
+          0, 0, 0, 0, 0, 0, 0, 0
       ];
       
-      this.log(`Enviando Init V10 (LE 12 Bytes): [${payload.join(',')}]`);
+      this.log(`Enviando Init V11 (LE 16 Bytes): [${payload.join(',')}]`);
       await this.send(CMD.SET_INTEGRATION, payload);
       
       return "OK";
