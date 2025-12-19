@@ -1,3 +1,4 @@
+
 import { USB_CONFIG } from "../constants";
 
 // Comandos del Protocolo MicroNIR
@@ -110,10 +111,24 @@ export class MicroNIRDriver {
       await this.sleep(200);
       await this.flushRx();
       
-      // --- V12: OMITIMOS EL COMANDO DE CONFIGURACIÓN INICIAL ---
-      // El objetivo es establecer una conexión básica y probar comandos simples (lámpara)
-      // para validar la capa de comunicación antes de atacar el problema del payload.
-      this.log("V12: Conexión básica establecida. Omitiendo configuración inicial.");
+      // --- V13: BIG ENDIAN CONFIGURATION ATTEMPT ---
+      // Persistent "Invalid Length" errors suggest the byte order might be wrong.
+      // Trying Big Endian with the 16-byte payload structure.
+      const scanCount = 500;
+      const integrationTime = 12500;
+
+      const payload = [
+          // Scans Count (Big Endian)
+          (scanCount >> 24) & 0xFF, (scanCount >> 16) & 0xFF, (scanCount >> 8) & 0xFF, scanCount & 0xFF,
+          // Integration Time (Big Endian)
+          (integrationTime >> 24) & 0xFF, (integrationTime >> 16) & 0xFF, (integrationTime >> 8) & 0xFF, integrationTime & 0xFF,
+          // Padding (8 Bytes to reach 16 bytes struct)
+          0, 0, 0, 0, 0, 0, 0, 0
+      ];
+      
+      this.log(`Enviando Init V13 (BE 16 Bytes): [${payload.join(',')}]`);
+      // Aún no validamos la respuesta, pero la enviamos. El siguiente comando fallará si esta no funciona.
+      await this.send(CMD.SET_INTEGRATION, payload);
       
       return "OK";
     } catch (error: any) {

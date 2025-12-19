@@ -1,3 +1,4 @@
+
 import { BLE_CONFIG } from "../constants";
 
 // Definiciones de tipos para Web Bluetooth API
@@ -180,13 +181,10 @@ export class MicroNIRBLEDriver {
       this.isConnected = true;
       this.rxBuffer = new Uint8Array(0);
 
-      // --- ESTRATEGIA DE CONEXIÓN V12 (PRUEBA DE LÁMPARA DIRECTA) ---
-      // Omitimos el comando de configuración (0x02) para establecer una conexión básica
-      // y verificar si otros comandos simples funcionan.
+      // --- ESTRATEGIA DE CONEXIÓN V13 (Big Endian) ---
+      this.log("Inicializando Sensor (Set Config V13)...");
+      await this.initializeSensor();
       
-      this.log("V12: Conexión básica establecida. Omitiendo configuración inicial.");
-      
-      // 2. Handshake Final
       this.log("Verificando Estado (GET INFO)...");
       await this.send(CMD.GET_INFO, [], true); 
 
@@ -204,7 +202,23 @@ export class MicroNIRBLEDriver {
   }
 
   private async initializeSensor() {
-    // ESTA FUNCIÓN QUEDA INTENCIONALMENTE VACÍA EN LA V12
+    // Comando 0x02: Set Config V13
+    // Intentando con Big Endian por los errores persistentes de "Longitud Inválida".
+    const scanCount = 500; 
+    const integrationTime = 12500; // 12.5ms = 12500us
+
+    const payload = [
+        // Scans (Big Endian)
+        (scanCount >> 24) & 0xFF, (scanCount >> 16) & 0xFF, (scanCount >> 8) & 0xFF, scanCount & 0xFF,
+        // Time (Big Endian)
+        (integrationTime >> 24) & 0xFF, (integrationTime >> 16) & 0xFF, (integrationTime >> 8) & 0xFF, integrationTime & 0xFF,
+        // Padding (8 Bytes para llegar a 16)
+        0, 0, 0, 0, 0, 0, 0, 0
+    ];
+
+    this.log(`Enviando Config V13 (BE 16 Bytes) [${payload.join(', ')}]`);
+    await this.send(CMD.SET_CONFIG, payload, true); 
+    await this.sleep(500);
   }
 
   async disconnect(): Promise<void> {
