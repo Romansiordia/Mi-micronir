@@ -2,7 +2,7 @@
 import React, { useState, useEffect } from 'react';
 import { 
   Usb, Activity, RefreshCw, Zap, AlertCircle, CheckCircle2, 
-  BarChart3, Settings2, ShieldCheck, Thermometer, Power, Bluetooth
+  BarChart3, Settings2, ShieldCheck, Thermometer, Power, Bluetooth, XCircle
 } from 'lucide-react';
 import { 
   AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer
@@ -53,8 +53,8 @@ export default function App() {
       if (res === "OK") {
         log("Conectado. Obteniendo telemetría...");
         
-        // Esperar un poco más en BLE
-        if (connectionType === 'ble') await new Promise(r => setTimeout(r, 500));
+        // Esperar un poco más en BLE para estabilizar conexión
+        if (connectionType === 'ble') await new Promise(r => setTimeout(r, 1000));
 
         const t = await activeDevice.getTemperature();
         
@@ -65,7 +65,7 @@ export default function App() {
         } else {
           setStatus('error');
           log("Conectado, pero sensor no responde datos.");
-          await activeDevice.disconnect();
+          // No desconectar automáticamente para permitir debug o reintento manual
         }
       } else {
         setStatus('error');
@@ -76,6 +76,18 @@ export default function App() {
       log("Excepción al conectar.");
     }
     setIsBusy(false);
+  };
+
+  const disconnect = async () => {
+    try {
+        await activeDevice.disconnect();
+        setStatus('disconnected');
+        setTemp(null);
+        setLamp(false);
+        log("Desconectado correctamente.");
+    } catch(e) {
+        log("Error al desconectar.");
+    }
   };
 
   const toggleLamp = async () => {
@@ -167,7 +179,7 @@ export default function App() {
             <ShieldCheck className="text-blue-500" />
             MicroNIR <span className="text-blue-400 bg-blue-500/10 px-2 rounded text-lg border border-blue-500/20">QUANTUM</span>
           </h1>
-          <p className="text-xs text-slate-500 font-mono mt-1 uppercase ml-1">v4.1.0 Dual Link • {connectionType === 'usb' ? 'FTDI Mode' : 'BLE Mode'}</p>
+          <p className="text-xs text-slate-500 font-mono mt-1 uppercase ml-1">v4.2.0 • {connectionType === 'usb' ? 'FTDI Mode' : 'BLE Mode'}</p>
         </div>
         
         <div className="flex flex-col md:flex-row gap-4 items-center">
@@ -197,12 +209,23 @@ export default function App() {
           )}
           
           {status === 'disconnected' || status === 'error' ? (
-            <button onClick={connect} disabled={isBusy} className={`bg-gradient-to-r ${connectionType === 'usb' ? 'from-blue-600 to-blue-500' : 'from-indigo-600 to-indigo-500'} hover:opacity-90 disabled:opacity-50 text-white px-6 py-3 rounded-xl font-bold flex items-center gap-2 transition-all shadow-lg`}>
-              {isBusy ? <RefreshCw className="animate-spin" size={20}/> : (connectionType === 'usb' ? <Usb size={20} /> : <Bluetooth size={20} />)} 
-              {status === 'error' ? 'REINTENTAR' : 'CONECTAR'}
-            </button>
+             <div className="flex gap-2">
+                <button onClick={connect} disabled={isBusy} className={`bg-gradient-to-r ${connectionType === 'usb' ? 'from-blue-600 to-blue-500' : 'from-indigo-600 to-indigo-500'} hover:opacity-90 disabled:opacity-50 text-white px-6 py-3 rounded-xl font-bold flex items-center gap-2 transition-all shadow-lg`}>
+                {isBusy ? <RefreshCw className="animate-spin" size={20}/> : (connectionType === 'usb' ? <Usb size={20} /> : <Bluetooth size={20} />)} 
+                {status === 'error' ? 'REINTENTAR' : 'CONECTAR'}
+                </button>
+                {/* Botón de pánico para limpiar estado BLE */}
+                {status === 'error' && connectionType === 'ble' && (
+                    <button onClick={disconnect} className="bg-red-900/50 border border-red-800 text-red-200 px-3 py-3 rounded-xl hover:bg-red-900 transition-colors" title="Forzar Reinicio Driver">
+                        <XCircle size={20} />
+                    </button>
+                )}
+            </div>
           ) : (
             <div className="flex gap-3">
+               <button onClick={disconnect} className="bg-slate-800 border border-slate-700 text-slate-400 px-3 py-3 rounded-xl hover:bg-red-900/30 hover:text-red-300 hover:border-red-800 transition-all" title="Desconectar">
+                  <Power size={18} />
+               </button>
               <button 
                 onClick={toggleLamp} 
                 disabled={isBusy}

@@ -82,9 +82,13 @@ const CMD = {
 export class MicroNIRBLEDriver {
   private device: BluetoothDevice | null = null;
   private server: BluetoothRemoteGATTServer | null = null;
-  private txChar: BluetoothRemoteGATTCharacteristic | null = null;
-  private rxChar: BluetoothRemoteGATTCharacteristic | null = null;
   
+  // En BLE puede haber una char para escribir y MÚLTIPLES para recibir (Indications vs Notifications)
+  private txChar: BluetoothRemoteGATTCharacteristic | null = null;
+  private listeningChars: BluetoothRemoteGATTCharacteristic[] = [];
+  
+  private keepAliveInterval: any = null;
+
   public isConnected = false;
   
   // Buffer para reensamblar paquetes BLE fragmentados
@@ -95,11 +99,24 @@ export class MicroNIRBLEDriver {
     return new Promise(r => setTimeout(r, ms));
   }
 
+  constructor() {
+    // Intentar limpieza al cerrar ventana
+    if (typeof window !== 'undefined') {
+      window.addEventListener('beforeunload', () => {
+        this.disconnect();
+      });
+    }
+  }
+
   async connect(): Promise<string> {
     try {
       if (!navigator.bluetooth) {
         return "Navegador no soporta Web Bluetooth";
       }
+
+      // Limpiar estado previo
+      this.listeningChars = [];
+      this.rxBuffer = new Uint8Array(0);
 
       // 1. Buscar Dispositivo
       console.log("Buscando dispositivo MicroNIR BLE...");
@@ -115,71 +132,85 @@ export class MicroNIRBLEDriver {
       this.server = await this.device.gatt!.connect();
 
       // 3. Obtener Servicio
+      console.log("Obteniendo servicio primario...");
       const service = await this.server.getPrimaryService(BLE_CONFIG.serviceUUID);
 
-      // 4. CONFIGURACIÓN INTELIGENTE DE UUIDs
-      // Obtenemos explícitamente las dos características conocidas (B1 y B2)
-      console.log("Configurando canales de comunicación...");
-      const char1 = await service.getCharacteristic(BLE_CONFIG.txCharUUID); // Termina en c9b1
-      const char2 = await service.getCharacteristic(BLE_CONFIG.rxCharUUID); // Termina en c9b2
+      // 4. ESTRATEGIA PROMISCUA DE CARACTERÍSTICAS
+      // El DLL indica que usa CommandControlPoints y múltiples UUIDs. 
+      // En lugar de adivinar, obtenemos TODAS y nos suscribimos a TODAS las que hablen.
+      const chars = await service.getCharacteristics();
+      console.log(`Encontradas ${chars.length} características en el servicio.`);
 
-      const char1Props = char1.properties;
-      const char2Props = char2.properties;
+      let foundTx = false;
 
-      const char1CanWrite = char1Props.write || char1Props.writeWithoutResponse;
-      const char1CanNotify = char1Props.notify || char1Props.indicate;
-      
-      const char2CanWrite = char2Props.write || char2Props.writeWithoutResponse;
-      const char2CanNotify = char2Props.notify || char2Props.indicate;
+      for (const c of chars) {
+        const props = c.properties;
+        const uuidShort = c.uuid.slice(4, 8); // Log visual
+        
+        console.log(`Char [${uuidShort}]: Write=${props.write}, Notify=${props.notify}, Indicate=${props.indicate}`);
 
-      console.log(`Char B1 (${char1.uuid.slice(-4)}): Write=${char1CanWrite}, Notify=${char1CanNotify}`);
-      console.log(`Char B2 (${char2.uuid.slice(-4)}): Write=${char2CanWrite}, Notify=${char2CanNotify}`);
+        // A. Detección de Canal de Escritura (TX)
+        // Preferimos Write sobre WriteWithoutResponse para comandos de control
+        if ((props.write || props.writeWithoutResponse) && !foundTx) {
+          this.txChar = c;
+          foundTx = true;
+          console.log(` -> ASIGNADO COMO TX: ${c.uuid}`);
+        }
 
-      // Lógica de decisión:
-      if (char1CanWrite && !char1CanNotify && char2CanNotify) {
-        // Caso Claro 1: B1 es TX, B2 es RX
-        this.txChar = char1;
-        this.rxChar = char2;
-      } else if (char2CanWrite && !char2CanNotify && char1CanNotify) {
-        // Caso Claro 2 (Invertido): B2 es TX, B1 es RX
-        this.txChar = char2;
-        this.rxChar = char1;
-      } else {
-        // Caso Ambiguo (ambos pueden hacer todo): Usamos B1 para TX y B2 para RX por defecto
-        console.warn("Propiedades ambiguas, usando asignación estándar B1->TX, B2->RX");
-        this.txChar = char1;
-        this.rxChar = char2;
+        // B. Detección de Canales de Lectura (RX)
+        // Nos suscribimos a TODO lo que pueda enviar datos
+        if (props.notify || props.indicate) {
+          try {
+            await c.startNotifications();
+            c.addEventListener('characteristicvaluechanged', this.handleNotifications);
+            this.listeningChars.push(c);
+            console.log(` -> SUSCRITO A: ${c.uuid} (${props.indicate ? 'Indicate' : 'Notify'})`);
+          } catch (e) {
+            console.warn(`No se pudo suscribir a ${uuidShort}:`, e);
+          }
+        }
       }
-      
-      console.log(`ASIGNADO: TX -> ${this.txChar?.uuid.slice(-4)}, RX -> ${this.rxChar?.uuid.slice(-4)}`);
 
-      // 5. Habilitar Notificaciones (Lectura de datos)
-      if (this.rxChar) {
-        await this.rxChar.startNotifications();
-        this.rxChar.addEventListener('characteristicvaluechanged', this.handleNotifications);
-        console.log("Notificaciones habilitadas");
+      if (!this.txChar) {
+        throw new Error("No se encontró característica de Escritura (TX)");
+      }
+      if (this.listeningChars.length === 0) {
+        throw new Error("No se encontraron características de Notificación (RX)");
       }
 
       this.isConnected = true;
       
-      // Limpiar buffer por si acaso
-      this.rxBuffer = new Uint8Array(0);
-      this.lastPacket = null;
+      // 5. INICIAR KEEP ALIVE
+      // El dump menciona "txKeepAliveTimer". Los dispositivos BLE a veces desconectan si no hay actividad.
+      // Leemos la temperatura cada 4 segundos en segundo plano.
+      this.startKeepAlive();
       
-      // Espera de estabilización
-      await this.sleep(300);
-
+      console.log("Conexión BLE establecida y configurada.");
       return "OK";
+
     } catch (error: any) {
-      console.error("BLE Error:", error);
+      console.error("BLE Error Fatal:", error);
       this.isConnected = false;
+      // Intentar desconectar limpiamente si falló a medias
+      if (this.device?.gatt?.connected) this.device.gatt.disconnect();
       return error.message || "Error BLE Desconocido";
     }
   }
 
+  private startKeepAlive() {
+    if (this.keepAliveInterval) clearInterval(this.keepAliveInterval);
+    this.keepAliveInterval = setInterval(() => {
+      if (this.isConnected && !this.lastPacket) { // Solo si no estamos esperando otra respuesta
+         // Enviar un comando inofensivo (GET_TEMP) silenciando errores
+         this.send(CMD.GET_TEMP, [], true).catch(() => {});
+      }
+    }, 4000);
+  }
+
   private onDisconnected = () => {
-    console.log("Dispositivo BLE desconectado");
+    console.log("Dispositivo BLE desconectado evento nativo");
     this.isConnected = false;
+    if (this.keepAliveInterval) clearInterval(this.keepAliveInterval);
   };
 
   private handleNotifications = (event: Event) => {
@@ -187,6 +218,7 @@ export class MicroNIRBLEDriver {
     if (!value) return;
 
     const chunk = new Uint8Array(value.buffer);
+    // console.log("RX Chunk:", chunk); // Debug a bajo nivel si es necesario
     
     // Concatenar chunk al buffer
     const newBuffer = new Uint8Array(this.rxBuffer.length + chunk.length);
@@ -195,29 +227,41 @@ export class MicroNIRBLEDriver {
     this.rxBuffer = newBuffer;
 
     // Verificar si tenemos un paquete completo (Termina en ETX 0x03)
+    // Nota: El protocolo MicroNIR termina en 0x03.
     if (this.rxBuffer.length > 0 && this.rxBuffer[this.rxBuffer.length - 1] === 0x03) {
-      // Guardar como último paquete válido y limpiar buffer para el siguiente
+      // Guardar como último paquete válido
       this.lastPacket = this.rxBuffer;
+      // Limpiar buffer
       this.rxBuffer = new Uint8Array(0);
     }
   };
 
   async disconnect() {
+    if (this.keepAliveInterval) clearInterval(this.keepAliveInterval);
+    
     if (this.device && this.device.gatt?.connected) {
       try {
-        if (this.rxChar) await this.rxChar.stopNotifications();
-      } catch(e) {}
+        // Intentar desuscribirse de todo
+        for(const c of this.listeningChars) {
+           await c.stopNotifications();
+        }
+      } catch(e) { console.warn("Error parando notificaciones", e); }
+      
       this.device.gatt.disconnect();
     }
     this.isConnected = false;
+    this.listeningChars = [];
+    this.txChar = null;
   }
 
-  async send(opcode: number, data: number[] = []): Promise<boolean> {
+  async send(opcode: number, data: number[] = [], silent = false): Promise<boolean> {
     if (!this.isConnected || !this.txChar) return false;
 
-    // Limpiar paquete anterior recibido para asegurar que la respuesta corresponde a este comando
-    this.lastPacket = null;
-    this.rxBuffer = new Uint8Array(0);
+    // Si no es un keep-alive, limpiamos el buffer de respuesta anterior
+    if (!silent) {
+        this.lastPacket = null;
+        this.rxBuffer = new Uint8Array(0);
+    }
 
     const len = data.length + 1;
     const rawPayload = new Uint8Array([len, opcode, ...data]);
@@ -230,7 +274,7 @@ export class MicroNIRBLEDriver {
       await this.txChar.writeValue(packet);
       return true;
     } catch (e) {
-      console.error("BLE TX Error:", e);
+      if (!silent) console.error("BLE TX Error:", e);
       return false;
     }
   }
@@ -250,15 +294,14 @@ export class MicroNIRBLEDriver {
   }
 
   async getTemperature(): Promise<number | null> {
-    // Reintentos automáticos para robustez en la conexión inicial
+    // Reintentos automáticos
     for (let attempt = 0; attempt < 3; attempt++) {
         if (!await this.send(CMD.GET_TEMP)) {
             await this.sleep(200);
             continue;
         }
         
-        // Esperar respuesta (puede venir en varios chunks BLE, aunque temp es corta)
-        const resp = await this.waitForPacket(2000); // Timeout generoso
+        const resp = await this.waitForPacket(2500);
         
         if (resp && resp.length >= 5) {
           // Buscar Opcode 0x06
@@ -267,14 +310,13 @@ export class MicroNIRBLEDriver {
               const view = new DataView(resp.buffer);
               if (i + 2 < resp.length) {
                 const rawTemp = view.getUint16(i+1, false); // Big Endian
-                return rawTemp / 1000.0;
+                const t = rawTemp / 1000.0;
+                // Filtrar lecturas basura (ej. 0 o >100 son improbables en ambiente normal)
+                if (t > 0 && t < 100) return t;
               }
             }
           }
         }
-        
-        // Si falló, esperar antes de reintentar
-        console.warn(`Intento ${attempt + 1} de leer temperatura fallido, reintentando...`);
         await this.sleep(300);
     }
     return null;
@@ -287,19 +329,28 @@ export class MicroNIRBLEDriver {
   }
 
   async scan(): Promise<Uint16Array | null> {
-    if (!await this.send(CMD.SCAN)) return null;
+    // Detener KeepAlive momentáneamente para no ensuciar el buffer durante el scan
+    if (this.keepAliveInterval) clearInterval(this.keepAliveInterval);
 
-    // Esperar a que lleguen todos los chunks BLE y se reensamble el paquete
-    const raw = await this.waitForPacket(5000); // Aumentado timeout para scan BLE
+    if (!await this.send(CMD.SCAN)) {
+        this.startKeepAlive();
+        return null;
+    }
+
+    // Esperar a que lleguen todos los chunks BLE (Scan es grande, ~288 bytes)
+    const raw = await this.waitForPacket(6000); 
     
+    // Reiniciar KeepAlive
+    this.startKeepAlive();
+
     if (!raw) return null;
 
     let spectrum: Uint16Array | null = null;
 
-    // Lógica de parseo idéntica al USB
+    // Lógica de parseo robusta (Short vs Long format)
     for(let i=0; i < raw.length - 10; i++) {
       if (raw[i] === 0x02) { 
-        if (raw[i+2] === 0x05) { // Short
+        if (raw[i+2] === 0x05) { // Short format
           const len = raw[i+1] - 1;
           const dataStart = i + 3;
           if (dataStart + len <= raw.length) {
@@ -307,7 +358,7 @@ export class MicroNIRBLEDriver {
              break;
           }
         }
-        else if (raw[i+3] === 0x05) { // Long
+        else if (raw[i+3] === 0x05) { // Long format
           const len = (raw[i+1] << 8 | raw[i+2]) - 1;
           const dataStart = i + 4;
           if (dataStart + len <= raw.length) {
@@ -318,7 +369,7 @@ export class MicroNIRBLEDriver {
       }
     }
 
-    // Fallback paquete raw
+    // Fallback paquete raw si el header se corrompió pero la longitud cuadra
     if (!spectrum && raw.length >= 256) {
        spectrum = this.parseSpectrum(raw, 0, 128);
     }
