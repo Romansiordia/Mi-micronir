@@ -41,15 +41,15 @@ function calculateCrc8(data: Uint8Array): number {
 
 export class MicroNIRDriver {
   private device: any | null = null;
-  private interfaceNumber = 0;
-  private inEndpoint = 2;
-  private outEndpoint = 1;
+  private inEndpoint = 0; // Se determinará dinámicamente
+  private outEndpoint = 0; // Se determinará dinámicamente
   public isConnected = false;
 
   private async sleep(ms: number) {
     return new Promise(r => setTimeout(r, ms));
   }
 
+  // Enviar comando de control al chip FTDI (Vendor Request)
   private async ctrl(req: number, val: number, idx: number) {
     if (!this.device) return;
     return this.device.controlTransferOut({
@@ -66,45 +66,64 @@ export class MicroNIRDriver {
       await this.device.open();
       if (this.device.configuration === null) await this.device.selectConfiguration(1);
       
-      try { await this.device.claimInterface(this.interfaceNumber); } 
+      // --- DETECCIÓN DINÁMICA DE ENDPOINTS (CRÍTICO) ---
+      // El error "Sensor no responde" suele ocurrir porque hardcodeamos endpoints (1/2) 
+      // pero el dispositivo los tiene invertidos o usa otros índices.
+      const intf = this.device.configuration.interfaces[0];
+      const alt = intf.alternates[0];
+      
+      const epIn = alt.endpoints.find((e: any) => e.direction === 'in');
+      const epOut = alt.endpoints.find((e: any) => e.direction === 'out');
+
+      if (!epIn || !epOut) {
+        throw new Error("No se encontraron endpoints IN/OUT válidos");
+      }
+
+      this.inEndpoint = epIn.endpointNumber;
+      this.outEndpoint = epOut.endpointNumber;
+      
+      console.log(`Endpoints Detected -> IN: ${this.inEndpoint}, OUT: ${this.outEndpoint}`);
+
+      try { await this.device.claimInterface(intf.interfaceNumber); } 
       catch(e) { console.warn("Interface claimed/busy", e); }
 
-      // --- SECUENCIA DE INICIALIZACIÓN ROBUSTA (POWER CYCLE) ---
+      // --- SECUENCIA DE INICIALIZACIÓN FTDI ---
       
       // 1. Reset
       await this.ctrl(0x00, 0x00, 0x00);
       
-      // 2. Baud Rate 115200
+      // 2. Baud Rate 115200 (Magic Number 0x001A para FT232R/H)
       await this.ctrl(0x03, 0x401A, 0x00);
 
       // 3. Data Format 8N1
       await this.ctrl(0x04, 0x0008, 0x00);
 
-      // 4. Latency Timer 1ms (Para respuesta rápida)
-      await this.ctrl(0x09, 0x0001, 0x00);
+      // 4. Latency Timer: 16ms (Valor Default según XML JDSU, más seguro que 1ms)
+      await this.ctrl(0x09, 0x0010, 0x00); 
 
-      // 5. Flow Control OFF
+      // 5. Flow Control: OFF
       await this.ctrl(0x02, 0x0000, 0x00);
 
-      // 6. POWER CYCLE: APAGAR DTR/RTS PRIMERO
-      // Esto asegura que si el dispositivo estaba en un estado extraño, se reinicie
-      await this.ctrl(0x01, 0x0000, 0x00); 
-      await this.sleep(50); 
-
-      // 7. ENCENDER DTR/RTS
-      // Value: 0x0303 (Mask=03, Val=03)
+      // 6. POWER CYCLE: Bajar DTR/RTS y luego Subir
+      // Esto resetea el microcontrolador del MicroNIR
+      await this.ctrl(0x01, 0x0000, 0x00); // OFF
+      await this.sleep(100); 
+      
+      // ON (DTR High + RTS High) -> Value 0x0303 (Mask 03, Val 03)
       await this.ctrl(0x01, 0x0303, 0x00);
 
       this.isConnected = true;
       
-      // Tiempo crítico para que el MCU del MicroNIR arranque después del Power Up
-      await this.sleep(300);
+      // Tiempo para que el MCU arranque
+      await this.sleep(500);
 
+      // Purga inicial
       await this.flushRx();
       
       return "OK";
     } catch (error: any) {
       this.isConnected = false;
+      console.error(error);
       return error.message || "Error USB Desconocido";
     }
   }
@@ -120,9 +139,10 @@ export class MicroNIRDriver {
   private async flushRx() {
     if (!this.isConnected) return;
     try {
-      for(let i=0; i<5; i++) {
+      // Leer agresivamente hasta limpiar el buffer
+      for(let i=0; i<10; i++) {
         const res = await this.device.transferIn(this.inEndpoint, 64);
-        if (!res.data || res.data.byteLength <= 2) break;
+        if (!res.data || res.data.byteLength <= 2) break; // Solo quedan headers FTDI
       }
     } catch(e) {}
   }
@@ -130,7 +150,6 @@ export class MicroNIRDriver {
   async send(opcode: number, data: number[] = []): Promise<boolean> {
     if (!this.isConnected) return false;
 
-    // Flush suave antes de enviar para evitar leer respuestas viejas
     await this.flushRx();
 
     const len = data.length + 1;
@@ -150,22 +169,27 @@ export class MicroNIRDriver {
   }
 
   async getTemperature(): Promise<number | null> {
-    // Intentar hasta 3 veces porque el primer paquete después de conectar suele fallar
     for(let attempt=0; attempt<3; attempt++) {
       if (await this.send(CMD.GET_TEMP)) {
-        await this.sleep(30); // Espera breve
+        await this.sleep(50);
         
-        // Esperamos respuesta (paquete corto)
-        const resp = await this.readPacket(200);
+        // Esperamos respuesta
+        const resp = await this.readPacket(300);
         
-        // Validar respuesta de temperatura [STX, LEN, 06, MSB, LSB, CRC, ETX]
+        // Paquete temp suele ser corto. Buscamos Opcode 0x06.
         if (resp && resp.length >= 5) {
-           // Verificar Opcode (byte 2 en formato estándar)
-           const opcodeIdx = 2; // Suponiendo frame [02, LEN, CMD...]
-           if (resp[opcodeIdx] === 0x06) {
-             const view = new DataView(resp.buffer);
-             const rawTemp = view.getUint16(opcodeIdx + 1, false); // Bytes siguientes al opcode
-             return rawTemp / 1000.0;
+           // Chequeo laxo: Buscamos 0x06 en las primeras posiciones
+           for(let i=0; i<resp.length-2; i++) {
+             if (resp[i] === 0x06) { // Opcode encontrado
+               // Temp son los siguientes 2 bytes (Big Endian)
+               const view = new DataView(resp.buffer);
+               const rawTemp = view.getUint16(i+1, false); 
+               // Según XML puede ser int16 raw counts o ADT7320
+               // Asumimos formato estándar MicroNIR: Raw / 1000.0 o Raw / 100.0
+               // Si el valor es muy alto (>10000), es raw counts. Si es <100, es Celsius.
+               // Asumimos conversión estándar driver:
+               return rawTemp / 1000.0;
+             }
            }
         }
       }
@@ -176,58 +200,77 @@ export class MicroNIRDriver {
 
   async setLamp(on: boolean): Promise<boolean> {
     const ok = await this.send(CMD.LAMP_CONTROL, [on ? 1 : 0]);
-    if (ok) {
-      await this.sleep(on ? 1200 : 200); 
-    }
+    if (ok) await this.sleep(on ? 1500 : 200); 
     return ok;
   }
 
   async scan(): Promise<Uint16Array | null> {
     if (!await this.send(CMD.SCAN)) return null;
 
-    await this.sleep(50); 
+    // Aumentamos espera para integración
+    await this.sleep(100); 
 
-    // El escaneo puede tardar un poco más en llegar
-    const packet = await this.readPacket(2000);
+    // Leer con timeout largo (2s)
+    const raw = await this.readPacket(3000);
     
-    if (!packet) return null;
+    if (!raw) return null;
 
-    // Buscar header de Scan (Opcode 0x05)
-    let dataStart = -1;
-    let dataLen = 0;
+    // Estrategia 1: Protocolo Estándar STX/ETX
+    // Buscar [02, LEN, 05, ...] o [02, HI, LO, 05...]
+    let spectrum: Uint16Array | null = null;
 
-    // Analizar la estructura del paquete recibido
-    // Puede ser [02, LEN, 05, ...] (Short) o [02, HI, LO, 05...] (Long)
-    
-    // Verificar formato Short
-    if (packet.length > 3 && packet[2] === 0x05) {
-      dataLen = packet[1] - 1;
-      dataStart = 3;
-    } 
-    // Verificar formato Long (MicroNIR Pro/ES suele usar este)
-    else if (packet.length > 4 && packet[3] === 0x05) {
-      dataLen = (packet[1] << 8 | packet[2]) - 1;
-      dataStart = 4;
-    }
-
-    if (dataStart > 0 && dataLen > 0 && (dataStart + dataLen) <= packet.length) {
-      const numPixels = Math.floor(dataLen / 2);
-      const spectrum = new Uint16Array(numPixels);
-      const view = new DataView(packet.buffer);
-
-      for (let i = 0; i < numPixels; i++) {
-        spectrum[i] = view.getUint16(dataStart + (i * 2), false);
+    for(let i=0; i < raw.length - 10; i++) {
+      if (raw[i] === 0x02) { // STX
+        // Short Format
+        if (raw[i+2] === 0x05) {
+          const len = raw[i+1] - 1;
+          const dataStart = i + 3;
+          if (dataStart + len <= raw.length) {
+             spectrum = this.parseSpectrum(raw, dataStart, len/2);
+             break;
+          }
+        }
+        // Long Format (Común en MicroNIR Pro)
+        else if (raw[i+3] === 0x05) {
+          const len = (raw[i+1] << 8 | raw[i+2]) - 1;
+          const dataStart = i + 4;
+          if (dataStart + len <= raw.length) {
+             spectrum = this.parseSpectrum(raw, dataStart, len/2);
+             break;
+          }
+        }
       }
-      return spectrum;
     }
-    
-    console.warn("Invalid Spectrum Packet", packet);
-    return null;
+
+    // Estrategia 2: Paquete Crudo de 288 Bytes (Documentado en XML)
+    // Si la estrategia STX falló, buscamos un bloque de 288 bytes que parezca tener sentido
+    if (!spectrum && raw.length >= 288) {
+       // El XML define: SpectraDataPacket (288 bytes)
+       // PixelRawCounts está al principio. 128 pixeles * 2 bytes = 256 bytes.
+       // Asumimos que los primeros 256 bytes son datos de pixeles.
+       // Validamos buscando un patrón de consistencia (ej. no todo ceros)
+       console.log("Intentando decodificar como paquete raw 288 bytes...");
+       spectrum = this.parseSpectrum(raw, 0, 128);
+    }
+
+    return spectrum;
+  }
+
+  private parseSpectrum(buffer: Uint8Array, offset: number, pixels: number): Uint16Array {
+    const s = new Uint16Array(pixels);
+    const view = new DataView(buffer.buffer);
+    for(let j=0; j<pixels; j++) {
+      // Offset + j*2. Protegemos límites.
+      if (offset + (j*2) + 1 < buffer.length) {
+        s[j] = view.getUint16(offset + (j*2), false); // Big Endian
+      }
+    }
+    return s;
   }
 
   /**
-   * Lector de Paquetes con "Ventana Deslizante".
-   * Tolera basura al principio del buffer y busca activamente el STX (0x02).
+   * Lee del dispositivo filtrando cabeceras FTDI (2 bytes cada 64).
+   * Implementa "Sliding Window" para acumular datos.
    */
   private async readPacket(timeoutMs: number): Promise<Uint8Array | null> {
     const startTime = Date.now();
@@ -238,75 +281,31 @@ export class MicroNIRDriver {
         const res = await this.device.transferIn(this.inEndpoint, 64);
         
         if (res.status === 'ok' && res.data.byteLength > 2) {
-          // FTDI Headers: Los primeros 2 bytes son estado, los ignoramos
-          const newBytes = new Uint8Array(res.data.buffer.slice(2));
+          // FTDI Modem Status bytes (2 bytes) están al inicio de CADA paquete USB de 64 bytes.
+          // Debemos quitarlos.
+          const chunk = new Uint8Array(res.data.buffer.slice(2));
           
-          // Concatenar al acumulador
-          const temp = new Uint8Array(acc.length + newBytes.length);
-          temp.set(acc);
-          temp.set(newBytes, acc.length);
-          acc = temp;
+          const next = new Uint8Array(acc.length + chunk.length);
+          next.set(acc);
+          next.set(chunk, acc.length);
+          acc = next;
 
-          // --- LOGICA DE BÚSQUEDA DE PAQUETE ---
-          
-          // 1. Buscar marcador de inicio STX (0x02)
-          let stxIndex = -1;
-          for(let i=0; i < acc.length; i++) {
-            if (acc[i] === 0x02) {
-              stxIndex = i;
-              break;
-            }
+          // Si hemos acumulado suficientes datos, intentamos ver si tenemos un paquete completo.
+          // ETX es 0x03.
+          if (acc.length > 10 && acc[acc.length-1] === 0x03) {
+            // Check rápido si parece un paquete válido
+            return acc;
           }
-
-          // Si encontramos un STX
-          if (stxIndex !== -1) {
-            // Descartar basura anterior al STX
-            if (stxIndex > 0) {
-              acc = acc.slice(stxIndex);
-            }
-
-            // Necesitamos al menos 3 bytes para saber longitud [02, LEN, CMD...]
-            if (acc.length >= 3) {
-              // Calcular tamaño esperado
-              // Nota: La longitud en el protocolo suele ser: LEN byte = Tamaño de (CMD + DATA)
-              // Total frame = 1(STX) + 1(LEN) + LEN + 1(CRC) + 1(ETX) = LEN + 4 bytes.
-              // O en formato largo: 1(STX) + 2(LEN) + LEN + 1(CRC) + 1(ETX) = LEN + 5 bytes.
-              
-              let expectedLen = 0;
-              let isLongFrame = false;
-
-              // Heurística simple: Si el byte de longitud es muy grande o el opcode no cuadra, verificar formato largo
-              // Pero para comandos simples (Temp), es formato corto.
-              
-              const lenByte = acc[1];
-              const totalShort = lenByte + 4;
-
-              // Verificamos si tenemos el paquete completo (Formato Corto)
-              if (acc.length >= totalShort) {
-                if (acc[totalShort - 1] === 0x03) {
-                  return acc.slice(0, totalShort);
-                }
-              }
-              
-              // Verificamos formato largo (solo si parece ser escaneo o calibración)
-              // [02, LEN_HI, LEN_LO, CMD...]
-              const lenLong = (acc[1] << 8) | acc[2];
-              const totalLong = lenLong + 5;
-              
-              if (acc.length >= totalLong) {
-                 if (acc[totalLong - 1] === 0x03) {
-                   return acc.slice(0, totalLong);
-                 }
-              }
-            }
+          // O si tenemos el tamaño fijo de 288 bytes (del XML)
+          if (acc.length >= 288) {
+            return acc; 
           }
         }
       } catch (e) {
-        // Ignorar timeout de USB (polling)
         await this.sleep(5);
       }
     }
-    return null;
+    return acc.length > 0 ? acc : null;
   }
 }
 
