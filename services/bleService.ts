@@ -181,11 +181,10 @@ export class MicroNIRBLEDriver {
       this.isConnected = true;
       this.rxBuffer = new Uint8Array(0);
 
-      // --- ESTRATEGIA DE CONEXIÓN V6 (Paridad con USB) ---
+      // --- ESTRATEGIA DE CONEXIÓN V7 (9 Bytes Little Endian) ---
       
-      // 1. Inicialización: Solo Configurar Integración (4 Bytes)
-      // Esto desbloquea la máquina de estados igual que en USB
-      this.log("Inicializando Sensor (Set Integration)...");
+      // 1. Inicialización: Configuración completa
+      this.log("Inicializando Sensor (Set Config V7)...");
       await this.initializeSensor();
       
       // 2. Handshake Final
@@ -206,22 +205,24 @@ export class MicroNIRBLEDriver {
   }
 
   private async initializeSensor() {
-    // Comando 0x02: Set Integration Time
-    // CORRECCIÓN V6: Enviar exactamente lo mismo que el driver USB.
-    // Solo 4 bytes (Big Endian) para el tiempo de integración.
+    // Comando 0x02: Set Config
+    // CORRECCIÓN V7: Enviar 9 bytes en Little Endian.
+    // Scans (4 bytes) + Time (4 bytes) + Gain (1 byte)
     
+    const scanCount = 50; 
     const integrationTime = 6800; // 6800us
+    const gain = 0;
 
-    // TIME (Big Endian)
-    const t0 = (integrationTime >> 24) & 0xFF;
-    const t1 = (integrationTime >> 16) & 0xFF;
-    const t2 = (integrationTime >> 8) & 0xFF;
-    const t3 = (integrationTime) & 0xFF;
+    const payload = [
+        // Scans (LE)
+        scanCount & 0xFF, (scanCount >> 8) & 0xFF, (scanCount >> 16) & 0xFF, (scanCount >> 24) & 0xFF,
+        // Time (LE)
+        integrationTime & 0xFF, (integrationTime >> 8) & 0xFF, (integrationTime >> 16) & 0xFF, (integrationTime >> 24) & 0xFF,
+        // Gain
+        gain & 0xFF
+    ];
 
-    // Payload de 4 bytes
-    const payload = [t0, t1, t2, t3];
-
-    this.log(`Enviando Config USB-Style [${payload.join(', ')}]`);
+    this.log(`Enviando Config V7 (LE) [${payload.join(', ')}]`);
     await this.send(CMD.SET_CONFIG, payload, true); 
     await this.sleep(500); 
   }

@@ -111,16 +111,23 @@ export class MicroNIRDriver {
       await this.sleep(200);
       await this.flushRx();
       
-      // --- WAKE UP SENSOR (Same as BLE) ---
-      // Send Integration Time 6800us to unlock state machine
-      const integrationTime = 6800; 
-      const b0 = (integrationTime >> 24) & 0xFF;
-      const b1 = (integrationTime >> 16) & 0xFF;
-      const b2 = (integrationTime >> 8) & 0xFF;
-      const b3 = (integrationTime) & 0xFF;
+      // --- WAKE UP SENSOR (Little Endian Strategy) ---
+      // Sending Full Structure (9 Bytes): Scans (4) + Time (4) + Gain (1)
+      const scanCount = 50;
+      const integrationTime = 6800;
+      const gain = 0;
+
+      const payload = [
+          // Scans Count (Little Endian)
+          scanCount & 0xFF, (scanCount >> 8) & 0xFF, (scanCount >> 16) & 0xFF, (scanCount >> 24) & 0xFF,
+          // Integration Time (Little Endian)
+          integrationTime & 0xFF, (integrationTime >> 8) & 0xFF, (integrationTime >> 16) & 0xFF, (integrationTime >> 24) & 0xFF,
+          // Gain
+          gain & 0xFF
+      ];
       
-      this.log("Enviando Init Sequence (Set Integration 6800us)...");
-      await this.send(CMD.SET_INTEGRATION, [b0, b1, b2, b3]);
+      this.log(`Enviando Init Full V7 (LE): [${payload.join(',')}]`);
+      await this.send(CMD.SET_INTEGRATION, payload);
       
       return "OK";
     } catch (error: any) {
