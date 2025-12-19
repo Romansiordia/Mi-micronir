@@ -29,14 +29,22 @@ const App: React.FC = () => {
   }, []);
 
   const handleConnect = async () => {
-    addLog("Iniciando conexión MicroNIR...", "info");
-    const success = await microNir.connect();
-    if (success) {
-      setIsConnected(true);
-      addLog("Sensor conectado y listo.", "success");
-      await updateHardwareStatus();
-    } else {
-      addLog("Error de conexión. Revise permisos USB.", "error");
+    addLog("Inicializando puerto USB (FTDI)...", "info");
+    try {
+      const success = await microNir.connect();
+      if (success) {
+        setIsConnected(true);
+        // Reseteamos estado visual de lámpara porque al conectar no sabemos como está
+        setLampStatus('off'); 
+        addLog("Conexión establecida. Parámetros FTDI configurados.", "success");
+        
+        // Esperar un momento antes de pedir temperatura para no saturar el bus durante el inicio
+        setTimeout(() => updateHardwareStatus(), 500);
+      } else {
+        addLog("No se pudo conectar. Verifique que el dispositivo no esté en uso.", "error");
+      }
+    } catch (e) {
+      addLog("Error crítico al conectar.", "error");
     }
   };
 
@@ -50,39 +58,51 @@ const App: React.FC = () => {
         firmware: "v2.5.1",
         pixelCount: 128
       });
-      addLog(`Hardware OK. Temperatura: ${temp.toFixed(1)}°C`, "info");
+      addLog(`Hardware Sincronizado. Temp: ${temp.toFixed(1)}°C`, "info");
+    } else {
+      addLog("Advertencia: No se pudo leer temperatura.", "warning");
     }
   };
 
   const turnOnLamp = async () => {
-    addLog("Comando: ENCENDER LÁMPARA...", "info");
+    addLog("Enviando comando SET_LAMP (ON)...", "info");
     setIsMeasuring(true);
-    const ok = await microNir.setLamp(true);
-    if (ok) {
-      setLampStatus('ok');
-      addLog("Lámpara ON (Estabilizada)", "success");
-    } else {
-      addLog("Fallo al encender lámpara.", "error");
+    try {
+      const ok = await microNir.setLamp(true);
+      if (ok) {
+        setLampStatus('ok');
+        addLog("Lámpara ENCENDIDA. Estabilizando...", "success");
+      } else {
+        addLog("Fallo crítico: El dispositivo rechazó el comando de lámpara.", "error");
+        // Si falla, intentamos leer status por si acaso
+        updateHardwareStatus();
+      }
+    } catch (e) {
+      addLog("Error de comunicación USB.", "error");
     }
     setIsMeasuring(false);
   };
 
   const turnOffLamp = async () => {
-    addLog("Comando: APAGAR LÁMPARA...", "info");
+    addLog("Enviando comando SET_LAMP (OFF)...", "info");
     setIsMeasuring(true);
-    const ok = await microNir.setLamp(false);
-    if (ok) {
-      setLampStatus('off');
-      addLog("Lámpara OFF", "success");
-    } else {
-      addLog("Fallo al apagar lámpara.", "error");
+    try {
+      const ok = await microNir.setLamp(false);
+      if (ok) {
+        setLampStatus('off');
+        addLog("Lámpara APAGADA.", "success");
+      } else {
+        addLog("Error al apagar lámpara.", "error");
+      }
+    } catch (e) {
+      addLog("Error de comunicación USB.", "error");
     }
     setIsMeasuring(false);
   };
 
   const runCalibration = async (type: 'dark' | 'reference') => {
     setIsMeasuring(true);
-    addLog(`Adquiriendo ${type.toUpperCase()}...`, "info");
+    addLog(`Capturando ${type.toUpperCase()} (Flush+Scan)...`, "info");
     try {
       const raw = await microNir.readSpectrum();
       if (raw && raw.length > 20) {
@@ -91,9 +111,9 @@ const App: React.FC = () => {
           [type]: Array.from(raw),
           step: (type === 'dark' && !!prev.reference) || (type === 'reference' && !!prev.dark) ? 'ready' : type
         }));
-        addLog(`Referencia ${type.toUpperCase()} guardada.`, "success");
+        addLog(`Calibración ${type} exitosa.`, "success");
       } else {
-        addLog("Lectura fallida. Revise conexión.", "error");
+        addLog("Lectura vacía o corrupta. Reintente.", "error");
       }
     } finally {
       setIsMeasuring(false);
@@ -102,7 +122,7 @@ const App: React.FC = () => {
 
   const runScan = async () => {
     setIsMeasuring(true);
-    addLog("Iniciando escaneo...", "info");
+    addLog("Iniciando secuencia de escaneo...", "info");
     try {
       const raw = await microNir.readSpectrum();
       if (raw && raw.length > 20) {
@@ -110,7 +130,10 @@ const App: React.FC = () => {
         const absData = sample.map((s, i) => {
           const d = calib.dark?.[i] || 0;
           const r = calib.reference?.[i] || 65535;
-          const refl = Math.min(Math.max((s - d) / Math.max(r - d, 1), 0.0001), 1.0);
+          // Evitar división por cero y log de negativos
+          const denominator = Math.max(r - d, 1);
+          const numerator = s - d;
+          const refl = Math.min(Math.max(numerator / denominator, 0.0001), 1.0);
           return -Math.log10(refl);
         });
 
@@ -123,10 +146,10 @@ const App: React.FC = () => {
         setPrediction(val.toString());
         const currentData = CDM_MODEL.wavelengths.map((nm, i) => ({ nm, absorbance: absData[i] }));
         setSpectralData(currentData);
-        addLog(`Resultado: ${val}% Proteína`, "success");
+        addLog(`Análisis completado: ${val}%`, "success");
         getAIInterpretation(currentData, val.toString(), lampStatus).then(setAiInsight);
       } else {
-        addLog("No se recibieron datos espectrales válidos.", "error");
+        addLog("Error: Paquete de datos incompleto o vacío.", "error");
       }
     } finally {
       setIsMeasuring(false);
@@ -144,7 +167,7 @@ const App: React.FC = () => {
             <h1 className="font-black text-xl tracking-tighter uppercase italic text-white flex items-center gap-2">
               MicroNIR <span className="text-blue-500 px-2 py-0.5 bg-blue-500/10 rounded text-sm not-italic tracking-normal">QUANTUM</span>
             </h1>
-            <p className="text-[10px] text-slate-500 font-bold uppercase tracking-widest">Protocolo OnSiteW v2.0</p>
+            <p className="text-[10px] text-slate-500 font-bold uppercase tracking-widest">Protocolo OnSiteW v2.1 (FTDI)</p>
           </div>
         </div>
         <div className="flex gap-4">
