@@ -181,10 +181,11 @@ export class MicroNIRBLEDriver {
       this.isConnected = true;
       this.rxBuffer = new Uint8Array(0);
 
-      // --- ESTRATEGIA DE CONEXIÓN V9 (16 Bytes Little Endian) ---
+      // --- ESTRATEGIA DE CONEXIÓN V10 (12 Bytes Little Endian - Safe MTU) ---
+      // Fixes: 8 bytes (0x64 error) AND 16 bytes (BLE MTU NotSupportedError)
       
       // 1. Inicialización: Configuración completa
-      this.log("Inicializando Sensor (Set Config V9)...");
+      this.log("Inicializando Sensor (Set Config V10)...");
       await this.initializeSensor();
       
       // 2. Handshake Final
@@ -205,10 +206,11 @@ export class MicroNIRBLEDriver {
   }
 
   private async initializeSensor() {
-    // Comando 0x02: Set Config
-    // CORRECCIÓN V9: Enviar 16 bytes (Estructura extendida).
-    // Scans (4) + Time (4) + Padding (8) matches standard struct alignment
-    // Values from XML: Scans=500, Time=12.5ms
+    // Comando 0x02: Set Config V10
+    // Problema previo: 16 bytes de datos generaban un paquete total de 21 bytes.
+    // Límite MTU BLE por defecto: 20 bytes.
+    // Solución: Usar 12 Bytes de Datos (3 enteros).
+    // Paquete Total: 1 (STX) + 1 (Len) + 1 (Op) + 12 (Data) + 1 (CRC) + 1 (ETX) = 17 bytes. (SAFE)
     
     const scanCount = 500; 
     const integrationTime = 12500; // 12.5ms = 12500us
@@ -218,11 +220,11 @@ export class MicroNIRBLEDriver {
         scanCount & 0xFF, (scanCount >> 8) & 0xFF, (scanCount >> 16) & 0xFF, (scanCount >> 24) & 0xFF,
         // Time (LE)
         integrationTime & 0xFF, (integrationTime >> 8) & 0xFF, (integrationTime >> 16) & 0xFF, (integrationTime >> 24) & 0xFF,
-        // Padding (8 Bytes to reach 16 bytes)
-        0, 0, 0, 0, 0, 0, 0, 0
+        // Padding (4 Bytes to reach 12 bytes struct)
+        0, 0, 0, 0
     ];
 
-    this.log(`Enviando Config V9 (LE 16 Bytes) [${payload.join(', ')}]`);
+    this.log(`Enviando Config V10 (LE 12 Bytes) [${payload.join(', ')}]`);
     await this.send(CMD.SET_CONFIG, payload, true); 
     await this.sleep(500); 
   }
