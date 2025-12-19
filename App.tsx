@@ -1,5 +1,4 @@
 
-// Fix: Added React to imports to provide the React namespace required for React.FC type definition
 import React, { useState, useCallback } from 'react';
 import { 
   Usb, Activity, CheckCircle2, 
@@ -34,7 +33,7 @@ const App: React.FC = () => {
     const success = await microNir.connect();
     if (success) {
       setIsConnected(true);
-      addLog("Hardware MicroNIR vinculado correctamente.", "success");
+      addLog("Protocolo OnSiteW vinculado correctamente.", "success");
       updateHardwareStatus();
     } else {
       addLog("Error de vinculación. Verifique conexión física.", "error");
@@ -60,14 +59,17 @@ const App: React.FC = () => {
     const nextState = !isCurrentlyOn;
     
     addLog(`Cambiando lámpara a ${nextState ? 'ON' : 'OFF'}...`, "info");
+    setIsMeasuring(true); // Bloquear UI durante estabilización
+    
     const ok = await microNir.setLamp(nextState);
     
     if (ok) {
       setLampStatus(nextState ? 'ok' : 'off');
-      addLog(`Lámpara ${nextState ? 'ENCENDIDA' : 'APAGADA'}`, "success");
+      addLog(`Lámpara ${nextState ? 'ENCENDIDA (Estabilizada)' : 'APAGADA'}`, "success");
     } else {
-      addLog("Error al comunicar con la lámpara.", "error");
+      addLog("Fallo de comando SET_LAMP.", "error");
     }
+    setIsMeasuring(false);
   };
 
   const runCalibration = async (type: 'dark' | 'reference') => {
@@ -83,8 +85,7 @@ const App: React.FC = () => {
         }));
         addLog(`Referencia ${type.toUpperCase()} almacenada.`, "success");
       } else {
-        addLog("Error: El sensor no devolvió datos. Reintente.", "error");
-        updateHardwareStatus();
+        addLog("Captura fallida. Revise estado de lámpara/posición.", "error");
       }
     } finally {
       setIsMeasuring(false);
@@ -144,8 +145,9 @@ const App: React.FC = () => {
           ) : (
             <div className="flex items-center gap-2">
                <button 
+                  disabled={isMeasuring}
                   onClick={toggleLamp} 
-                  className={`px-5 py-2.5 rounded-full font-bold text-xs border transition-all ${lampStatus === 'ok' ? 'bg-orange-500 text-white border-orange-400' : 'bg-slate-800 border-white/5 text-slate-500 hover:text-white'}`}
+                  className={`px-5 py-2.5 rounded-full font-bold text-xs border transition-all ${isMeasuring ? 'opacity-50 cursor-wait' : ''} ${lampStatus === 'ok' ? 'bg-orange-500 text-white border-orange-400' : 'bg-slate-800 border-white/5 text-slate-500 hover:text-white'}`}
                 >
                 {lampStatus === 'ok' ? 'APAGAR LÁMPARA' : 'ENCENDER LÁMPARA'}
               </button>

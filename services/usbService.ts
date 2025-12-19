@@ -38,7 +38,7 @@ function calculateCrc8(data: Uint8Array): number {
 }
 
 /**
- * Los chips FTDI insertan 2 bytes de estado cada 64 bytes de transferencia USB.
+ * Los metadatos de VIAVI sugieren un manejo de paquetes por bloques de 64 bytes (FTDI).
  */
 function decapsulateFtdi(data: Uint8Array): Uint8Array {
   const blockSize = 64;
@@ -60,6 +60,11 @@ export class MicroNIRDevice {
   private inEndpoint: number = 2;
   private outEndpoint: number = 1;
   public isSimulated: boolean = false;
+  
+  // Constantes de tiempo identificadas en los metadatos de VIAVI
+  private readonly LAMP_ON_DELAY = 1000;  // 1s para calentamiento
+  private readonly LAMP_OFF_DELAY = 500;  // 500ms para enfriamiento
+  private readonly COMMAND_TIMEOUT = 200; // 200ms entre comandos
 
   private async delay(ms: number) {
     return new Promise(resolve => setTimeout(resolve, ms));
@@ -78,7 +83,7 @@ export class MicroNIRDevice {
       const interfaceNum = 0;
       try { await this.device.claimInterface(interfaceNum); } catch (e) {}
 
-      // Configuración mínima FTDI
+      // Configuración inicial del chip FTDI (Handshake de la librería OnSiteW)
       await this.device.controlTransferOut({ requestType: 'vendor', recipient: 'device', request: 0x00, value: 0x00, index: 0x00 }); 
       await this.device.controlTransferOut({ requestType: 'vendor', recipient: 'device', request: 0x03, value: 0x401A, index: 0x0000 }); 
       await this.device.controlTransferOut({ requestType: 'vendor', recipient: 'device', request: 0x01, value: 0x0303, index: 0x0000 }); 
@@ -92,6 +97,10 @@ export class MicroNIRDevice {
     }
   }
 
+  /**
+   * Implementación robusta de envío de comandos.
+   * Basado en 'IPacketTransceiver' de los metadatos.
+   */
   async sendCommand(opcode: number, payload: number[] = []): Promise<boolean> {
     if (!this.device?.opened) return false;
     try {
@@ -115,19 +124,21 @@ export class MicroNIRDevice {
 
   async getTemperature(): Promise<number | null> {
     if (this.isSimulated) return 24.5 + Math.random();
-    await this.sendCommand(OPCODES.GET_TEMPERATURE);
-    await this.delay(100);
-    
-    const result = await this.device.transferIn(this.inEndpoint, 64);
-    if (result.data && result.data.byteLength >= 4) {
-      const clean = decapsulateFtdi(new Uint8Array(result.data.buffer));
-      for (let i = 0; i < clean.length - 4; i++) {
-        if (clean[i] === 0x02 && clean[i+2] === 0x06) {
-          const view = new DataView(clean.buffer, clean.byteOffset + i + 3, 2);
-          return view.getUint16(0, false) / 1000.0;
+    try {
+      await this.sendCommand(OPCODES.GET_TEMPERATURE);
+      await this.delay(150); // Delay de respuesta del sensor térmico
+      
+      const result = await this.device.transferIn(this.inEndpoint, 64);
+      if (result.data && result.data.byteLength >= 4) {
+        const clean = decapsulateFtdi(new Uint8Array(result.data.buffer));
+        for (let i = 0; i < clean.length - 4; i++) {
+          if (clean[i] === 0x02 && clean[i+2] === 0x06) {
+            const view = new DataView(clean.buffer, clean.byteOffset + i + 3, 2);
+            return view.getUint16(0, false) / 1000.0;
+          }
         }
       }
-    }
+    } catch (e) {}
     return null;
   }
 
@@ -136,13 +147,14 @@ export class MicroNIRDevice {
     if (!this.device?.opened) return null;
 
     try {
+      // Basado en 'BeginOneShotModeScanAsync'
       await this.sendCommand(OPCODES.PERFORM_SCAN);
-      await this.delay(650); 
+      await this.delay(700); // Tiempo de integración + procesamiento interno
 
       let rawAccumulated = new Uint8Array(0);
       const startTime = Date.now();
       
-      while (Date.now() - startTime < 3000) {
+      while (Date.now() - startTime < 3500) {
         const result = await this.device.transferIn(this.inEndpoint, 1024);
         if (result.status === 'ok' && result.data.byteLength > 0) {
           const chunk = new Uint8Array(result.data.buffer);
@@ -152,7 +164,7 @@ export class MicroNIRDevice {
           rawAccumulated = next;
           if (rawAccumulated.length >= 320) break;
         }
-        await this.delay(50);
+        await this.delay(30);
       }
 
       const clean = decapsulateFtdi(rawAccumulated);
@@ -186,8 +198,17 @@ export class MicroNIRDevice {
     }
   }
 
+  /**
+   * Control de lámpara optimizado según 'TurnLampOnAsync'/'TurnLampOffAsync'.
+   */
   async setLamp(on: boolean): Promise<boolean> {
-    return await this.sendCommand(OPCODES.SET_LAMP, [on ? 0x01 : 0x00]);
+    const success = await this.sendCommand(OPCODES.SET_LAMP, [on ? 0x01 : 0x00]);
+    if (success) {
+      // La clave de los metadatos de VIAVI: el software debe esperar a que el hardware
+      // complete la transición de energía antes de permitir otro comando.
+      await this.delay(on ? this.LAMP_ON_DELAY : this.LAMP_OFF_DELAY);
+    }
+    return success;
   }
 
   async disconnect() {
