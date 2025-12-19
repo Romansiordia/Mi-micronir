@@ -75,6 +75,7 @@ function calculateCrc8(data: Uint8Array): number {
 
 const CMD = {
   LAMP_CONTROL: 0x01,
+  SET_CONFIG: 0x02, // Configuración de Integración (Wake Up)
   SCAN: 0x05,
   GET_TEMP: 0x06,
 };
@@ -163,6 +164,12 @@ export class MicroNIRBLEDriver {
       this.isConnected = true;
       this.rxBuffer = new Uint8Array(0);
 
+      // --- INICIALIZACIÓN / WAKE UP ---
+      console.log("Inicializando Sensor...");
+      // El sensor responde NAK si no se configura primero.
+      // Enviamos el Integration Time (6800us por defecto según dump) para despertarlo.
+      await this.initializeSensor();
+      
       this.startKeepAlive();
       
       console.log("BLE Listo.");
@@ -173,6 +180,22 @@ export class MicroNIRBLEDriver {
       this.isConnected = false;
       return error.message || "Error BLE Desconocido";
     }
+  }
+
+  private async initializeSensor() {
+    // Comando 0x02: Set Config / Integration Time
+    // Payload: 4 bytes (Uint32 Big Endian). 
+    // Valor: 6800us (0x00001A90) o 8000us (0x00001F40)
+    // Usaremos 6800us basado en el dump "it = 6800"
+    const integrationTime = 6800; 
+    const b0 = (integrationTime >> 24) & 0xFF;
+    const b1 = (integrationTime >> 16) & 0xFF;
+    const b2 = (integrationTime >> 8) & 0xFF;
+    const b3 = (integrationTime) & 0xFF;
+
+    console.log("Enviando WakeUp (Set Integration Time)...");
+    await this.send(CMD.SET_CONFIG, [b0, b1, b2, b3], true); // Silent = true para no bloquear si no responde rápido
+    await this.sleep(500); // Tiempo para que el sensor aplique la config
   }
 
   async disconnect(): Promise<void> {
@@ -232,8 +255,6 @@ export class MicroNIRBLEDriver {
     }
 
     // 2. Buscar ETX (0x03)
-    // En lugar de confiar ciegamente en el byte de longitud (que falla con paquetes NAK 0x15),
-    // buscamos una estructura [02 ... 03] que tenga sentido.
     let packetFound = false;
     
     // Buscamos ETX a partir de STX+1
@@ -244,30 +265,17 @@ export class MicroNIRBLEDriver {
             
             // Validar
             // Caso especial: NAK [02 15 ... 03]
-            // Si el byte de longitud es 0x15, es un NAK, no una longitud.
+            // Si el byte de longitud es 0x15, es un NAK (Negative Acknowledge).
             if (candidate.length > 1 && candidate[1] === 0x15) {
-                console.warn("Recibido NAK (0x15) del sensor. Comando fallido.");
-                // Extraemos el paquete pero NO lo guardamos como 'lastPacket' valido de datos,
-                // sino que limpiamos el flag de pendingResponse para desbloquear la app.
-                this.pendingResponse = false; 
+                console.warn("Sensor NAK (0x15): Comando rechazado o sensor en error.");
+                this.pendingResponse = false; // Desbloquear la UI
                 this.rxBuffer = this.rxBuffer.slice(i + 1);
                 packetFound = true;
                 break; 
             }
 
             // Caso normal: Validar CRC
-            // Estructura: [STX, DATA...., CRC, ETX]
-            // Payload para CRC es todo excepto STX, CRC, ETX.
-            // Protocolo MicroNIR: CRC se calcula sobre [LEN, OPCODE, DATA...]
-            // Es decir, packet[1 ... end-2]
             if (candidate.length >= 4) {
-                // Verificamos si podemos confiar en el Byte de Longitud
-                // const statedLen = candidate[1];
-                // if (statedLen + 4 === candidate.length) { ... }
-                
-                // O confiamos en el CRC
-                // El CRC es el penúltimo byte (i-1)
-                // El CRC se calcula sobre los bytes [1 ... i-2]
                 const payloadForCrc = candidate.slice(1, candidate.length - 2);
                 const packetCrc = candidate[candidate.length - 2];
                 const calcCrc = calculateCrc8(payloadForCrc);
@@ -284,7 +292,6 @@ export class MicroNIRBLEDriver {
         }
     }
 
-    // Si encontramos un paquete y queda buffer, buscar recursivamente
     if (packetFound && this.rxBuffer.length > 0) {
         this.scanForPackets();
     }
@@ -321,9 +328,8 @@ export class MicroNIRBLEDriver {
         this.lastPacket = null;
         return pkt;
       }
-      // Si pendingResponse se puso en false (por NAK) pero lastPacket es null
       if (!this.pendingResponse && !this.lastPacket) {
-          return null; // Error explícito (NAK)
+          return null; 
       }
       await this.sleep(20);
     }
@@ -340,8 +346,6 @@ export class MicroNIRBLEDriver {
         
         const resp = await this.waitForPacket(2500);
         if (resp && resp.length >= 5) {
-            // [02, LEN, 06, MSB, LSB, CRC, 03]
-            // Validar Opcode 0x06 (byte index 2)
             if (resp[2] === 0x06) { 
                 const view = new DataView(resp.buffer);
                 const val = view.getUint16(3, false); 
@@ -367,23 +371,21 @@ export class MicroNIRBLEDriver {
 
     let spectrum: Uint16Array | null = null;
 
-    // Short format: [02, LEN, 05, ...]
+    // Paquete corto: [02, LEN, 05, DATA...]
     if (raw.length > 3 && raw[2] === 0x05) {
         const len = raw[1] - 1;
         spectrum = this.parseSpectrum(raw, 3, len/2);
     }
-    // Long format: [02, HI, LO, 05, ...]
+    // Paquete largo: [02, HI, LO, 05, DATA...]
     else if (raw.length > 4 && raw[3] === 0x05) {
         const len = (raw[1] << 8 | raw[2]) - 1;
         spectrum = this.parseSpectrum(raw, 4, len/2);
     }
-    // Fallback NAK check: si raw es muy pequeño, retornamos null
     else if (raw.length < 100) {
-        console.warn("Scan packet too small, likely NAK or Error");
         return null;
     }
     else {
-        // Fallback blind parse
+        // Fallback: Asumir payload directo para 128 píxeles
         spectrum = this.parseSpectrum(raw, 0, 128);
     }
 
@@ -391,11 +393,16 @@ export class MicroNIRBLEDriver {
   }
 
   private parseSpectrum(buffer: Uint8Array, offset: number, pixels: number): Uint16Array {
-    // Protección contra buffer overflow
-    const safePixels = Math.min(pixels, Math.floor((buffer.length - offset) / 2));
-    const s = new Uint16Array(safePixels);
+    // Si la cabecera dice una cosa pero tenemos buffer para 128, intentamos sacar 128
+    const bytesAvailable = buffer.length - offset;
+    const pixelsPossible = Math.floor(bytesAvailable / 2);
+    
+    // Preferir 128 si hay datos suficientes, si no, lo que llegue
+    const targetPixels = (pixelsPossible >= 128) ? 128 : pixels;
+
+    const s = new Uint16Array(targetPixels);
     const view = new DataView(buffer.buffer);
-    for(let j=0; j<safePixels; j++) {
+    for(let j=0; j<targetPixels; j++) {
        s[j] = view.getUint16(offset + (j*2), false); 
     }
     return s;
