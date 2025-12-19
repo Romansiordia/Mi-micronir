@@ -33,10 +33,10 @@ const App: React.FC = () => {
     const success = await microNir.connect();
     if (success) {
       setIsConnected(true);
-      addLog("Protocolo OnSiteW vinculado correctamente.", "success");
-      updateHardwareStatus();
+      addLog("Sensor conectado.", "success");
+      await updateHardwareStatus();
     } else {
-      addLog("Error de vinculación. Verifique conexión física.", "error");
+      addLog("Error de conexión USB.", "error");
     }
   };
 
@@ -50,24 +50,32 @@ const App: React.FC = () => {
         firmware: "v2.5.1",
         pixelCount: 128
       });
-      addLog(`Status: Temperatura sensor ${temp.toFixed(1)}°C`, "info");
+      addLog(`Temperatura: ${temp.toFixed(1)}°C`, "info");
     }
   };
 
-  const toggleLamp = async () => {
-    const isCurrentlyOn = lampStatus === 'ok';
-    const nextState = !isCurrentlyOn;
-    
-    addLog(`Cambiando lámpara a ${nextState ? 'ON' : 'OFF'}...`, "info");
-    setIsMeasuring(true); // Bloquear UI durante estabilización
-    
-    const ok = await microNir.setLamp(nextState);
-    
+  const turnOnLamp = async () => {
+    addLog("Encendiendo lámpara (calentando...)", "info");
+    setIsMeasuring(true);
+    const ok = await microNir.setLamp(true);
     if (ok) {
-      setLampStatus(nextState ? 'ok' : 'off');
-      addLog(`Lámpara ${nextState ? 'ENCENDIDA (Estabilizada)' : 'APAGADA'}`, "success");
+      setLampStatus('ok');
+      addLog("Lámpara encendida y lista.", "success");
     } else {
-      addLog("Fallo de comando SET_LAMP.", "error");
+      addLog("Error al encender lámpara.", "error");
+    }
+    setIsMeasuring(false);
+  };
+
+  const turnOffLamp = async () => {
+    addLog("Apagando lámpara...", "info");
+    setIsMeasuring(true);
+    const ok = await microNir.setLamp(false);
+    if (ok) {
+      setLampStatus('off');
+      addLog("Lámpara apagada.", "success");
+    } else {
+      addLog("Error al apagar lámpara.", "error");
     }
     setIsMeasuring(false);
   };
@@ -83,9 +91,9 @@ const App: React.FC = () => {
           [type]: Array.from(raw),
           step: (type === 'dark' && !!prev.reference) || (type === 'reference' && !!prev.dark) ? 'ready' : type
         }));
-        addLog(`Referencia ${type.toUpperCase()} almacenada.`, "success");
+        addLog(`Referencia ${type.toUpperCase()} capturada.`, "success");
       } else {
-        addLog("Captura fallida. Revise estado de lámpara/posición.", "error");
+        addLog("Captura de referencia fallida.", "error");
       }
     } finally {
       setIsMeasuring(false);
@@ -114,9 +122,10 @@ const App: React.FC = () => {
         setPrediction(val.toString());
         const currentData = CDM_MODEL.wavelengths.map((nm, i) => ({ nm, absorbance: absData[i] }));
         setSpectralData(currentData);
-        addLog(`Escaneo finalizado: ${val}%`, "success");
-        
+        addLog(`Análisis completado: ${val}%`, "success");
         getAIInterpretation(currentData, val.toString(), lampStatus).then(setAiInsight);
+      } else {
+        addLog("Error al leer el espectro.", "error");
       }
     } finally {
       setIsMeasuring(false);
@@ -134,7 +143,7 @@ const App: React.FC = () => {
             <h1 className="font-black text-xl tracking-tighter uppercase italic text-white flex items-center gap-2">
               MicroNIR <span className="text-blue-500 px-2 py-0.5 bg-blue-500/10 rounded text-sm not-italic tracking-normal">QUANTUM</span>
             </h1>
-            <p className="text-[10px] text-slate-500 font-bold uppercase tracking-widest">SDK Command Control Protocol v4.0</p>
+            <p className="text-[10px] text-slate-500 font-bold uppercase tracking-widest">Protocolo de Control OnSiteW</p>
           </div>
         </div>
         <div className="flex gap-4">
@@ -144,13 +153,23 @@ const App: React.FC = () => {
             </button>
           ) : (
             <div className="flex items-center gap-2">
-               <button 
+               {lampStatus === 'off' ? (
+                 <button 
                   disabled={isMeasuring}
-                  onClick={toggleLamp} 
-                  className={`px-5 py-2.5 rounded-full font-bold text-xs border transition-all ${isMeasuring ? 'opacity-50 cursor-wait' : ''} ${lampStatus === 'ok' ? 'bg-orange-500 text-white border-orange-400' : 'bg-slate-800 border-white/5 text-slate-500 hover:text-white'}`}
-                >
-                {lampStatus === 'ok' ? 'APAGAR LÁMPARA' : 'ENCENDER LÁMPARA'}
-              </button>
+                  onClick={turnOnLamp} 
+                  className={`px-6 py-2.5 rounded-full font-bold text-xs bg-orange-600 text-white hover:bg-orange-500 transition-all ${isMeasuring ? 'opacity-50 cursor-wait' : ''}`}
+                 >
+                   ENCENDER LÁMPARA
+                 </button>
+               ) : (
+                 <button 
+                  disabled={isMeasuring}
+                  onClick={turnOffLamp} 
+                  className={`px-6 py-2.5 rounded-full font-bold text-xs bg-slate-800 text-slate-400 border border-white/10 hover:text-white transition-all ${isMeasuring ? 'opacity-50 cursor-wait' : ''}`}
+                 >
+                   APAGAR LÁMPARA
+                 </button>
+               )}
               <button onClick={updateHardwareStatus} className="p-2.5 rounded-full bg-slate-800 text-slate-400 border border-white/5 hover:text-white transition-colors">
                 <RefreshCw size={18} />
               </button>
@@ -163,7 +182,7 @@ const App: React.FC = () => {
         <aside className="lg:col-span-4 space-y-6">
           <div className="glass-panel p-6 rounded-3xl border-white/5 shadow-lg">
             <h3 className="text-[10px] font-black text-slate-500 uppercase mb-5 flex items-center gap-2 tracking-widest">
-              <ShieldCheck size={14} className="text-emerald-500" /> Diagnóstico de Hardware
+              <ShieldCheck size={14} className="text-emerald-500" /> Diagnóstico
             </h3>
             {deviceInfo ? (
               <div className="grid grid-cols-2 gap-4">
@@ -174,34 +193,28 @@ const App: React.FC = () => {
                   </div>
                 </div>
                 <div className="bg-slate-900/50 p-3 rounded-2xl border border-white/5">
-                  <span className="text-[9px] text-slate-500 block uppercase mb-1">Integración</span>
+                  <span className="text-[9px] text-slate-500 block uppercase mb-1">Estado</span>
                   <div className="flex items-center gap-2 text-blue-400 font-bold">
-                    <Zap size={14} /> 10ms
+                    <CheckCircle2 size={14} /> OK
                   </div>
-                </div>
-                <div className="col-span-2 bg-slate-900/50 p-3 rounded-2xl border border-white/5">
-                   <div className="flex justify-between items-center text-[10px] font-mono opacity-60">
-                     <span>MODEL: {deviceInfo.model}</span>
-                     <span>SN: {deviceInfo.serialNumber}</span>
-                   </div>
                 </div>
               </div>
             ) : (
-              <div className="text-center py-4 text-xs text-slate-600 italic">Equipo no detectado</div>
+              <div className="text-center py-4 text-xs text-slate-600 italic">Esperando conexión...</div>
             )}
           </div>
 
           <div className="glass-panel p-6 rounded-3xl border-white/5 shadow-lg">
             <h3 className="text-[10px] font-black text-slate-500 uppercase mb-6 flex items-center gap-2 tracking-widest">
-              <FlaskConical size={14} /> Flujo de Calibración
+              <FlaskConical size={14} /> Calibración
             </h3>
             <div className="space-y-3">
-              <button disabled={!isConnected || isMeasuring} onClick={() => runCalibration('dark')} className={`w-full flex justify-between items-center p-4 rounded-2xl border transition-all ${calib.dark ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-400' : 'bg-slate-900 border-white/5 hover:border-blue-500/50'}`}>
-                <div className="flex items-center gap-3 font-bold uppercase text-[11px]"><Moon size={18} />Referencia Dark</div>
+              <button disabled={!isConnected || isMeasuring} onClick={() => runCalibration('dark')} className={`w-full flex justify-between items-center p-4 rounded-2xl border transition-all ${calib.dark ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-400' : 'bg-slate-900 border-white/5'}`}>
+                <div className="flex items-center gap-3 font-bold uppercase text-[11px]"><Moon size={18} />Referencia Oscura</div>
                 {calib.dark && <CheckCircle2 size={16} />}
               </button>
-              <button disabled={!isConnected || isMeasuring} onClick={() => runCalibration('reference')} className={`w-full flex justify-between items-center p-4 rounded-2xl border transition-all ${calib.reference ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-400' : 'bg-slate-900 border-white/5 hover:border-blue-500/50'}`}>
-                <div className="flex items-center gap-3 font-bold uppercase text-[11px]"><Sun size={18} />Referencia White</div>
+              <button disabled={!isConnected || isMeasuring} onClick={() => runCalibration('reference')} className={`w-full flex justify-between items-center p-4 rounded-2xl border transition-all ${calib.reference ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-400' : 'bg-slate-900 border-white/5'}`}>
+                <div className="flex items-center gap-3 font-bold uppercase text-[11px]"><Sun size={18} />Referencia Blanca</div>
                 {calib.reference && <CheckCircle2 size={16} />}
               </button>
             </div>
@@ -209,7 +222,7 @@ const App: React.FC = () => {
 
           <div className="glass-panel p-6 rounded-3xl border-white/5 overflow-hidden">
             <h3 className="text-[10px] font-black text-slate-500 uppercase mb-4 flex items-center gap-2 tracking-widest">
-              <Terminal size={14} /> Consola de Sistema
+              <Terminal size={14} /> Logs
             </h3>
             <div className="h-48 overflow-y-auto space-y-2 pr-2 custom-scrollbar font-mono text-[9px]">
               {logs.map((l, i) => (
@@ -226,12 +239,12 @@ const App: React.FC = () => {
             <div className="flex justify-between items-start mb-10">
               <div>
                 <h2 className="text-2xl font-black italic text-white flex items-center gap-3 mb-1">
-                  <Activity className="text-blue-500" /> Curva Espectral
+                  <Activity className="text-blue-500" /> Espectro de Absorbancia
                 </h2>
                 <p className="text-xs text-slate-500 uppercase font-bold tracking-widest">Modelo: {CDM_MODEL.name}</p>
               </div>
-              <div className="bg-slate-950 p-5 rounded-3xl border border-white/5 text-center min-w-[180px] shadow-inner">
-                <span className="text-[10px] font-black text-blue-500 block mb-1 tracking-tighter uppercase">Proteína Estimada</span>
+              <div className="bg-slate-950 p-5 rounded-3xl border border-white/5 text-center min-w-[180px]">
+                <span className="text-[10px] font-black text-blue-500 block mb-1 tracking-tighter uppercase">Proteína</span>
                 <span className="text-5xl font-black text-white">{prediction || '--.--'}<small className="text-sm ml-1 opacity-40">%</small></span>
               </div>
             </div>
@@ -246,11 +259,10 @@ const App: React.FC = () => {
                     </linearGradient>
                   </defs>
                   <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.1} />
-                  <XAxis dataKey="nm" stroke="#475569" fontSize={10} tickFormatter={v => `${v}nm`} axisLine={false} tickLine={false} />
-                  <YAxis stroke="#475569" fontSize={10} axisLine={false} tickLine={false} />
+                  <XAxis dataKey="nm" stroke="#475569" fontSize={10} tickFormatter={v => `${v}nm`} />
+                  <YAxis stroke="#475569" fontSize={10} />
                   <Tooltip 
-                    contentStyle={{ background: '#0f172a', border: '1px solid rgba(255,255,255,0.05)', borderRadius: '16px', boxShadow: '0 20px 25px -5px rgb(0 0 0 / 0.5)' }}
-                    itemStyle={{ color: '#3b82f6', fontWeight: 'bold' }}
+                    contentStyle={{ background: '#0f172a', border: '1px solid rgba(255,255,255,0.05)', borderRadius: '16px' }}
                   />
                   <Area type="monotone" dataKey="absorbance" stroke="#3b82f6" fillOpacity={1} fill="url(#colorAbs)" strokeWidth={4} animationDuration={1000} />
                 </AreaChart>
@@ -269,10 +281,10 @@ const App: React.FC = () => {
             <button 
               disabled={!isConnected || isMeasuring || calib.step !== 'ready'} 
               onClick={runScan}
-              className={`w-full py-7 rounded-3xl font-black text-xl uppercase transition-all flex items-center justify-center gap-4 shadow-xl ${isConnected && calib.step === 'ready' ? 'bg-white text-black hover:bg-blue-500 hover:text-white hover:scale-[1.01]' : 'bg-slate-900 text-slate-700 cursor-not-allowed border border-white/5'}`}
+              className={`w-full py-7 rounded-3xl font-black text-xl uppercase transition-all flex items-center justify-center gap-4 shadow-xl ${isConnected && calib.step === 'ready' ? 'bg-white text-black hover:bg-blue-500 hover:text-white' : 'bg-slate-900 text-slate-700 cursor-not-allowed'}`}
             >
               {isMeasuring ? <RefreshCw className="animate-spin" /> : <Play fill="currentColor" />}
-              {isMeasuring ? 'Capturando datos...' : 'Ejecutar Análisis PLS'}
+              {isMeasuring ? 'Procesando...' : 'Escanear Muestra'}
             </button>
           </div>
         </main>

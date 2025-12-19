@@ -37,9 +37,6 @@ function calculateCrc8(data: Uint8Array): number {
   return crc;
 }
 
-/**
- * Los metadatos de VIAVI sugieren un manejo de paquetes por bloques de 64 bytes (FTDI).
- */
 function decapsulateFtdi(data: Uint8Array): Uint8Array {
   const blockSize = 64;
   const result = new Uint8Array(data.length); 
@@ -60,11 +57,6 @@ export class MicroNIRDevice {
   private inEndpoint: number = 2;
   private outEndpoint: number = 1;
   public isSimulated: boolean = false;
-  
-  // Constantes de tiempo identificadas en los metadatos de VIAVI
-  private readonly LAMP_ON_DELAY = 1000;  // 1s para calentamiento
-  private readonly LAMP_OFF_DELAY = 500;  // 500ms para enfriamiento
-  private readonly COMMAND_TIMEOUT = 200; // 200ms entre comandos
 
   private async delay(ms: number) {
     return new Promise(resolve => setTimeout(resolve, ms));
@@ -83,24 +75,19 @@ export class MicroNIRDevice {
       const interfaceNum = 0;
       try { await this.device.claimInterface(interfaceNum); } catch (e) {}
 
-      // Configuración inicial del chip FTDI (Handshake de la librería OnSiteW)
+      // Handshake FTDI estándar para MicroNIR
       await this.device.controlTransferOut({ requestType: 'vendor', recipient: 'device', request: 0x00, value: 0x00, index: 0x00 }); 
       await this.device.controlTransferOut({ requestType: 'vendor', recipient: 'device', request: 0x03, value: 0x401A, index: 0x0000 }); 
       await this.device.controlTransferOut({ requestType: 'vendor', recipient: 'device', request: 0x01, value: 0x0303, index: 0x0000 }); 
       await this.device.controlTransferOut({ requestType: 'vendor', recipient: 'device', request: 0x09, value: 0x0001, index: 0x0000 }); 
 
-      await this.setIntegrationTime(10000); 
       return true;
     } catch (error) {
-      console.error("USB Connect Error:", error);
+      console.error("Connection error:", error);
       return false;
     }
   }
 
-  /**
-   * Implementación robusta de envío de comandos.
-   * Basado en 'IPacketTransceiver' de los metadatos.
-   */
   async sendCommand(opcode: number, payload: number[] = []): Promise<boolean> {
     if (!this.device?.opened) return false;
     try {
@@ -112,6 +99,7 @@ export class MicroNIRDevice {
       const result = await this.device.transferOut(this.outEndpoint, packet);
       return result.status === 'ok';
     } catch (e) {
+      console.error("Command error:", e);
       return false;
     }
   }
@@ -124,10 +112,13 @@ export class MicroNIRDevice {
 
   async getTemperature(): Promise<number | null> {
     if (this.isSimulated) return 24.5 + Math.random();
+    if (!this.device?.opened) return null;
+
     try {
-      await this.sendCommand(OPCODES.GET_TEMPERATURE);
-      await this.delay(150); // Delay de respuesta del sensor térmico
+      const sent = await this.sendCommand(OPCODES.GET_TEMPERATURE);
+      if (!sent) return null;
       
+      await this.delay(50);
       const result = await this.device.transferIn(this.inEndpoint, 64);
       if (result.data && result.data.byteLength >= 4) {
         const clean = decapsulateFtdi(new Uint8Array(result.data.buffer));
@@ -142,19 +133,28 @@ export class MicroNIRDevice {
     return null;
   }
 
+  async setLamp(on: boolean): Promise<boolean> {
+    if (!this.device?.opened) return false;
+    const ok = await this.sendCommand(OPCODES.SET_LAMP, [on ? 0x01 : 0x00]);
+    if (ok) {
+      await this.delay(on ? 1500 : 500); // Delay crítico de estabilización
+    }
+    return ok;
+  }
+
   async readSpectrum(): Promise<Uint16Array | null> {
     if (this.isSimulated) return new Uint16Array(Array.from({ length: 128 }, () => 20000 + Math.random() * 5000));
     if (!this.device?.opened) return null;
 
     try {
-      // Basado en 'BeginOneShotModeScanAsync'
-      await this.sendCommand(OPCODES.PERFORM_SCAN);
-      await this.delay(700); // Tiempo de integración + procesamiento interno
+      const ok = await this.sendCommand(OPCODES.PERFORM_SCAN);
+      if (!ok) return null;
 
+      await this.delay(800); 
       let rawAccumulated = new Uint8Array(0);
       const startTime = Date.now();
       
-      while (Date.now() - startTime < 3500) {
+      while (Date.now() - startTime < 3000) {
         const result = await this.device.transferIn(this.inEndpoint, 1024);
         if (result.status === 'ok' && result.data.byteLength > 0) {
           const chunk = new Uint8Array(result.data.buffer);
@@ -164,7 +164,7 @@ export class MicroNIRDevice {
           rawAccumulated = next;
           if (rawAccumulated.length >= 320) break;
         }
-        await this.delay(30);
+        await this.delay(20);
       }
 
       const clean = decapsulateFtdi(rawAccumulated);
@@ -172,7 +172,6 @@ export class MicroNIRDevice {
         if (clean[i] === 0x02) {
           let dataStart = -1;
           let dataLength = 0;
-
           if (clean[i+2] === 0x05) { 
             dataStart = i + 3;
             dataLength = clean[i+1] - 1;
@@ -180,7 +179,6 @@ export class MicroNIRDevice {
             dataStart = i + 4;
             dataLength = (clean[i+1] << 8 | clean[i+2]) - 1;
           }
-
           if (dataStart !== -1 && dataLength > 100) {
             const points = Math.floor(dataLength / 2);
             const spectrum = new Uint16Array(points);
@@ -188,7 +186,7 @@ export class MicroNIRDevice {
             for (let j = 0; j < points; j++) {
               spectrum[j] = view.getUint16(j * 2, false); 
             }
-            if (spectrum[10] > 0) return spectrum;
+            return spectrum;
           }
         }
       }
@@ -196,19 +194,6 @@ export class MicroNIRDevice {
     } catch (e) {
       return null;
     }
-  }
-
-  /**
-   * Control de lámpara optimizado según 'TurnLampOnAsync'/'TurnLampOffAsync'.
-   */
-  async setLamp(on: boolean): Promise<boolean> {
-    const success = await this.sendCommand(OPCODES.SET_LAMP, [on ? 0x01 : 0x00]);
-    if (success) {
-      // La clave de los metadatos de VIAVI: el software debe esperar a que el hardware
-      // complete la transición de energía antes de permitir otro comando.
-      await this.delay(on ? this.LAMP_ON_DELAY : this.LAMP_OFF_DELAY);
-    }
-    return success;
   }
 
   async disconnect() {
