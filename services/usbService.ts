@@ -40,13 +40,12 @@ function calculateCrc8(data: Uint8Array): number {
 /**
  * Decapsula los datos del protocolo FTDI.
  * El chip FTDI inserta 2 bytes de estado cada 64 bytes de transmisión USB.
- * Estos bytes deben ser eliminados para reconstruir el flujo de datos original.
  */
 function decapsulateFtdi(data: Uint8Array): Uint8Array {
   const blockSize = 64;
   const headerSize = 2;
   
-  // Calculamos el tamaño exacto del buffer de salida
+  // Calcular tamaño final
   let cleanSize = 0;
   for (let i = 0; i < data.length; i += blockSize) {
     const chunkLength = Math.min(blockSize, data.length - i);
@@ -61,7 +60,7 @@ function decapsulateFtdi(data: Uint8Array): Uint8Array {
   for (let i = 0; i < data.length; i += blockSize) {
     const remaining = Math.min(blockSize, data.length - i);
     if (remaining > headerSize) {
-      // Saltamos los primeros 2 bytes (Status bytes)
+      // Ignorar los 2 bytes de status del módem
       const chunk = data.slice(i + headerSize, i + remaining);
       result.set(chunk, destOffset);
       destOffset += chunk.length;
@@ -72,8 +71,8 @@ function decapsulateFtdi(data: Uint8Array): Uint8Array {
 
 export class MicroNIRDevice {
   private device: any | null = null;
-  private inEndpoint: number = 2; // EP2 IN para FTDI común
-  private outEndpoint: number = 1; // EP1 OUT para FTDI común
+  private inEndpoint: number = 2; // EP2 IN
+  private outEndpoint: number = 1; // EP1 OUT
   public isSimulated: boolean = false;
 
   private async delay(ms: number) {
@@ -81,22 +80,21 @@ export class MicroNIRDevice {
   }
 
   /**
-   * Limpia el buffer de entrada del USB para evitar leer datos antiguos.
-   * Crítico para el protocolo de disparo reforzado.
+   * Limpieza de Purga Agresiva:
+   * Lee repetidamente del buffer hasta que esté vacío para asegurar
+   * que no haya datos "fantasmas" o de operaciones anteriores.
    */
   private async flushBuffer() {
     if (!this.device?.opened) return;
     try {
-      // Intentamos leer agresivamente hasta que no haya más datos o timeout
-      // FTDI Latency timer = 1ms ayuda a que esto sea rápido
-      const res = await this.device.transferIn(this.inEndpoint, 64);
-      if (res.data && res.data.byteLength > 2) {
-        // Si había datos reales, leemos otra vez por si acaso
-        await this.delay(2); 
-        await this.device.transferIn(this.inEndpoint, 64);
+      // Intentamos vaciar el buffer (max 5 intentos o hasta timeout)
+      for (let i = 0; i < 5; i++) {
+        const result = await this.device.transferIn(this.inEndpoint, 64);
+        // Si recibimos 2 bytes o menos, son solo los status bytes (buffer vacío)
+        if (!result.data || result.data.byteLength <= 2) break;
       }
     } catch (e) {
-      // Timeout esperado si el buffer está vacío
+      // Timeout es bueno aquí, significa buffer vacío
     }
   }
 
@@ -113,42 +111,46 @@ export class MicroNIRDevice {
       try { 
         await this.device.claimInterface(0); 
       } catch (e) {
-        console.warn("Interface 0 already claimed or busy", e);
+        console.warn("Interface 0 already claimed", e);
       }
 
-      // --- SECUENCIA DE INICIALIZACIÓN FTDI ROBUSTA ---
+      // --- CONFIGURACIÓN FTDI CORRECTA ---
       
-      // 1. Resetear dispositivo (Reset Port)
+      // 1. Reset (SIO_RESET)
       await this.device.controlTransferOut({
         requestType: 'vendor', recipient: 'device', request: 0x00, value: 0x00, index: 0x00
       });
 
-      // 2. Configurar Baud Rate (115200 aprox usando divisor 0x1A)
-      // Value 0x401A es un "magic number" común para 115200 en algunos chips FTDI con reloj base específico
+      // 2. Baud Rate (SIO_SET_BAUDRATE) - 115200 (Divisor 0x001A | 0x4000)
       await this.device.controlTransferOut({
         requestType: 'vendor', recipient: 'device', request: 0x03, value: 0x401A, index: 0x0000 
       });
 
-      // 3. Configurar Data Characteristics (8 bits, 1 stop bit, no parity) -> 0x0008
+      // 3. Data Format (SIO_SET_DATA) - 8N1
       await this.device.controlTransferOut({
         requestType: 'vendor', recipient: 'device', request: 0x04, value: 0x0008, index: 0x0000
       });
 
-      // 4. Configurar Latency Timer a 1ms (CRÍTICO para evitar paquetes vacíos)
-      // Request 0x09, Value 0x01
+      // 4. Latency Timer (SIO_SET_LATENCY_TIMER) - 1ms para respuesta rápida
       await this.device.controlTransferOut({
         requestType: 'vendor', recipient: 'device', request: 0x09, value: 0x0001, index: 0x0000
       });
 
-      // 5. Configurar Flow Control a None (0x0000, index 0x0000)
+      // 5. Modem Control (SIO_SET_MODEM_CTRL) - DTR HIGH, RTS HIGH
+      // CRÍTICO: Esto alimenta/despierta el MicroNIR. 
+      // Value 0x0303 = (DTR_MASK|RTS_MASK) << 8 | (DTR_HIGH|RTS_HIGH)
       await this.device.controlTransferOut({
-        requestType: 'vendor', recipient: 'device', request: 0x01, value: 0x0000, index: 0x0000
+        requestType: 'vendor', recipient: 'device', request: 0x01, value: 0x0303, index: 0x0000
       });
 
-      // Esperar estabilización del chip
-      await this.delay(100);
+      // 6. Flow Control (SIO_SET_FLOW_CTRL) - None
+      // Request 0x02 es Flow Control (antes estaba mal en 0x01)
+      await this.device.controlTransferOut({
+        requestType: 'vendor', recipient: 'device', request: 0x02, value: 0x0000, index: 0x0000
+      });
 
-      // Limpieza inicial
+      // Estabilización
+      await this.delay(100);
       await this.flushBuffer();
 
       return true;
@@ -158,19 +160,13 @@ export class MicroNIRDevice {
     }
   }
 
-  /**
-   * Protocolo de Disparo Reforzado:
-   * 1. Flush (Limpiar buffer)
-   * 2. Wait (Pausa de seguridad)
-   * 3. Send (Envío con reintento si falla USB)
-   */
   async sendCommand(opcode: number, payload: number[] = []): Promise<boolean> {
     if (!this.device?.opened) return false;
     
-    // Paso 1: Limpieza preventiva
-    await this.flushBuffer(); 
+    // Purga antes de enviar para asegurar canal limpio
+    await this.flushBuffer();
     
-    // Paso 2: Pausa corta para separar operaciones
+    // Pequeño delay de seguridad
     await this.delay(20);
 
     try {
@@ -178,12 +174,10 @@ export class MicroNIRDevice {
       const crcBuffer = new Uint8Array([payloadLength, opcode, ...payload]);
       const crc = calculateCrc8(crcBuffer);
       
-      // Paquete: [STX, LEN, OPCODE, DATA..., CRC, ETX]
+      // Protocolo Robusto: [STX, LEN, OPCODE, DATA..., CRC, ETX]
       const packet = new Uint8Array([0x02, payloadLength, opcode, ...payload, crc, 0x03]);
       
-      // Paso 3: Envío
       const result = await this.device.transferOut(this.outEndpoint, packet);
-      
       return result.status === 'ok';
     } catch (e) {
       console.error(`Command ${opcode.toString(16)} error:`, e);
@@ -205,27 +199,20 @@ export class MicroNIRDevice {
       const sent = await this.sendCommand(OPCODES.GET_TEMPERATURE);
       if (!sent) return null;
       
-      // Esperar respuesta (temperatura es rápida)
       await this.delay(50);
 
-      // Leer respuesta
       const result = await this.device.transferIn(this.inEndpoint, 64);
-      if (result.data && result.data.byteLength >= 4) {
-        // Eliminar headers FTDI
+      if (result.data && result.data.byteLength > 2) {
         const clean = decapsulateFtdi(new Uint8Array(result.data.buffer));
         
-        // Buscar patrón de respuesta [STX, LEN, OPCODE=0x06, ...]
         for (let i = 0; i < clean.length - 4; i++) {
           if (clean[i] === 0x02 && clean[i+2] === 0x06) {
-            // Temperatura suele ser 2 bytes Big Endian en estos modelos
             const view = new DataView(clean.buffer, clean.byteOffset + i + 3, 2);
-            return view.getUint16(0, false) / 1000.0; // Algunas versiones requieren / 100.0, ajustado a estándar
+            return view.getUint16(0, false) / 1000.0;
           }
         }
       }
-    } catch (e) {
-      console.warn("Read temp failed", e);
-    }
+    } catch (e) {}
     return null;
   }
 
@@ -236,8 +223,7 @@ export class MicroNIRDevice {
     const ok = await this.sendCommand(OPCODES.SET_LAMP, [on ? 0x01 : 0x00]);
     
     if (ok) {
-      // Delay crítico: La fuente de poder de la lámpara tarda en estabilizarse
-      // Si enviamos otro comando muy rápido, el voltaje cae y el USB se desconecta lógicamente
+      // Delay crítico de estabilización eléctrica de la lámpara
       await this.delay(on ? 1500 : 500); 
     }
     return ok;
@@ -248,60 +234,58 @@ export class MicroNIRDevice {
     if (!this.device?.opened) return null;
 
     try {
-      // Disparo reforzado ya incluye flush dentro de sendCommand
+      // Disparo (incluye flush previo)
       const ok = await this.sendCommand(OPCODES.PERFORM_SCAN);
       if (!ok) return null;
 
-      // Tiempo de integración + tiempo de procesamiento del sensor
-      // Aumentado a 600ms para asegurar que el sensor tiene datos listos
+      // Tiempo de integración + procesamiento
       await this.delay(600); 
       
       let rawAccumulated = new Uint8Array(0);
       const startTime = Date.now();
       
-      // Bucle de lectura "Chunked"
-      // Lee todo lo que llega, pedazo a pedazo, hasta tener suficiente o timeout
-      while (Date.now() - startTime < 3000) {
+      // Lectura Acumulativa: Bucle de 1000ms para asegurar recepción completa
+      while (Date.now() - startTime < 1000) {
         try {
-          const result = await this.device.transferIn(this.inEndpoint, 512); // Pedir bloques grandes
-          if (result.status === 'ok' && result.data.byteLength > 2) { // >2 porque 2 bytes son siempre status
+          const result = await this.device.transferIn(this.inEndpoint, 512);
+          
+          // FTDI siempre devuelve 2 bytes de status. Datos reales => byteLength > 2
+          if (result.status === 'ok' && result.data.byteLength > 2) {
             const chunk = new Uint8Array(result.data.buffer);
             const next = new Uint8Array(rawAccumulated.length + chunk.length);
             next.set(rawAccumulated);
             next.set(chunk, rawAccumulated.length);
             rawAccumulated = next;
             
-            // Si tenemos suficiente data (ej. 128 px * 2 bytes + headers ~ 260-300 bytes)
-            // Calculando con margen por los headers FTDI
-            if (rawAccumulated.length >= 400) break; 
+            // Si ya tenemos suficientes bytes (aprox 300 para 128px), salir
+            if (rawAccumulated.length >= 350) break; 
           } else {
-            // Si el paquete está vacío (solo status bytes o 0), esperar un poco
-            await this.delay(10);
+            // Buffer vacío temporalmente, esperar un poco
+            await this.delay(20);
           }
         } catch(readErr) {
-          // Si hay error de lectura (stall), intentamos una vez más y seguimos
-          await this.delay(10);
+          // Error de lectura (ej. stall), esperar y reintentar
+          await this.delay(20);
         }
       }
 
-      // Limpieza de datos (Quitar headers FTDI)
+      // Procesar datos crudos eliminando cabeceras FTDI
       const clean = decapsulateFtdi(rawAccumulated);
       
-      // Buscar la cabecera del espectro (Opcode 0x05)
+      // Buscar respuesta 0x05 (Perform Scan)
       for (let i = 0; i < clean.length - 10; i++) {
         if (clean[i] === 0x02) { // STX
           let dataStart = -1;
           let dataLength = 0;
           
-          // Verificar opcode 0x05 (Respuesta estándar)
+          // Formato estándar: LEN, CMD
           if (clean[i+2] === 0x05) { 
             dataStart = i + 3;
-            dataLength = clean[i+1] - 1; // Longitud basada en byte LEN
+            dataLength = clean[i+1] - 1;
           } 
-          // Verificar opcode 0x05 en modo extendido (len > 255)
+          // Formato extendido: LEN (2 bytes), CMD
           else if (clean[i+3] === 0x05) { 
             dataStart = i + 4;
-            // Len es 2 bytes
             dataLength = (clean[i+1] << 8 | clean[i+2]) - 1;
           }
 
@@ -311,33 +295,23 @@ export class MicroNIRDevice {
             const view = new DataView(clean.buffer, clean.byteOffset + dataStart, dataLength);
             
             for (let j = 0; j < points; j++) {
-              // Intento Big Endian (Estándar VIAVI)
-              spectrum[j] = view.getUint16(j * 2, false); 
+              spectrum[j] = view.getUint16(j * 2, false); // Big Endian
             }
-            
-            // Auto-detección Endianness:
-            // Los sensores oscuros suelen tener valores bajos (< 5000) o altos (> 60000) si están invertidos raramente.
-            // Una prueba simple: el pixel 0 y el pixel 64 deberían tener cierta coherencia.
-            // Si spectrum[64] es absurdamente grande y el pixel adyacente cambia drásticamente, podría ser Little Endian.
-            // Por ahora, mantenemos Big Endian que es el estándar del firmware 2.5.1
-            
             return spectrum;
           }
         }
       }
-      console.warn("Header 0x05 not found in clean data", clean.slice(0, 20));
+      console.warn("No spectrum header found in data", clean.byteLength);
       return null;
     } catch (e) {
-      console.error("Read spectrum fatal error:", e);
+      console.error("Read spectrum error:", e);
       return null;
     }
   }
 
   async disconnect() {
     if (this.device?.opened) {
-      try {
-        await this.setLamp(false);
-      } catch(e) {}
+      try { await this.setLamp(false); } catch(e) {}
       await this.device.close();
     }
     this.device = null;
