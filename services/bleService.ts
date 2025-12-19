@@ -1,4 +1,3 @@
-
 import { BLE_CONFIG } from "../constants";
 
 // Definiciones de tipos para Web Bluetooth API
@@ -83,11 +82,11 @@ export class MicroNIRBLEDriver {
   private device: BluetoothDevice | null = null;
   private server: BluetoothRemoteGATTServer | null = null;
   
-  // En BLE puede haber una char para escribir y MÚLTIPLES para recibir (Indications vs Notifications)
   private txChar: BluetoothRemoteGATTCharacteristic | null = null;
   private listeningChars: BluetoothRemoteGATTCharacteristic[] = [];
   
   private keepAliveInterval: any = null;
+  private pendingResponse = false;
 
   public isConnected = false;
   
@@ -100,7 +99,6 @@ export class MicroNIRBLEDriver {
   }
 
   constructor() {
-    // Intentar limpieza al cerrar ventana
     if (typeof window !== 'undefined') {
       window.addEventListener('beforeunload', () => {
         this.disconnect();
@@ -114,9 +112,7 @@ export class MicroNIRBLEDriver {
         return "Navegador no soporta Web Bluetooth";
       }
 
-      // Limpiar estado previo
-      this.listeningChars = [];
-      this.rxBuffer = new Uint8Array(0);
+      this.disconnectCleanly();
 
       // 1. Buscar Dispositivo
       console.log("Buscando dispositivo MicroNIR BLE...");
@@ -135,64 +131,52 @@ export class MicroNIRBLEDriver {
       console.log("Obteniendo servicio primario...");
       const service = await this.server.getPrimaryService(BLE_CONFIG.serviceUUID);
 
-      // 4. ESTRATEGIA PROMISCUA DE CARACTERÍSTICAS
-      // El DLL indica que usa CommandControlPoints y múltiples UUIDs. 
-      // En lugar de adivinar, obtenemos TODAS y nos suscribimos a TODAS las que hablen.
+      // 4. CONFIGURACIÓN DE CARACTERÍSTICAS
       const chars = await service.getCharacteristics();
-      console.log(`Encontradas ${chars.length} características en el servicio.`);
+      console.log(`Encontradas ${chars.length} características.`);
 
       let foundTx = false;
 
       for (const c of chars) {
         const props = c.properties;
-        const uuidShort = c.uuid.slice(4, 8); // Log visual
-        
-        console.log(`Char [${uuidShort}]: Write=${props.write}, Notify=${props.notify}, Indicate=${props.indicate}`);
+        const uuidShort = c.uuid.slice(4, 8);
+        console.log(`Char [${uuidShort}]: W=${props.write}, N=${props.notify}, I=${props.indicate}`);
 
-        // A. Detección de Canal de Escritura (TX)
-        // Preferimos Write sobre WriteWithoutResponse para comandos de control
+        // TX: Preferir Write
         if ((props.write || props.writeWithoutResponse) && !foundTx) {
           this.txChar = c;
           foundTx = true;
-          console.log(` -> ASIGNADO COMO TX: ${c.uuid}`);
+          console.log(` -> ASIGNADO TX: ${c.uuid}`);
         }
 
-        // B. Detección de Canales de Lectura (RX)
-        // Nos suscribimos a TODO lo que pueda enviar datos
+        // RX: Suscribirse a todo lo que hable
         if (props.notify || props.indicate) {
           try {
             await c.startNotifications();
             c.addEventListener('characteristicvaluechanged', this.handleNotifications);
             this.listeningChars.push(c);
-            console.log(` -> SUSCRITO A: ${c.uuid} (${props.indicate ? 'Indicate' : 'Notify'})`);
+            console.log(` -> SUSCRITO RX: ${c.uuid}`);
           } catch (e) {
-            console.warn(`No se pudo suscribir a ${uuidShort}:`, e);
+            console.warn(`Error suscribiendo a ${uuidShort}:`, e);
           }
         }
       }
 
-      if (!this.txChar) {
-        throw new Error("No se encontró característica de Escritura (TX)");
-      }
-      if (this.listeningChars.length === 0) {
-        throw new Error("No se encontraron características de Notificación (RX)");
-      }
+      if (!this.txChar) throw new Error("No se encontró canal de escritura (TX)");
+      if (this.listeningChars.length === 0) throw new Error("No se encontraron canales de lectura (RX)");
 
       this.isConnected = true;
-      
-      // 5. INICIAR KEEP ALIVE
-      // El dump menciona "txKeepAliveTimer". Los dispositivos BLE a veces desconectan si no hay actividad.
-      // Leemos la temperatura cada 4 segundos en segundo plano.
+      this.rxBuffer = new Uint8Array(0); // Reset buffer
+
+      // Iniciar KeepAlive suave
       this.startKeepAlive();
       
-      console.log("Conexión BLE establecida y configurada.");
+      console.log("BLE Listo.");
       return "OK";
 
     } catch (error: any) {
-      console.error("BLE Error Fatal:", error);
+      console.error("BLE Connect Error:", error);
       this.isConnected = false;
-      // Intentar desconectar limpiamente si falló a medias
-      if (this.device?.gatt?.connected) this.device.gatt.disconnect();
       return error.message || "Error BLE Desconocido";
     }
   }
@@ -200,124 +184,147 @@ export class MicroNIRBLEDriver {
   private startKeepAlive() {
     if (this.keepAliveInterval) clearInterval(this.keepAliveInterval);
     this.keepAliveInterval = setInterval(() => {
-      if (this.isConnected && !this.lastPacket) { // Solo si no estamos esperando otra respuesta
-         // Enviar un comando inofensivo (GET_TEMP) silenciando errores
+      // Solo enviar KeepAlive si no estamos esperando una respuesta crítica
+      if (this.isConnected && !this.pendingResponse) { 
          this.send(CMD.GET_TEMP, [], true).catch(() => {});
       }
     }, 4000);
   }
 
-  private onDisconnected = () => {
-    console.log("Dispositivo BLE desconectado evento nativo");
+  private disconnectCleanly() {
     this.isConnected = false;
+    this.pendingResponse = false;
     if (this.keepAliveInterval) clearInterval(this.keepAliveInterval);
+    this.listeningChars = [];
+    this.rxBuffer = new Uint8Array(0);
+    this.txChar = null;
+  }
+
+  private onDisconnected = () => {
+    console.log("Evento Desconectado recibido");
+    this.disconnectCleanly();
   };
 
+  // Manejo de buffer inteligente: Busca paquetes STX...ETX ignorando basura
   private handleNotifications = (event: Event) => {
     const value = (event.target as BluetoothRemoteGATTCharacteristic).value;
     if (!value) return;
 
     const chunk = new Uint8Array(value.buffer);
-    // console.log("RX Chunk:", chunk); // Debug a bajo nivel si es necesario
-    
-    // Concatenar chunk al buffer
+    console.log("BLE RX Chunk:", chunk); // DEBUG CRÍTICO: Ver qué llega
+
+    // Concatenar
     const newBuffer = new Uint8Array(this.rxBuffer.length + chunk.length);
     newBuffer.set(this.rxBuffer);
     newBuffer.set(chunk, this.rxBuffer.length);
     this.rxBuffer = newBuffer;
 
-    // Verificar si tenemos un paquete completo (Termina en ETX 0x03)
-    // Nota: El protocolo MicroNIR termina en 0x03.
-    if (this.rxBuffer.length > 0 && this.rxBuffer[this.rxBuffer.length - 1] === 0x03) {
-      // Guardar como último paquete válido
-      this.lastPacket = this.rxBuffer;
-      // Limpiar buffer
-      this.rxBuffer = new Uint8Array(0);
-    }
+    this.scanForPackets();
   };
 
+  private scanForPackets() {
+    // Buscar inicio (0x02)
+    const stxIndex = this.rxBuffer.indexOf(0x02);
+    if (stxIndex === -1) {
+        // Si el buffer es enorme y no tiene STX, límpialo para no explotar memoria
+        if (this.rxBuffer.length > 2048) this.rxBuffer = new Uint8Array(0);
+        return;
+    }
+
+    // Buscar fin (0x03) DESPUÉS del inicio
+    let etxIndex = -1;
+    for(let i = stxIndex + 1; i < this.rxBuffer.length; i++) {
+        if (this.rxBuffer[i] === 0x03) {
+            etxIndex = i;
+            break;
+        }
+    }
+
+    if (etxIndex !== -1) {
+        // ¡Paquete encontrado!
+        const packet = this.rxBuffer.slice(stxIndex, etxIndex + 1);
+        console.log("Packet Validated:", packet);
+        this.lastPacket = packet;
+        
+        // Eliminar este paquete del buffer y seguir buscando
+        this.rxBuffer = this.rxBuffer.slice(etxIndex + 1);
+        
+        // Recursión por si llegaron dos paquetes juntos
+        if (this.rxBuffer.length > 0) this.scanForPackets();
+    }
+  }
+
   async disconnect() {
-    if (this.keepAliveInterval) clearInterval(this.keepAliveInterval);
-    
     if (this.device && this.device.gatt?.connected) {
       try {
-        // Intentar desuscribirse de todo
-        for(const c of this.listeningChars) {
-           await c.stopNotifications();
-        }
-      } catch(e) { console.warn("Error parando notificaciones", e); }
-      
+        for(const c of this.listeningChars) await c.stopNotifications();
+      } catch(e) {}
       this.device.gatt.disconnect();
     }
-    this.isConnected = false;
-    this.listeningChars = [];
-    this.txChar = null;
+    this.disconnectCleanly();
   }
 
   async send(opcode: number, data: number[] = [], silent = false): Promise<boolean> {
     if (!this.isConnected || !this.txChar) return false;
 
-    // Si no es un keep-alive, limpiamos el buffer de respuesta anterior
     if (!silent) {
         this.lastPacket = null;
-        this.rxBuffer = new Uint8Array(0);
+        this.rxBuffer = new Uint8Array(0); // Limpiar buffer antiguo para evitar colisiones
+        this.pendingResponse = true;
     }
 
     const len = data.length + 1;
     const rawPayload = new Uint8Array([len, opcode, ...data]);
     const crc = calculateCrc8(rawPayload);
-
-    // [STX, LEN, OPCODE, DATA..., CRC, ETX]
     const packet = new Uint8Array([0x02, ...rawPayload, crc, 0x03]);
 
     try {
       await this.txChar.writeValue(packet);
       return true;
     } catch (e) {
-      if (!silent) console.error("BLE TX Error:", e);
+      if (!silent) {
+          console.error("BLE TX Error:", e);
+          this.pendingResponse = false;
+      }
       return false;
     }
   }
 
-  // Espera a que llegue un paquete completo vía Notificaciones
   private async waitForPacket(timeoutMs: number): Promise<Uint8Array | null> {
     const start = Date.now();
     while ((Date.now() - start) < timeoutMs) {
       if (this.lastPacket) {
         const pkt = this.lastPacket;
-        this.lastPacket = null; // Consumir
+        this.lastPacket = null;
+        this.pendingResponse = false;
         return pkt;
       }
-      await this.sleep(10);
+      await this.sleep(20);
     }
+    this.pendingResponse = false;
     return null;
   }
 
   async getTemperature(): Promise<number | null> {
-    // Reintentos automáticos
-    for (let attempt = 0; attempt < 3; attempt++) {
+    // Intentos
+    for (let i = 0; i < 3; i++) {
         if (!await this.send(CMD.GET_TEMP)) {
-            await this.sleep(200);
+            await this.sleep(100);
             continue;
         }
         
         const resp = await this.waitForPacket(2500);
-        
         if (resp && resp.length >= 5) {
-          // Buscar Opcode 0x06
-          for(let i=0; i<resp.length-2; i++) {
-            if (resp[i] === 0x06) {
-              const view = new DataView(resp.buffer);
-              if (i + 2 < resp.length) {
-                const rawTemp = view.getUint16(i+1, false); // Big Endian
-                const t = rawTemp / 1000.0;
-                // Filtrar lecturas basura (ej. 0 o >100 son improbables en ambiente normal)
-                if (t > 0 && t < 100) return t;
-              }
+            // Validar opcode 0x06 dentro del paquete
+            // [02, LEN, 06, MSB, LSB, CRC, 03]
+            if (resp[2] === 0x06) { 
+                const view = new DataView(resp.buffer);
+                const val = view.getUint16(3, false); // Big Endian
+                return val / 1000.0;
             }
-          }
+            // A veces el offset cambia si LEN > 255 (formato largo), pero para TEMP es corto
         }
-        await this.sleep(300);
+        await this.sleep(200);
     }
     return null;
   }
@@ -329,49 +336,31 @@ export class MicroNIRBLEDriver {
   }
 
   async scan(): Promise<Uint16Array | null> {
-    // Detener KeepAlive momentáneamente para no ensuciar el buffer durante el scan
-    if (this.keepAliveInterval) clearInterval(this.keepAliveInterval);
+    if (!await this.send(CMD.SCAN)) return null;
 
-    if (!await this.send(CMD.SCAN)) {
-        this.startKeepAlive();
-        return null;
-    }
-
-    // Esperar a que lleguen todos los chunks BLE (Scan es grande, ~288 bytes)
-    const raw = await this.waitForPacket(6000); 
-    
-    // Reiniciar KeepAlive
-    this.startKeepAlive();
-
+    // Scan tarda más, damos 6 segundos
+    const raw = await this.waitForPacket(6000);
     if (!raw) return null;
 
+    // Parseo
     let spectrum: Uint16Array | null = null;
 
-    // Lógica de parseo robusta (Short vs Long format)
-    for(let i=0; i < raw.length - 10; i++) {
-      if (raw[i] === 0x02) { 
-        if (raw[i+2] === 0x05) { // Short format
-          const len = raw[i+1] - 1;
-          const dataStart = i + 3;
-          if (dataStart + len <= raw.length) {
-             spectrum = this.parseSpectrum(raw, dataStart, len/2);
-             break;
-          }
-        }
-        else if (raw[i+3] === 0x05) { // Long format
-          const len = (raw[i+1] << 8 | raw[i+2]) - 1;
-          const dataStart = i + 4;
-          if (dataStart + len <= raw.length) {
-             spectrum = this.parseSpectrum(raw, dataStart, len/2);
-             break;
-          }
-        }
-      }
+    // Buscar encabezado 0x05 dentro del raw
+    // Formato corto: [02, LEN, 05, ...]
+    if (raw.length > 3 && raw[2] === 0x05) {
+        const len = raw[1] - 1;
+        spectrum = this.parseSpectrum(raw, 3, len/2);
     }
-
-    // Fallback paquete raw si el header se corrompió pero la longitud cuadra
-    if (!spectrum && raw.length >= 256) {
-       spectrum = this.parseSpectrum(raw, 0, 128);
+    // Formato largo: [02, HI, LO, 05, ...]
+    else if (raw.length > 4 && raw[3] === 0x05) {
+        const len = (raw[1] << 8 | raw[2]) - 1;
+        spectrum = this.parseSpectrum(raw, 4, len/2);
+    }
+    // Fallback: Si el paquete es ~256 bytes de payload directo
+    else if (raw.length >= 256) {
+        // Intentar encontrar el inicio de los datos
+        // Si hay header 02..05, saltarlo. Si no, desde 0.
+        spectrum = this.parseSpectrum(raw, 0, 128);
     }
 
     return spectrum;
