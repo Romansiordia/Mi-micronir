@@ -111,22 +111,19 @@ export class MicroNIRDriver {
       await this.sleep(200);
       await this.flushRx();
       
-      // --- WAKE UP SENSOR (Little Endian Strategy) ---
-      // Sending Full Structure (9 Bytes): Scans (4) + Time (4) + Gain (1)
+      // --- WAKE UP SENSOR (Little Endian Strategy 8 Bytes) ---
+      // Sending 8 Bytes: Scans (4) + Time (4)
       const scanCount = 50;
       const integrationTime = 6800;
-      const gain = 0;
 
       const payload = [
           // Scans Count (Little Endian)
           scanCount & 0xFF, (scanCount >> 8) & 0xFF, (scanCount >> 16) & 0xFF, (scanCount >> 24) & 0xFF,
           // Integration Time (Little Endian)
-          integrationTime & 0xFF, (integrationTime >> 8) & 0xFF, (integrationTime >> 16) & 0xFF, (integrationTime >> 24) & 0xFF,
-          // Gain
-          gain & 0xFF
+          integrationTime & 0xFF, (integrationTime >> 8) & 0xFF, (integrationTime >> 16) & 0xFF, (integrationTime >> 24) & 0xFF
       ];
       
-      this.log(`Enviando Init Full V7 (LE): [${payload.join(',')}]`);
+      this.log(`Enviando Init V8 (LE 8 Bytes): [${payload.join(',')}]`);
       await this.send(CMD.SET_INTEGRATION, payload);
       
       return "OK";
