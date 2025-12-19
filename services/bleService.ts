@@ -165,13 +165,11 @@ export class MicroNIRBLEDriver {
       this.isConnected = true;
       this.rxBuffer = new Uint8Array(0);
 
-      // --- ESTRATEGIA DE CONEXIÓN V5 (Fix NAK: Big Endian & Correct Order) ---
+      // --- ESTRATEGIA DE CONEXIÓN V6 (Paridad con USB) ---
       
-      // Nota: Se eliminó el RESET (0x0F) ya que provocaba NAK.
-
-      // 1. Inicialización: Configurar Scans + Integración + Gain
-      // Usando orden definido en XML: ConfigureScan(int scans, int integrationTime, GainValue gain)
-      console.log("Inicializando Sensor (Config Completa)...");
+      // 1. Inicialización: Solo Configurar Integración (4 Bytes)
+      // Esto desbloquea la máquina de estados igual que en USB
+      console.log("Inicializando Sensor (Set Integration)...");
       await this.initializeSensor();
       
       // 2. Handshake Final
@@ -191,20 +189,11 @@ export class MicroNIRBLEDriver {
   }
 
   private async initializeSensor() {
-    // Comando 0x02: ConfigureScan
-    // CORRECCIÓN V5:
-    // 1. Endianness: El dispositivo usa Big Endian (Network Order).
-    // 2. Orden de Parámetros: Scans (4B) -> Integration (4B) -> Gain (1B).
+    // Comando 0x02: Set Integration Time
+    // CORRECCIÓN V6: Enviar exactamente lo mismo que el driver USB.
+    // Solo 4 bytes (Big Endian) para el tiempo de integración.
     
-    const scanCount = 50;         // 50 promedios
     const integrationTime = 6800; // 6800us
-    const gain = 0x00;            // Low Gain
-
-    // SCANS (Big Endian)
-    const c0 = (scanCount >> 24) & 0xFF;
-    const c1 = (scanCount >> 16) & 0xFF;
-    const c2 = (scanCount >> 8) & 0xFF;
-    const c3 = (scanCount) & 0xFF;
 
     // TIME (Big Endian)
     const t0 = (integrationTime >> 24) & 0xFF;
@@ -212,10 +201,10 @@ export class MicroNIRBLEDriver {
     const t2 = (integrationTime >> 8) & 0xFF;
     const t3 = (integrationTime) & 0xFF;
 
-    // Payload de 9 bytes: [SCANS] + [TIME] + [GAIN]
-    const payload = [c0, c1, c2, c3, t0, t1, t2, t3, gain];
+    // Payload de 4 bytes
+    const payload = [t0, t1, t2, t3];
 
-    console.log(`Enviando Config BE [${payload.join(', ')}]`);
+    console.log(`Enviando Config USB-Style [${payload.join(', ')}]`);
     await this.send(CMD.SET_CONFIG, payload, true); 
     await this.sleep(500); 
   }
