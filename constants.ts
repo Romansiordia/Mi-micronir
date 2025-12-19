@@ -26,14 +26,14 @@ export const USB_CONFIG = {
   firmwareVersion: "2.5.1-stable"
 };
 
-// Configuración BLE basada en estándares JDSU/Viavi
-// Si el dispositivo usa un servicio UART Nórdico estándar (común en estos equipos):
+// Configuración BLE basada en los UUIDs propietarios de VIAVI Solutions extraídos del firmware
 export const BLE_CONFIG = {
   // Filtro de nombre para encontrar el dispositivo
   namePrefix: "MicroNIR",
-  // UUIDs comunes para Serial Port Profile sobre BLE (Nordic UART Service)
-  // Se usan como fallback si no se detectan automáticamente
-  serviceUUID: "6e400001-b5a3-f393-e0a9-e50e24dcca9e",
-  rxCharUUID: "6e400003-b5a3-f393-e0a9-e50e24dcca9e", // Notify
-  txCharUUID: "6e400002-b5a3-f393-e0a9-e50e24dcca9e"  // Write
+  // UUIDs específicos del servicio propietario de MicroNIR
+  serviceUUID: "0f45c9b0-5508-11e6-bdf4-0800200c9a66",
+  // Característica para enviar comandos (Write) - Identificada como ...C9B1
+  txCharUUID: "0f45c9b1-5508-11e6-bdf4-0800200c9a66",
+  // Característica para recibir datos/notificaciones (Notify) - Identificada como ...C9B2
+  rxCharUUID: "0f45c9b2-5508-11e6-bdf4-0800200c9a66"
 };
