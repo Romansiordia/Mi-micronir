@@ -1,320 +1,259 @@
 
-import React, { useState, useCallback } from 'react';
+import React, { useState, useEffect } from 'react';
 import { 
-  Usb, Activity, CheckCircle2, 
-  Play, RefreshCw, Cpu, Terminal, BrainCircuit,
-  Moon, Sun, FlaskConical, Thermometer, ShieldCheck, Zap
+  Usb, Activity, RefreshCw, Zap, AlertCircle, CheckCircle2, 
+  BarChart3, Settings2, ShieldCheck, Thermometer
 } from 'lucide-react';
 import { 
   AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer
 } from 'recharts';
-import { WavelengthPoint, LampStatus, LogEntry, CalibrationData, DeviceInfo } from './types';
+import { device } from './services/usbService';
 import { CDM_MODEL } from './constants';
 import { getAIInterpretation } from './services/geminiService';
-import { microNir } from './services/usbService';
+import { WavelengthPoint } from './types';
 
-const App: React.FC = () => {
-  const [isConnected, setIsConnected] = useState(false);
-  const [lampStatus, setLampStatus] = useState<LampStatus>('off');
-  const [isMeasuring, setIsMeasuring] = useState(false);
-  const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [calib, setCalib] = useState<CalibrationData>({ dark: null, reference: null, step: 'none' });
-  const [spectralData, setSpectralData] = useState<WavelengthPoint[]>([]);
-  const [prediction, setPrediction] = useState<string | null>(null);
-  const [aiInsight, setAiInsight] = useState<string | null>(null);
-  const [deviceInfo, setDeviceInfo] = useState<DeviceInfo | null>(null);
+export default function App() {
+  const [status, setStatus] = useState<'disconnected' | 'connecting' | 'ready' | 'error'>('disconnected');
+  const [statusMsg, setStatusMsg] = useState("Esperando dispositivo USB...");
+  const [temp, setTemp] = useState<number | null>(null);
+  const [lamp, setLamp] = useState(false);
+  
+  // Datos Espectrales
+  const [darkRef, setDarkRef] = useState<Uint16Array | null>(null);
+  const [whiteRef, setWhiteRef] = useState<Uint16Array | null>(null);
+  const [spectrum, setSpectrum] = useState<WavelengthPoint[]>([]);
+  const [prediction, setPrediction] = useState<string>("--");
+  const [aiAnalysis, setAiAnalysis] = useState<string>("");
 
-  const addLog = useCallback((message: string, type: LogEntry['type']) => {
-    setLogs(prev => [{ timestamp: new Date().toLocaleTimeString(), message, type }, ...prev].slice(0, 30));
-  }, []);
+  const log = (msg: string) => setStatusMsg(msg);
 
-  const handleConnect = async () => {
-    addLog("Inicializando puerto USB (FTDI)...", "info");
-    try {
-      const success = await microNir.connect();
-      if (success) {
-        setIsConnected(true);
-        // Reseteamos estado visual de lámpara porque al conectar no sabemos como está
-        setLampStatus('off'); 
-        addLog("Conexión establecida. Parámetros FTDI configurados.", "success");
-        
-        // Esperar un momento antes de pedir temperatura para no saturar el bus durante el inicio
-        setTimeout(() => updateHardwareStatus(), 500);
+  const connect = async () => {
+    setStatus('connecting');
+    log("Solicitando permiso USB...");
+    
+    const res = await device.connect();
+    if (res === "OK") {
+      log("Puerto abierto. Verificando sensor...");
+      // Verificar vida del sensor leyendo temperatura
+      const t = await device.getTemperature();
+      if (t !== null) {
+        setTemp(t);
+        setStatus('ready');
+        log(`Conectado. Temp: ${t.toFixed(1)}°C`);
       } else {
-        addLog("No se pudo conectar. Verifique que el dispositivo no esté en uso.", "error");
+        setStatus('error');
+        log("Error: Sensor no responde (Revise DTR/Power)");
       }
-    } catch (e) {
-      addLog("Error crítico al conectar.", "error");
-    }
-  };
-
-  const updateHardwareStatus = async () => {
-    const temp = await microNir.getTemperature();
-    if (temp !== null) {
-      setDeviceInfo({
-        serialNumber: "SN-9102-OSW",
-        model: "On-Site-W",
-        temperature: temp,
-        firmware: "v2.5.1",
-        pixelCount: 128
-      });
-      addLog(`Hardware Sincronizado. Temp: ${temp.toFixed(1)}°C`, "info");
     } else {
-      addLog("Advertencia: No se pudo leer temperatura.", "warning");
+      setStatus('error');
+      log(`Fallo conexión: ${res}`);
     }
   };
 
-  const turnOnLamp = async () => {
-    addLog("Enviando comando SET_LAMP (ON)...", "info");
-    setIsMeasuring(true);
-    try {
-      const ok = await microNir.setLamp(true);
-      if (ok) {
-        setLampStatus('ok');
-        addLog("Lámpara ENCENDIDA. Estabilizando...", "success");
-      } else {
-        addLog("Fallo crítico: El dispositivo rechazó el comando de lámpara.", "error");
-        // Si falla, intentamos leer status por si acaso
-        updateHardwareStatus();
-      }
-    } catch (e) {
-      addLog("Error de comunicación USB.", "error");
-    }
-    setIsMeasuring(false);
-  };
-
-  const turnOffLamp = async () => {
-    addLog("Enviando comando SET_LAMP (OFF)...", "info");
-    setIsMeasuring(true);
-    try {
-      const ok = await microNir.setLamp(false);
-      if (ok) {
-        setLampStatus('off');
-        addLog("Lámpara APAGADA.", "success");
-      } else {
-        addLog("Error al apagar lámpara.", "error");
-      }
-    } catch (e) {
-      addLog("Error de comunicación USB.", "error");
-    }
-    setIsMeasuring(false);
-  };
-
-  const runCalibration = async (type: 'dark' | 'reference') => {
-    setIsMeasuring(true);
-    addLog(`Capturando ${type.toUpperCase()} (Flush+Scan)...`, "info");
-    try {
-      const raw = await microNir.readSpectrum();
-      if (raw && raw.length > 20) {
-        setCalib(prev => ({
-          ...prev,
-          [type]: Array.from(raw),
-          step: (type === 'dark' && !!prev.reference) || (type === 'reference' && !!prev.dark) ? 'ready' : type
-        }));
-        addLog(`Calibración ${type} exitosa.`, "success");
-      } else {
-        addLog("Lectura vacía o corrupta. Reintente.", "error");
-      }
-    } finally {
-      setIsMeasuring(false);
+  const toggleLamp = async () => {
+    if (status !== 'ready') return;
+    const newState = !lamp;
+    log(newState ? "Encendiendo Lámpara..." : "Apagando...");
+    
+    const ok = await device.setLamp(newState);
+    if (ok) {
+      setLamp(newState);
+      log(newState ? "Lámpara ON (Estable)" : "Lámpara OFF");
+    } else {
+      log("Error enviando comando Lámpara");
     }
   };
 
-  const runScan = async () => {
-    setIsMeasuring(true);
-    addLog("Iniciando secuencia de escaneo...", "info");
-    try {
-      const raw = await microNir.readSpectrum();
-      if (raw && raw.length > 20) {
-        const sample = Array.from(raw);
-        const absData = sample.map((s, i) => {
-          const d = calib.dark?.[i] || 0;
-          const r = calib.reference?.[i] || 65535;
-          // Evitar división por cero y log de negativos
-          const denominator = Math.max(r - d, 1);
-          const numerator = s - d;
-          const refl = Math.min(Math.max(numerator / denominator, 0.0001), 1.0);
-          return -Math.log10(refl);
-        });
+  const calibrate = async (type: 'dark' | 'white') => {
+    log(`Adquiriendo referencia ${type.toUpperCase()}...`);
+    const data = await device.scan();
+    if (data) {
+      if (type === 'dark') setDarkRef(data);
+      else setWhiteRef(data);
+      log(`Referencia ${type} guardada (${data.length} px)`);
+    } else {
+      log("Error de lectura: Paquete vacío");
+    }
+  };
 
-        let sum = CDM_MODEL.bias;
-        absData.forEach((val, i) => {
-          if (CDM_MODEL.betaCoefficients[i]) sum += val * CDM_MODEL.betaCoefficients[i];
-        });
+  const measure = async () => {
+    if (!darkRef || !whiteRef) {
+      log("Error: Se requieren referencias Dark/White");
+      return;
+    }
+    
+    log("Escaneando muestra...");
+    const raw = await device.scan();
+    
+    if (raw) {
+      // Procesamiento Chemométrico: Absorbancia = -log10((Sample - Dark) / (White - Dark))
+      const plotData: WavelengthPoint[] = [];
+      const absData: number[] = [];
+      
+      for(let i=0; i<raw.length; i++) {
+        // Evitar división por cero
+        const denominator = Math.max((whiteRef[i] - darkRef[i]), 1);
+        const numerator = (raw[i] - darkRef[i]);
+        let r = numerator / denominator;
+        
+        // Limites físicos de reflectancia
+        if (r <= 0) r = 0.0001;
+        if (r > 1.2) r = 1.2;
 
-        const val = parseFloat(sum.toFixed(2));
-        setPrediction(val.toString());
-        const currentData = CDM_MODEL.wavelengths.map((nm, i) => ({ nm, absorbance: absData[i] }));
-        setSpectralData(currentData);
-        addLog(`Análisis completado: ${val}%`, "success");
-        getAIInterpretation(currentData, val.toString(), lampStatus).then(setAiInsight);
-      } else {
-        addLog("Error: Paquete de datos incompleto o vacío.", "error");
+        const abs = -Math.log10(r);
+        absData.push(abs);
+        
+        // Mapear a longitudes de onda (Aprox 908nm inicio + 6.2nm/pixel)
+        const wl = 908 + (i * 6.25);
+        plotData.push({ nm: Math.round(wl), absorbance: abs });
       }
-    } finally {
-      setIsMeasuring(false);
+
+      setSpectrum(plotData);
+
+      // Calculo PLS Simple (Producto Punto con coeficientes Beta)
+      let score = CDM_MODEL.bias;
+      // Usamos los primeros N coeficientes disponibles
+      const limit = Math.min(absData.length, CDM_MODEL.betaCoefficients.length);
+      for(let i=0; i<limit; i++) {
+        score += absData[i] * CDM_MODEL.betaCoefficients[i];
+      }
+      
+      const result = score.toFixed(2);
+      setPrediction(result);
+      log(`Medición Exitosa. Proteína: ${result}%`);
+
+      // Consulta AI
+      getAIInterpretation(plotData, result, lamp ? 'ok' : 'off').then(setAiAnalysis);
+    } else {
+      log("Error crítico: Lectura fallida");
     }
   };
 
   return (
-    <div className="min-h-screen bg-[#020617] text-slate-200 p-4 lg:p-10">
-      <nav className="glass-panel p-6 rounded-3xl mb-8 flex justify-between items-center border border-white/5 shadow-xl">
-        <div className="flex items-center gap-4">
-          <div className={`p-3 rounded-xl ${isConnected ? 'bg-blue-500/20 text-blue-400' : 'bg-slate-800 text-slate-500'}`}>
-            <Cpu size={24} className={isConnected ? 'animate-pulse' : ''} />
-          </div>
-          <div>
-            <h1 className="font-black text-xl tracking-tighter uppercase italic text-white flex items-center gap-2">
-              MicroNIR <span className="text-blue-500 px-2 py-0.5 bg-blue-500/10 rounded text-sm not-italic tracking-normal">QUANTUM</span>
-            </h1>
-            <p className="text-[10px] text-slate-500 font-bold uppercase tracking-widest">Protocolo OnSiteW v2.1 (FTDI)</p>
-          </div>
+    <div className="min-h-screen bg-slate-950 text-slate-200 p-6 font-sans">
+      {/* Header */}
+      <header className="flex justify-between items-center mb-8 bg-slate-900/50 p-6 rounded-2xl border border-white/5">
+        <div>
+          <h1 className="text-2xl font-black text-white tracking-tight flex items-center gap-3">
+            MicroNIR <span className="text-blue-500 bg-blue-500/10 px-2 rounded text-lg">PRO LINK</span>
+          </h1>
+          <p className="text-xs text-slate-500 font-mono mt-1 uppercase">Driver v3.0 (Strict Hardware)</p>
         </div>
-        <div className="flex gap-4">
-          {!isConnected ? (
-            <button onClick={handleConnect} className="bg-blue-600 px-6 py-2.5 rounded-full font-bold text-sm flex items-center gap-2 hover:bg-blue-500 transition-all shadow-lg shadow-blue-600/20">
-              <Usb size={18} /> VINCULAR SENSOR
+        <div className="flex gap-4 items-center">
+          <div className="text-right">
+            <p className="text-xs font-bold text-slate-400 uppercase">Estado</p>
+            <p className={`text-sm font-bold ${status==='ready' ? 'text-emerald-400' : 'text-amber-400'}`}>
+              {statusMsg}
+            </p>
+          </div>
+          {status === 'disconnected' || status === 'error' ? (
+            <button onClick={connect} className="bg-blue-600 hover:bg-blue-500 text-white px-6 py-3 rounded-xl font-bold flex items-center gap-2 transition-all">
+              <Usb size={20} /> Conectar USB
             </button>
           ) : (
-            <div className="flex items-center gap-2">
-               {lampStatus === 'off' ? (
-                 <button 
-                  disabled={isMeasuring}
-                  onClick={turnOnLamp} 
-                  className={`px-6 py-2.5 rounded-full font-bold text-xs bg-orange-600 text-white hover:bg-orange-500 transition-all shadow-lg shadow-orange-600/20 ${isMeasuring ? 'opacity-50 cursor-wait' : ''}`}
-                 >
-                   TURN ON LAMP
-                 </button>
-               ) : (
-                 <button 
-                  disabled={isMeasuring}
-                  onClick={turnOffLamp} 
-                  className={`px-6 py-2.5 rounded-full font-bold text-xs bg-slate-800 text-slate-400 border border-white/10 hover:text-white transition-all ${isMeasuring ? 'opacity-50 cursor-wait' : ''}`}
-                 >
-                   TURN OFF LAMP
-                 </button>
-               )}
-              <button onClick={updateHardwareStatus} className="p-2.5 rounded-full bg-slate-800 text-slate-400 border border-white/5 hover:text-white transition-colors">
-                <RefreshCw size={18} />
+            <div className="flex gap-2">
+              <button onClick={toggleLamp} className={`px-4 py-2 rounded-lg font-bold border ${lamp ? 'bg-orange-500 text-white border-orange-500' : 'bg-slate-800 border-slate-700'}`}>
+                {lamp ? 'LÁMPARA ON' : 'LÁMPARA OFF'}
               </button>
+              <div className="bg-slate-800 px-4 py-2 rounded-lg flex items-center gap-2 border border-slate-700">
+                <Thermometer size={16} className="text-blue-400"/>
+                <span className="font-mono font-bold">{temp ? temp.toFixed(1) : '--'}°C</span>
+              </div>
             </div>
           )}
         </div>
-      </nav>
+      </header>
 
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
-        <aside className="lg:col-span-4 space-y-6">
-          <div className="glass-panel p-6 rounded-3xl border-white/5 shadow-lg">
-            <h3 className="text-[10px] font-black text-slate-500 uppercase mb-5 flex items-center gap-2 tracking-widest">
-              <ShieldCheck size={14} className="text-emerald-500" /> Diagnóstico
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        {/* Controles */}
+        <div className="space-y-4">
+          <div className="bg-slate-900/50 p-6 rounded-2xl border border-white/5">
+            <h3 className="text-xs font-black text-slate-500 uppercase tracking-widest mb-4 flex gap-2 items-center">
+              <Settings2 size={14} /> Calibración
             </h3>
-            {deviceInfo ? (
-              <div className="grid grid-cols-2 gap-4">
-                <div className="bg-slate-900/50 p-3 rounded-2xl border border-white/5">
-                  <span className="text-[9px] text-slate-500 block uppercase mb-1">Temperatura</span>
-                  <div className="flex items-center gap-2 text-emerald-400 font-bold">
-                    <Thermometer size={14} /> {deviceInfo.temperature.toFixed(1)}°C
-                  </div>
-                </div>
-                <div className="bg-slate-900/50 p-3 rounded-2xl border border-white/5">
-                  <span className="text-[9px] text-slate-500 block uppercase mb-1">Estado</span>
-                  <div className="flex items-center gap-2 text-blue-400 font-bold">
-                    <CheckCircle2 size={14} /> OK
-                  </div>
-                </div>
+            <div className="grid grid-cols-2 gap-3">
+              <button 
+                disabled={status !== 'ready' || !lamp}
+                onClick={() => calibrate('dark')}
+                className={`p-4 rounded-xl border flex flex-col items-center justify-center gap-2 transition-all ${darkRef ? 'bg-emerald-500/10 border-emerald-500/50 text-emerald-400' : 'bg-slate-800 border-white/5 hover:border-blue-500/50'}`}
+              >
+                <div className="w-8 h-8 rounded-full bg-black border border-slate-700 mb-1"></div>
+                <span className="text-xs font-bold uppercase">Ref. Oscura</span>
+              </button>
+              <button 
+                 disabled={status !== 'ready' || !lamp}
+                onClick={() => calibrate('white')}
+                className={`p-4 rounded-xl border flex flex-col items-center justify-center gap-2 transition-all ${whiteRef ? 'bg-emerald-500/10 border-emerald-500/50 text-emerald-400' : 'bg-slate-800 border-white/5 hover:border-blue-500/50'}`}
+              >
+                <div className="w-8 h-8 rounded-full bg-white mb-1"></div>
+                <span className="text-xs font-bold uppercase">Ref. Blanca</span>
+              </button>
+            </div>
+          </div>
+
+          <button 
+            disabled={!darkRef || !whiteRef || !lamp}
+            onClick={measure}
+            className={`w-full py-6 rounded-2xl font-black text-lg uppercase tracking-wide shadow-xl transition-all flex items-center justify-center gap-3
+              ${(darkRef && whiteRef && lamp) 
+                ? 'bg-blue-600 hover:bg-blue-500 text-white shadow-blue-900/20' 
+                : 'bg-slate-800 text-slate-600 cursor-not-allowed border border-white/5'}`}
+          >
+            <Activity size={24} /> ANALIZAR MUESTRA
+          </button>
+
+           {prediction !== "--" && (
+            <div className="bg-slate-900 p-6 rounded-2xl border border-white/10 text-center relative overflow-hidden">
+               <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-blue-500 to-emerald-500"></div>
+               <span className="text-xs text-slate-500 font-bold uppercase tracking-widest">Resultado (Proteína)</span>
+               <div className="text-6xl font-black text-white mt-2 tracking-tighter">
+                 {prediction}<span className="text-2xl text-slate-600 ml-1">%</span>
+               </div>
+            </div>
+           )}
+        </div>
+
+        {/* Gráfico */}
+        <div className="lg:col-span-2 bg-slate-900/50 p-6 rounded-2xl border border-white/5 flex flex-col">
+          <div className="flex justify-between items-center mb-6">
+            <h3 className="text-xs font-black text-slate-500 uppercase tracking-widest flex gap-2 items-center">
+              <BarChart3 size={14} /> Espectro NIR
+            </h3>
+            {aiAnalysis && (
+              <div className="bg-blue-500/10 px-3 py-1 rounded-full border border-blue-500/20 flex items-center gap-2">
+                 <Zap size={12} className="text-blue-400" />
+                 <span className="text-[10px] text-blue-300 font-medium italic truncate max-w-[300px]">{aiAnalysis}</span>
               </div>
-            ) : (
-              <div className="text-center py-4 text-xs text-slate-600 italic">Esperando conexión...</div>
             )}
           </div>
-
-          <div className="glass-panel p-6 rounded-3xl border-white/5 shadow-lg">
-            <h3 className="text-[10px] font-black text-slate-500 uppercase mb-6 flex items-center gap-2 tracking-widest">
-              <FlaskConical size={14} /> Calibración
-            </h3>
-            <div className="space-y-3">
-              <button disabled={!isConnected || isMeasuring} onClick={() => runCalibration('dark')} className={`w-full flex justify-between items-center p-4 rounded-2xl border transition-all ${calib.dark ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-400' : 'bg-slate-900 border-white/5 hover:border-blue-500/50'}`}>
-                <div className="flex items-center gap-3 font-bold uppercase text-[11px]"><Moon size={18} />Referencia Oscura</div>
-                {calib.dark && <CheckCircle2 size={16} />}
-              </button>
-              <button disabled={!isConnected || isMeasuring} onClick={() => runCalibration('reference')} className={`w-full flex justify-between items-center p-4 rounded-2xl border transition-all ${calib.reference ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-400' : 'bg-slate-900 border-white/5 hover:border-blue-500/50'}`}>
-                <div className="flex items-center gap-3 font-bold uppercase text-[11px]"><Sun size={18} />Referencia Blanca</div>
-                {calib.reference && <CheckCircle2 size={16} />}
-              </button>
-            </div>
-          </div>
-
-          <div className="glass-panel p-6 rounded-3xl border-white/5 overflow-hidden">
-            <h3 className="text-[10px] font-black text-slate-500 uppercase mb-4 flex items-center gap-2 tracking-widest">
-              <Terminal size={14} /> Logs
-            </h3>
-            <div className="h-48 overflow-y-auto space-y-2 pr-2 custom-scrollbar font-mono text-[9px]">
-              {logs.map((l, i) => (
-                <div key={i} className={`p-2 rounded-lg border leading-tight ${l.type === 'error' ? 'bg-red-500/10 border-red-500/20 text-red-400' : 'bg-slate-900/50 border-white/5 text-slate-400'}`}>
-                  <span className="opacity-30 mr-2">{l.timestamp}</span>{l.message}
-                </div>
-              ))}
-            </div>
-          </div>
-        </aside>
-
-        <main className="lg:col-span-8 space-y-6">
-          <div className="glass-panel p-8 rounded-[2.5rem] border-white/5 relative shadow-2xl">
-            <div className="flex justify-between items-start mb-10">
-              <div>
-                <h2 className="text-2xl font-black italic text-white flex items-center gap-3 mb-1">
-                  <Activity className="text-blue-500" /> Espectro de Absorbancia
-                </h2>
-                <p className="text-xs text-slate-500 uppercase font-bold tracking-widest">Modelo: {CDM_MODEL.name}</p>
-              </div>
-              <div className="bg-slate-950 p-5 rounded-3xl border border-white/5 text-center min-w-[180px] shadow-inner">
-                <span className="text-[10px] font-black text-blue-500 block mb-1 tracking-tighter uppercase">Proteína Estimada</span>
-                <span className="text-5xl font-black text-white">{prediction || '--.--'}<small className="text-sm ml-1 opacity-40">%</small></span>
-              </div>
-            </div>
-
-            <div className="h-[380px] w-full mb-10">
-              <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={spectralData}>
+          
+          <div className="flex-1 min-h-[300px] w-full bg-slate-950/50 rounded-xl border border-white/5 p-2">
+             <ResponsiveContainer width="100%" height="100%">
+                <AreaChart data={spectrum}>
                   <defs>
                     <linearGradient id="colorAbs" x1="0" y1="0" x2="0" y2="1">
                       <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.3}/>
                       <stop offset="95%" stopColor="#3b82f6" stopOpacity={0}/>
                     </linearGradient>
                   </defs>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.1} />
+                  <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} />
                   <XAxis dataKey="nm" stroke="#475569" fontSize={10} tickFormatter={v => `${v}nm`} />
-                  <YAxis stroke="#475569" fontSize={10} />
+                  <YAxis stroke="#475569" fontSize={10} domain={[0, 'auto']} />
                   <Tooltip 
-                    contentStyle={{ background: '#0f172a', border: '1px solid rgba(255,255,255,0.05)', borderRadius: '16px' }}
+                    contentStyle={{ background: '#0f172a', border: '1px solid #1e293b', borderRadius: '8px' }}
+                    itemStyle={{ color: '#3b82f6' }}
                   />
-                  <Area type="monotone" dataKey="absorbance" stroke="#3b82f6" fillOpacity={1} fill="url(#colorAbs)" strokeWidth={4} animationDuration={1000} />
+                  <Area type="monotone" dataKey="absorbance" stroke="#3b82f6" fill="url(#colorAbs)" strokeWidth={2} />
                 </AreaChart>
               </ResponsiveContainer>
-            </div>
-
-            {aiInsight && (
-              <div className="mb-8 p-6 bg-blue-500/5 border border-blue-500/10 rounded-3xl flex gap-5 items-center">
-                <div className="p-3 bg-blue-500/20 rounded-2xl text-blue-400 shrink-0">
-                  <BrainCircuit size={24} />
+              {spectrum.length === 0 && (
+                <div className="h-full flex items-center justify-center text-slate-700 text-sm font-medium italic">
+                  No hay datos espectrales. Realice una medición.
                 </div>
-                <p className="text-xs text-slate-400 leading-relaxed italic font-medium">"{aiInsight}"</p>
-              </div>
-            )}
-
-            <button 
-              disabled={!isConnected || isMeasuring || calib.step !== 'ready'} 
-              onClick={runScan}
-              className={`w-full py-7 rounded-3xl font-black text-xl uppercase transition-all flex items-center justify-center gap-4 shadow-xl ${isConnected && calib.step === 'ready' ? 'bg-white text-black hover:bg-blue-500 hover:text-white' : 'bg-slate-900 text-slate-700 cursor-not-allowed border border-white/5'}`}
-            >
-              {isMeasuring ? <RefreshCw className="animate-spin" /> : <Play fill="currentColor" />}
-              {isMeasuring ? 'Capturando datos...' : 'Ejecutar Análisis PLS'}
-            </button>
+              )}
           </div>
-        </main>
+        </div>
       </div>
     </div>
   );
-};
-
-export default App;
+}
