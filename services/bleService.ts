@@ -115,7 +115,6 @@ export class MicroNIRBLEDriver {
 
       this.disconnectCleanly();
 
-      // 1. Buscar Dispositivo
       console.log("Buscando dispositivo MicroNIR BLE...");
       this.device = await navigator.bluetooth.requestDevice({
         filters: [{ namePrefix: BLE_CONFIG.namePrefix }],
@@ -124,15 +123,12 @@ export class MicroNIRBLEDriver {
 
       this.device.addEventListener('gattserverdisconnected', this.onDisconnected);
 
-      // 2. Conectar al Servidor GATT
       console.log("Conectando a servidor GATT...");
       this.server = await this.device.gatt!.connect();
 
-      // 3. Obtener Servicio
       console.log("Obteniendo servicio primario...");
       const service = await this.server.getPrimaryService(BLE_CONFIG.serviceUUID);
 
-      // 4. CONFIGURACIÓN DE CARACTERÍSTICAS
       const chars = await service.getCharacteristics();
       console.log(`Encontradas ${chars.length} características.`);
 
@@ -140,17 +136,15 @@ export class MicroNIRBLEDriver {
 
       for (const c of chars) {
         const props = c.properties;
-        const uuidShort = c.uuid.slice(4, 8);
-        console.log(`Char [${uuidShort}]: W=${props.write}, N=${props.notify}, I=${props.indicate}`);
-
-        // TX: Preferir Write
+        
+        // TX
         if ((props.write || props.writeWithoutResponse) && !foundTx) {
           this.txChar = c;
           foundTx = true;
           console.log(` -> ASIGNADO TX: ${c.uuid}`);
         }
 
-        // RX: Suscribirse a todo lo que hable
+        // RX
         if (props.notify || props.indicate) {
           try {
             await c.startNotifications();
@@ -158,18 +152,17 @@ export class MicroNIRBLEDriver {
             this.listeningChars.push(c);
             console.log(` -> SUSCRITO RX: ${c.uuid}`);
           } catch (e) {
-            console.warn(`Error suscribiendo a ${uuidShort}:`, e);
+            console.warn(`Error suscribiendo:`, e);
           }
         }
       }
 
-      if (!this.txChar) throw new Error("No se encontró canal de escritura (TX)");
-      if (this.listeningChars.length === 0) throw new Error("No se encontraron canales de lectura (RX)");
+      if (!this.txChar) throw new Error("No TX channel found");
+      if (this.listeningChars.length === 0) throw new Error("No RX channel found");
 
       this.isConnected = true;
-      this.rxBuffer = new Uint8Array(0); // Reset buffer
+      this.rxBuffer = new Uint8Array(0);
 
-      // Iniciar KeepAlive suave
       this.startKeepAlive();
       
       console.log("BLE Listo.");
@@ -182,10 +175,17 @@ export class MicroNIRBLEDriver {
     }
   }
 
+  async disconnect(): Promise<void> {
+    if (this.device && this.device.gatt && this.device.gatt.connected) {
+      this.device.gatt.disconnect();
+    } else {
+      this.disconnectCleanly();
+    }
+  }
+
   private startKeepAlive() {
     if (this.keepAliveInterval) clearInterval(this.keepAliveInterval);
     this.keepAliveInterval = setInterval(() => {
-      // Solo enviar KeepAlive si no estamos esperando una respuesta crítica
       if (this.isConnected && !this.pendingResponse) { 
          this.send(CMD.GET_TEMP, [], true).catch(() => {});
       }
@@ -206,7 +206,6 @@ export class MicroNIRBLEDriver {
     this.disconnectCleanly();
   };
 
-  // Manejo de buffer inteligente: Busca paquetes STX...ETX ignorando basura
   private handleNotifications = (event: Event) => {
     const value = (event.target as BluetoothRemoteGATTCharacteristic).value;
     if (!value) return;
@@ -214,7 +213,6 @@ export class MicroNIRBLEDriver {
     const chunk = new Uint8Array(value.buffer);
     console.log("RX Chunk:", chunk);
 
-    // Concatenar
     const newBuffer = new Uint8Array(this.rxBuffer.length + chunk.length);
     newBuffer.set(this.rxBuffer);
     newBuffer.set(chunk, this.rxBuffer.length);
@@ -224,65 +222,72 @@ export class MicroNIRBLEDriver {
   };
 
   private scanForPackets() {
+    if (this.rxBuffer.length === 0) return;
+
     // 1. Buscar STX (0x02)
     const stxIndex = this.rxBuffer.indexOf(0x02);
     if (stxIndex === -1) {
-       // Si el buffer crece demasiado sin STX, limpiar para evitar fugas de memoria
        if (this.rxBuffer.length > 2048) this.rxBuffer = new Uint8Array(0);
        return;
     }
 
-    // 2. Necesitamos al menos 2 bytes para leer la LONGITUD (STX + LEN)
-    if (stxIndex + 1 >= this.rxBuffer.length) {
-        return; // Esperar más datos
-    }
-
-    // 3. Leer Longitud del Payload (Byte 1)
-    const len = this.rxBuffer[stxIndex + 1];
+    // 2. Buscar ETX (0x03)
+    // En lugar de confiar ciegamente en el byte de longitud (que falla con paquetes NAK 0x15),
+    // buscamos una estructura [02 ... 03] que tenga sentido.
+    let packetFound = false;
     
-    // 4. Calcular tamaño total esperado del paquete
-    // Estructura: [STX(1), LEN(1), OPCODE(1), DATA(n), CRC(1), ETX(1)]
-    // Según protocolo MicroNIR: LEN = length(OPCODE + DATA).
-    // Total Bytes = 1(STX) + 1(LEN) + LEN + 1(CRC) + 1(ETX) = LEN + 4.
-    const totalPacketSize = len + 4;
+    // Buscamos ETX a partir de STX+1
+    for (let i = stxIndex + 1; i < this.rxBuffer.length; i++) {
+        if (this.rxBuffer[i] === 0x03) {
+            // Candidato a paquete: rxBuffer[stxIndex ... i]
+            const candidate = this.rxBuffer.slice(stxIndex, i + 1);
+            
+            // Validar
+            // Caso especial: NAK [02 15 ... 03]
+            // Si el byte de longitud es 0x15, es un NAK, no una longitud.
+            if (candidate.length > 1 && candidate[1] === 0x15) {
+                console.warn("Recibido NAK (0x15) del sensor. Comando fallido.");
+                // Extraemos el paquete pero NO lo guardamos como 'lastPacket' valido de datos,
+                // sino que limpiamos el flag de pendingResponse para desbloquear la app.
+                this.pendingResponse = false; 
+                this.rxBuffer = this.rxBuffer.slice(i + 1);
+                packetFound = true;
+                break; 
+            }
 
-    // 5. Verificar si tenemos todos los bytes en el buffer
-    if (this.rxBuffer.length < stxIndex + totalPacketSize) {
-        // console.log(`Esperando datos... Tenemos ${this.rxBuffer.length}, Necesitamos ${stxIndex + totalPacketSize}`);
-        return; // Esperar más fragmentos BLE
+            // Caso normal: Validar CRC
+            // Estructura: [STX, DATA...., CRC, ETX]
+            // Payload para CRC es todo excepto STX, CRC, ETX.
+            // Protocolo MicroNIR: CRC se calcula sobre [LEN, OPCODE, DATA...]
+            // Es decir, packet[1 ... end-2]
+            if (candidate.length >= 4) {
+                // Verificamos si podemos confiar en el Byte de Longitud
+                // const statedLen = candidate[1];
+                // if (statedLen + 4 === candidate.length) { ... }
+                
+                // O confiamos en el CRC
+                // El CRC es el penúltimo byte (i-1)
+                // El CRC se calcula sobre los bytes [1 ... i-2]
+                const payloadForCrc = candidate.slice(1, candidate.length - 2);
+                const packetCrc = candidate[candidate.length - 2];
+                const calcCrc = calculateCrc8(payloadForCrc);
+
+                if (calcCrc === packetCrc) {
+                    console.log("Paquete CRC OK:", candidate);
+                    this.lastPacket = candidate;
+                    this.pendingResponse = false;
+                    this.rxBuffer = this.rxBuffer.slice(i + 1);
+                    packetFound = true;
+                    break;
+                }
+            }
+        }
     }
 
-    // 6. Verificar ETX (0x03) en la posición calculada
-    const etxIndex = stxIndex + totalPacketSize - 1;
-    if (this.rxBuffer[etxIndex] !== 0x03) {
-        console.warn("Error de Trama: ETX no encontrado donde debería. Saltando STX.");
-        // El STX encontrado era falso (basura), avanzamos el buffer y reintentamos
-        this.rxBuffer = this.rxBuffer.slice(stxIndex + 1);
+    // Si encontramos un paquete y queda buffer, buscar recursivamente
+    if (packetFound && this.rxBuffer.length > 0) {
         this.scanForPackets();
-        return;
     }
-
-    // 7. ¡Paquete Validado! Extraerlo.
-    const packet = this.rxBuffer.slice(stxIndex, etxIndex + 1);
-    this.rxBuffer = this.rxBuffer.slice(etxIndex + 1); // Remover del buffer
-    
-    console.log("Paquete Reensamblado OK:", packet);
-    this.lastPacket = packet;
-
-    // 8. Buscar si hay más paquetes en el buffer restante
-    if (this.rxBuffer.length > 0) {
-        this.scanForPackets();
-    }
-  }
-
-  async disconnect() {
-    if (this.device && this.device.gatt?.connected) {
-      try {
-        for(const c of this.listeningChars) await c.stopNotifications();
-      } catch(e) {}
-      this.device.gatt.disconnect();
-    }
-    this.disconnectCleanly();
   }
 
   async send(opcode: number, data: number[] = [], silent = false): Promise<boolean> {
@@ -290,7 +295,7 @@ export class MicroNIRBLEDriver {
 
     if (!silent) {
         this.lastPacket = null;
-        this.rxBuffer = new Uint8Array(0); // Limpiar buffer antiguo
+        this.rxBuffer = new Uint8Array(0);
         this.pendingResponse = true;
     }
 
@@ -303,10 +308,7 @@ export class MicroNIRBLEDriver {
       await this.txChar.writeValue(packet);
       return true;
     } catch (e) {
-      if (!silent) {
-          console.error("BLE TX Error:", e);
-          this.pendingResponse = false;
-      }
+      if (!silent) this.pendingResponse = false;
       return false;
     }
   }
@@ -314,11 +316,14 @@ export class MicroNIRBLEDriver {
   private async waitForPacket(timeoutMs: number): Promise<Uint8Array | null> {
     const start = Date.now();
     while ((Date.now() - start) < timeoutMs) {
-      if (this.lastPacket) {
+      if (!this.pendingResponse && this.lastPacket) {
         const pkt = this.lastPacket;
         this.lastPacket = null;
-        this.pendingResponse = false;
         return pkt;
+      }
+      // Si pendingResponse se puso en false (por NAK) pero lastPacket es null
+      if (!this.pendingResponse && !this.lastPacket) {
+          return null; // Error explícito (NAK)
       }
       await this.sleep(20);
     }
@@ -327,7 +332,6 @@ export class MicroNIRBLEDriver {
   }
 
   async getTemperature(): Promise<number | null> {
-    // Intentos
     for (let i = 0; i < 3; i++) {
         if (!await this.send(CMD.GET_TEMP)) {
             await this.sleep(100);
@@ -336,15 +340,12 @@ export class MicroNIRBLEDriver {
         
         const resp = await this.waitForPacket(2500);
         if (resp && resp.length >= 5) {
-            // Validar opcode 0x06 (Temperatura)
-            // Estructura: [02, LEN, OPCODE, MSB, LSB, CRC, 03]
-            // Index Opcode = 2
+            // [02, LEN, 06, MSB, LSB, CRC, 03]
+            // Validar Opcode 0x06 (byte index 2)
             if (resp[2] === 0x06) { 
                 const view = new DataView(resp.buffer);
-                const val = view.getUint16(3, false); // Big Endian
+                const val = view.getUint16(3, false); 
                 return val / 1000.0;
-            } else {
-                console.warn(`Opcode inesperado en getTemperature: ${resp[2]} (dec: ${resp[2]})`);
             }
         }
         await this.sleep(200);
@@ -361,26 +362,28 @@ export class MicroNIRBLEDriver {
   async scan(): Promise<Uint16Array | null> {
     if (!await this.send(CMD.SCAN)) return null;
 
-    // Scan tarda más, damos 6 segundos
     const raw = await this.waitForPacket(6000);
     if (!raw) return null;
 
-    // Parseo
     let spectrum: Uint16Array | null = null;
 
-    // Buscar encabezado 0x05 dentro del raw
-    // Formato corto: [02, LEN, 05, ...]
+    // Short format: [02, LEN, 05, ...]
     if (raw.length > 3 && raw[2] === 0x05) {
         const len = raw[1] - 1;
         spectrum = this.parseSpectrum(raw, 3, len/2);
     }
-    // Formato largo: [02, HI, LO, 05, ...]
+    // Long format: [02, HI, LO, 05, ...]
     else if (raw.length > 4 && raw[3] === 0x05) {
         const len = (raw[1] << 8 | raw[2]) - 1;
         spectrum = this.parseSpectrum(raw, 4, len/2);
     }
-    // Fallback: Si el paquete es ~256 bytes de payload directo
-    else if (raw.length >= 256) {
+    // Fallback NAK check: si raw es muy pequeño, retornamos null
+    else if (raw.length < 100) {
+        console.warn("Scan packet too small, likely NAK or Error");
+        return null;
+    }
+    else {
+        // Fallback blind parse
         spectrum = this.parseSpectrum(raw, 0, 128);
     }
 
@@ -388,12 +391,12 @@ export class MicroNIRBLEDriver {
   }
 
   private parseSpectrum(buffer: Uint8Array, offset: number, pixels: number): Uint16Array {
-    const s = new Uint16Array(pixels);
+    // Protección contra buffer overflow
+    const safePixels = Math.min(pixels, Math.floor((buffer.length - offset) / 2));
+    const s = new Uint16Array(safePixels);
     const view = new DataView(buffer.buffer);
-    for(let j=0; j<pixels; j++) {
-      if (offset + (j*2) + 1 < buffer.length) {
-        s[j] = view.getUint16(offset + (j*2), false); 
-      }
+    for(let j=0; j<safePixels; j++) {
+       s[j] = view.getUint16(offset + (j*2), false); 
     }
     return s;
   }
