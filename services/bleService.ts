@@ -73,6 +73,11 @@ function calculateCrc8(data: Uint8Array): number {
   return crc;
 }
 
+function toHex(buffer: Uint8Array | number[]): string {
+  const arr = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+  return Array.from(arr).map(b => b.toString(16).padStart(2, '0').toUpperCase()).join(' ');
+}
+
 const CMD = {
   LAMP_CONTROL: 0x01,
   SET_CONFIG: 0x02, 
@@ -96,6 +101,16 @@ export class MicroNIRBLEDriver {
   
   private rxBuffer: Uint8Array = new Uint8Array(0);
   private lastPacket: Uint8Array | null = null;
+  
+  private logger: (msg: string) => void = () => {};
+
+  public setLogger(fn: (msg: string) => void) {
+    this.logger = fn;
+  }
+
+  private log(msg: string) {
+    this.logger(`[BLE] ${msg}`);
+  }
 
   private async sleep(ms: number) {
     return new Promise(r => setTimeout(r, ms));
@@ -117,7 +132,7 @@ export class MicroNIRBLEDriver {
 
       this.disconnectCleanly();
 
-      console.log("Buscando dispositivo MicroNIR BLE...");
+      this.log("Buscando dispositivo MicroNIR BLE...");
       this.device = await navigator.bluetooth.requestDevice({
         filters: [{ namePrefix: BLE_CONFIG.namePrefix }],
         optionalServices: [BLE_CONFIG.serviceUUID]
@@ -125,14 +140,14 @@ export class MicroNIRBLEDriver {
 
       this.device.addEventListener('gattserverdisconnected', this.onDisconnected);
 
-      console.log("Conectando a servidor GATT...");
+      this.log("Conectando a servidor GATT...");
       this.server = await this.device.gatt!.connect();
 
-      console.log("Obteniendo servicio primario...");
+      this.log("Obteniendo servicio primario...");
       const service = await this.server.getPrimaryService(BLE_CONFIG.serviceUUID);
 
       const chars = await service.getCharacteristics();
-      console.log(`Encontradas ${chars.length} características.`);
+      this.log(`Encontradas ${chars.length} características.`);
 
       let foundTx = false;
 
@@ -143,7 +158,7 @@ export class MicroNIRBLEDriver {
         if ((props.write || props.writeWithoutResponse) && !foundTx) {
           this.txChar = c;
           foundTx = true;
-          console.log(` -> ASIGNADO TX: ${c.uuid}`);
+          this.log(` -> ASIGNADO TX: ${c.uuid}`);
         }
 
         // RX
@@ -152,9 +167,10 @@ export class MicroNIRBLEDriver {
             await c.startNotifications();
             c.addEventListener('characteristicvaluechanged', this.handleNotifications);
             this.listeningChars.push(c);
-            console.log(` -> SUSCRITO RX: ${c.uuid}`);
+            this.log(` -> SUSCRITO RX: ${c.uuid}`);
           } catch (e) {
             console.warn(`Error suscribiendo:`, e);
+            this.log(`Error suscribiendo a ${c.uuid}: ${e}`);
           }
         }
       }
@@ -169,21 +185,22 @@ export class MicroNIRBLEDriver {
       
       // 1. Inicialización: Solo Configurar Integración (4 Bytes)
       // Esto desbloquea la máquina de estados igual que en USB
-      console.log("Inicializando Sensor (Set Integration)...");
+      this.log("Inicializando Sensor (Set Integration)...");
       await this.initializeSensor();
       
       // 2. Handshake Final
-      console.log("Verificando Estado (GET INFO)...");
+      this.log("Verificando Estado (GET INFO)...");
       await this.send(CMD.GET_INFO, [], true); 
 
       this.startKeepAlive();
       
-      console.log("BLE Listo.");
+      this.log("BLE Listo.");
       return "OK";
 
     } catch (error: any) {
       console.error("BLE Connect Error:", error);
       this.isConnected = false;
+      this.log(`Error Conexión: ${error.message}`);
       return error.message || "Error BLE Desconocido";
     }
   }
@@ -204,7 +221,7 @@ export class MicroNIRBLEDriver {
     // Payload de 4 bytes
     const payload = [t0, t1, t2, t3];
 
-    console.log(`Enviando Config USB-Style [${payload.join(', ')}]`);
+    this.log(`Enviando Config USB-Style [${payload.join(', ')}]`);
     await this.send(CMD.SET_CONFIG, payload, true); 
     await this.sleep(500); 
   }
@@ -215,6 +232,7 @@ export class MicroNIRBLEDriver {
     } else {
       this.disconnectCleanly();
     }
+    this.log("Desconectado.");
   }
 
   private startKeepAlive() {
@@ -236,7 +254,7 @@ export class MicroNIRBLEDriver {
   }
 
   private onDisconnected = () => {
-    console.log("Evento Desconectado recibido");
+    this.log("Evento Desconectado recibido");
     this.disconnectCleanly();
   };
 
@@ -245,7 +263,7 @@ export class MicroNIRBLEDriver {
     if (!value) return;
 
     const chunk = new Uint8Array(value.buffer);
-    // console.log("RX:", Array.from(chunk).map(b => b.toString(16).padStart(2, '0')).join(' '));
+    this.log(`RX Notify <<< ${toHex(chunk)}`);
 
     const newBuffer = new Uint8Array(this.rxBuffer.length + chunk.length);
     newBuffer.set(this.rxBuffer);
@@ -273,6 +291,7 @@ export class MicroNIRBLEDriver {
             // Validar NAK (0x15)
             if (candidate.length > 1 && candidate[1] === 0x15) {
                 console.warn("Sensor NAK (0x15) - Comando Rechazado");
+                this.log(`NAK Recibido (0x15) - Comando Rechazado`);
                 this.pendingResponse = false; 
                 this.rxBuffer = this.rxBuffer.slice(i + 1);
                 packetFound = true;
@@ -291,6 +310,8 @@ export class MicroNIRBLEDriver {
                     this.rxBuffer = this.rxBuffer.slice(i + 1);
                     packetFound = true;
                     break;
+                } else {
+                    this.log(`CRC Error en paquete: ${toHex(candidate)}`);
                 }
             }
         }
@@ -315,11 +336,14 @@ export class MicroNIRBLEDriver {
     const crc = calculateCrc8(rawPayload);
     const packet = new Uint8Array([0x02, ...rawPayload, crc, 0x03]);
 
+    this.log(`TX >>> ${toHex(packet)}`);
+
     try {
       await this.txChar.writeValue(packet);
       return true;
     } catch (e) {
       if (!silent) this.pendingResponse = false;
+      this.log(`Error TX: ${e}`);
       return false;
     }
   }
@@ -339,6 +363,7 @@ export class MicroNIRBLEDriver {
       await this.sleep(20);
     }
     this.pendingResponse = false;
+    this.log("Timeout esperando paquete");
     return null;
   }
 

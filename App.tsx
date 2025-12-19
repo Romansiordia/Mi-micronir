@@ -1,8 +1,8 @@
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { 
   Usb, Activity, RefreshCw, Zap, AlertCircle, CheckCircle2, 
-  BarChart3, Settings2, ShieldCheck, Thermometer, Power, Bluetooth, XCircle
+  BarChart3, Settings2, ShieldCheck, Thermometer, Power, Bluetooth, XCircle, Terminal, Trash2
 } from 'lucide-react';
 import { 
   AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer
@@ -20,6 +20,7 @@ interface IDeviceDriver {
   setLamp(on: boolean): Promise<boolean>;
   getTemperature(): Promise<number | null>;
   scan(): Promise<Uint16Array | null>;
+  setLogger(fn: (msg: string) => void): void;
   isConnected: boolean;
 }
 
@@ -37,10 +38,26 @@ export default function App() {
   const [prediction, setPrediction] = useState<string>("--");
   const [aiAnalysis, setAiAnalysis] = useState<string>("");
 
+  // Terminal de depuración
+  const [logs, setLogs] = useState<string[]>([]);
+  const [showLogs, setShowLogs] = useState(false);
+  const logsEndRef = useRef<HTMLDivElement>(null);
+
   // Selector del driver activo
   const activeDevice: IDeviceDriver = connectionType === 'usb' ? usbDevice : bleDevice;
 
   const log = (msg: string) => setStatusMsg(msg);
+  
+  const addLogEntry = (msg: string) => {
+    const time = new Date().toLocaleTimeString().split(' ')[0];
+    setLogs(prev => [`[${time}] ${msg}`, ...prev.slice(0, 199)]); // Max 200 logs
+  };
+
+  // Conectar el logger cuando cambia el dispositivo
+  useEffect(() => {
+    activeDevice.setLogger(addLogEntry);
+    addLogEntry(`Sistema listo. Modo seleccionado: ${connectionType.toUpperCase()}`);
+  }, [connectionType]);
 
   const connect = async () => {
     if (isBusy) return;
@@ -172,14 +189,14 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-200 p-4 md:p-8 font-sans">
+    <div className="min-h-screen bg-slate-950 text-slate-200 p-4 md:p-8 font-sans pb-32">
       <header className="flex flex-col md:flex-row justify-between items-center mb-8 bg-slate-900/80 backdrop-blur p-6 rounded-2xl border border-slate-800 shadow-xl">
         <div className="mb-4 md:mb-0">
           <h1 className="text-2xl font-black text-white tracking-tight flex items-center gap-3">
             <ShieldCheck className="text-blue-500" />
             MicroNIR <span className="text-blue-400 bg-blue-500/10 px-2 rounded text-lg border border-blue-500/20">QUANTUM</span>
           </h1>
-          <p className="text-xs text-slate-500 font-mono mt-1 uppercase ml-1">v4.2.0 • {connectionType === 'usb' ? 'FTDI Mode' : 'BLE Mode'}</p>
+          <p className="text-xs text-slate-500 font-mono mt-1 uppercase ml-1">v4.3.0 Debug • {connectionType === 'usb' ? 'FTDI Mode' : 'BLE Mode'}</p>
         </div>
         
         <div className="flex flex-col md:flex-row gap-4 items-center">
@@ -351,6 +368,43 @@ export default function App() {
           </div>
         </div>
       </div>
+
+      {/* TERMINAL DE DEPURACIÓN (FLOTANTE / EXPANDIBLE) */}
+      <div className={`fixed bottom-0 left-0 right-0 bg-slate-950/95 border-t border-slate-800 transition-all duration-300 z-50 flex flex-col ${showLogs ? 'h-80' : 'h-10'}`}>
+        <div 
+            className="flex items-center justify-between px-4 h-10 bg-slate-900 cursor-pointer hover:bg-slate-800 transition-colors"
+            onClick={() => setShowLogs(!showLogs)}
+        >
+            <div className="flex items-center gap-2 text-xs font-mono text-slate-400">
+                <Terminal size={14} />
+                <span className="font-bold">TERMINAL DE COMUNICACIÓN</span>
+                <span className="bg-slate-800 px-2 rounded text-[10px]">{logs.length} Eventos</span>
+            </div>
+            <div className="flex items-center gap-3">
+                <button 
+                    onClick={(e) => { e.stopPropagation(); setLogs([]); }}
+                    className="p-1 hover:text-red-400 text-slate-500 transition-colors"
+                    title="Limpiar Logs"
+                >
+                    <Trash2 size={14} />
+                </button>
+                <span className="text-[10px] text-slate-600">{showLogs ? '▼ Ocultar' : '▲ Mostrar'}</span>
+            </div>
+        </div>
+        
+        {showLogs && (
+            <div className="flex-1 overflow-y-auto p-4 font-mono text-xs space-y-1">
+                {logs.length === 0 && <p className="text-slate-600 italic">Esperando eventos de comunicación...</p>}
+                {logs.map((log, i) => (
+                    <div key={i} className={`break-all ${log.includes('RX') ? 'text-emerald-400' : log.includes('TX') ? 'text-blue-400' : log.includes('Error') || log.includes('NAK') ? 'text-red-400' : 'text-slate-400'}`}>
+                        {log}
+                    </div>
+                ))}
+                <div ref={logsEndRef} />
+            </div>
+        )}
+      </div>
+
     </div>
   );
 }

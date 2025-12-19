@@ -39,11 +39,25 @@ function calculateCrc8(data: Uint8Array): number {
   return crc;
 }
 
+function toHex(buffer: Uint8Array | number[]): string {
+  const arr = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+  return Array.from(arr).map(b => b.toString(16).padStart(2, '0').toUpperCase()).join(' ');
+}
+
 export class MicroNIRDriver {
   private device: any | null = null;
   private inEndpoint = 0; 
   private outEndpoint = 0;
   public isConnected = false;
+  private logger: (msg: string) => void = () => {};
+
+  public setLogger(fn: (msg: string) => void) {
+    this.logger = fn;
+  }
+
+  private log(msg: string) {
+    this.logger(`[USB] ${msg}`);
+  }
 
   private async sleep(ms: number) {
     return new Promise(r => setTimeout(r, ms));
@@ -52,6 +66,7 @@ export class MicroNIRDriver {
   // Enviar comando de control al chip FTDI (Vendor Request)
   private async ctrl(req: number, val: number, idx: number) {
     if (!this.device) return;
+    this.log(`FTDI CTRL Req:${req.toString(16)} Val:${val.toString(16)}`);
     return this.device.controlTransferOut({
       requestType: 'vendor', recipient: 'device', request: req, value: val, index: idx
     });
@@ -59,10 +74,12 @@ export class MicroNIRDriver {
 
   async connect(): Promise<string> {
     try {
+      this.log("Solicitando dispositivo...");
       this.device = await (navigator as any).usb.requestDevice({
         filters: [{ vendorId: USB_CONFIG.vendorId }]
       });
 
+      this.log(`Dispositivo seleccionado: ${this.device.productName}`);
       await this.device.open();
       if (this.device.configuration === null) await this.device.selectConfiguration(1);
       
@@ -75,12 +92,13 @@ export class MicroNIRDriver {
       this.inEndpoint = epIn ? epIn.endpointNumber : 2;
       this.outEndpoint = epOut ? epOut.endpointNumber : 1;
       
-      console.log(`Endpoints: IN=${this.inEndpoint}, OUT=${this.outEndpoint}`);
+      this.log(`Endpoints: IN=${this.inEndpoint}, OUT=${this.outEndpoint}`);
 
       try { await this.device.claimInterface(intf.interfaceNumber); } 
-      catch(e) { console.warn("Interface claimed/busy", e); }
+      catch(e) { this.log("Interface ya reclamada o ocupada"); }
 
       // --- CONFIGURACIÓN FTDI ---
+      this.log("Configurando FTDI Serial (115200 8N1)...");
       await this.ctrl(0x00, 0x00, 0x00); // Reset
       await this.ctrl(0x03, 0x401A, 0x00); // Baud 115200
       await this.ctrl(0x04, 0x0008, 0x00); // 8N1
@@ -100,11 +118,14 @@ export class MicroNIRDriver {
       const b1 = (integrationTime >> 16) & 0xFF;
       const b2 = (integrationTime >> 8) & 0xFF;
       const b3 = (integrationTime) & 0xFF;
+      
+      this.log("Enviando Init Sequence (Set Integration 6800us)...");
       await this.send(CMD.SET_INTEGRATION, [b0, b1, b2, b3]);
       
       return "OK";
     } catch (error: any) {
       this.isConnected = false;
+      this.log(`Error Critico: ${error.message}`);
       console.error(error);
       return error.message || "Error USB Desconocido";
     }
@@ -116,11 +137,13 @@ export class MicroNIRDriver {
       await this.device.close();
     }
     this.isConnected = false;
+    this.log("Desconectado.");
   }
 
   private async flushRx() {
     if (!this.isConnected) return;
     try {
+      this.log("Limpiando buffer RX...");
       for(let i=0; i<5; i++) {
         const res = await this.device.transferIn(this.inEndpoint, 64);
         if (!res.data || res.data.byteLength <= 2) break;
@@ -138,12 +161,14 @@ export class MicroNIRDriver {
     const crc = calculateCrc8(rawPayload);
 
     const packet = new Uint8Array([0x02, ...rawPayload, crc, 0x03]);
+    
+    this.log(`TX >>> ${toHex(packet)}`);
 
     try {
       const res = await this.device.transferOut(this.outEndpoint, packet);
       return res.status === 'ok';
     } catch (e) {
-      console.error("TX Error:", e);
+      this.log(`TX Falló: ${e}`);
       return false;
     }
   }
@@ -155,7 +180,10 @@ export class MicroNIRDriver {
         const resp = await this.readPacket(500);
         
         if (resp && resp.length >= 5) {
+           // Buscar respuesta válida
            for(let i=0; i<resp.length-2; i++) {
+             // 0x06 es el Opcode de GET_TEMP Response (echo del comando o específico)
+             // Ajustar lógica según logs
              if (resp[i] === 0x06) {
                const view = new DataView(resp.buffer);
                if (i + 2 < resp.length) {
@@ -178,13 +206,18 @@ export class MicroNIRDriver {
   }
 
   async scan(): Promise<Uint16Array | null> {
+    this.log("Iniciando SCAN...");
     if (!await this.send(CMD.SCAN)) return null;
 
     await this.sleep(100); 
 
     const raw = await this.readPacket(3000);
-    if (!raw) return null;
+    if (!raw) {
+        this.log("SCAN Timeout: No se recibieron datos");
+        return null;
+    }
 
+    this.log(`SCAN RX Total Bytes: ${raw.length}`);
     let spectrum: Uint16Array | null = null;
 
     for(let i=0; i < raw.length - 10; i++) {
@@ -210,9 +243,8 @@ export class MicroNIRDriver {
       }
     }
 
-    // Fallback: Si no hay cabecera clara pero el tamaño es coherente con 128 píxeles
-    // 128 píxeles * 2 bytes = 256 bytes + overhead
     if (!spectrum && raw.length >= 256) {
+       this.log("SCAN Fallback (Raw size match)");
        spectrum = this.parseSpectrum(raw, 0, 128);
     }
 
@@ -220,7 +252,6 @@ export class MicroNIRDriver {
   }
 
   private parseSpectrum(buffer: Uint8Array, offset: number, pixels: number): Uint16Array {
-    // Forzar 128 si es posible
     const bytesAvailable = buffer.length - offset;
     const pixelsPossible = Math.floor(bytesAvailable / 2);
     const targetPixels = (pixelsPossible >= 128) ? 128 : pixels;
@@ -244,18 +275,19 @@ export class MicroNIRDriver {
         const res = await this.device.transferIn(this.inEndpoint, 64);
         
         if (res.status === 'ok' && res.data.byteLength > 2) {
-          const chunk = new Uint8Array(res.data.buffer.slice(2)); // Remover FTDI header
+          const chunk = new Uint8Array(res.data.buffer.slice(2)); // Remover FTDI header (2 bytes status)
           
-          const next = new Uint8Array(acc.length + chunk.length);
-          next.set(acc);
-          next.set(chunk, acc.length);
-          acc = next;
+          if (chunk.length > 0) {
+             this.log(`RX Chunk (No Header) <<< ${toHex(chunk)}`);
+             const next = new Uint8Array(acc.length + chunk.length);
+             next.set(acc);
+             next.set(chunk, acc.length);
+             acc = next;
 
-          if (acc.length > 5 && acc[acc.length-1] === 0x03) {
-             // Si tenemos al menos 256 bytes (128 pixeles * 2) y termina en ETX, probablemente es SCAN
-             if (acc.length >= 256) return acc;
-             // Paquetes cortos (ACKs, Temp)
-             if (acc.length < 50) return acc;
+             if (acc.length > 5 && acc[acc.length-1] === 0x03) {
+                if (acc.length >= 256) return acc;
+                if (acc.length < 50) return acc;
+             }
           }
         }
       } catch (e) {
