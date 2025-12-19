@@ -25,3 +25,15 @@ export const USB_CONFIG = {
   deviceName: "MicroNIR On-Site-W",
   firmwareVersion: "2.5.1-stable"
 };
+
+// Configuración BLE basada en estándares JDSU/Viavi
+// Si el dispositivo usa un servicio UART Nórdico estándar (común en estos equipos):
+export const BLE_CONFIG = {
+  // Filtro de nombre para encontrar el dispositivo
+  namePrefix: "MicroNIR",
+  // UUIDs comunes para Serial Port Profile sobre BLE (Nordic UART Service)
+  // Se usan como fallback si no se detectan automáticamente
+  serviceUUID: "6e400001-b5a3-f393-e0a9-e50e24dcca9e",
+  rxCharUUID: "6e400003-b5a3-f393-e0a9-e50e24dcca9e", // Notify
+  txCharUUID: "6e400002-b5a3-f393-e0a9-e50e24dcca9e"  // Write
+};

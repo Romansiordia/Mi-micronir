@@ -2,17 +2,29 @@
 import React, { useState, useEffect } from 'react';
 import { 
   Usb, Activity, RefreshCw, Zap, AlertCircle, CheckCircle2, 
-  BarChart3, Settings2, ShieldCheck, Thermometer, Power
+  BarChart3, Settings2, ShieldCheck, Thermometer, Power, Bluetooth
 } from 'lucide-react';
 import { 
   AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer
 } from 'recharts';
-import { device } from './services/usbService';
+import { device as usbDevice } from './services/usbService';
+import { bleDevice } from './services/bleService';
 import { CDM_MODEL } from './constants';
 import { getAIInterpretation } from './services/geminiService';
 import { WavelengthPoint } from './types';
 
+// Interfaz unificada para usar cualquiera de los dos drivers
+interface IDeviceDriver {
+  connect(): Promise<string>;
+  disconnect(): Promise<void>;
+  setLamp(on: boolean): Promise<boolean>;
+  getTemperature(): Promise<number | null>;
+  scan(): Promise<Uint16Array | null>;
+  isConnected: boolean;
+}
+
 export default function App() {
+  const [connectionType, setConnectionType] = useState<'usb' | 'ble'>('usb');
   const [status, setStatus] = useState<'disconnected' | 'connecting' | 'ready' | 'error'>('disconnected');
   const [statusMsg, setStatusMsg] = useState("Listo para conectar");
   const [temp, setTemp] = useState<number | null>(null);
@@ -25,39 +37,43 @@ export default function App() {
   const [prediction, setPrediction] = useState<string>("--");
   const [aiAnalysis, setAiAnalysis] = useState<string>("");
 
+  // Selector del driver activo
+  const activeDevice: IDeviceDriver = connectionType === 'usb' ? usbDevice : bleDevice;
+
   const log = (msg: string) => setStatusMsg(msg);
 
   const connect = async () => {
     if (isBusy) return;
     setIsBusy(true);
     setStatus('connecting');
-    log("Iniciando secuencia de arranque USB...");
+    log(connectionType === 'usb' ? "Iniciando USB..." : "Buscando BLE...");
     
     try {
-      const res = await device.connect();
+      const res = await activeDevice.connect();
       if (res === "OK") {
-        log("Chip FTDI Inicializado. Buscando sensor...");
+        log("Conectado. Obteniendo telemetría...");
         
-        // Intentar leer temperatura varias veces si es necesario
-        const t = await device.getTemperature();
+        // Esperar un poco más en BLE
+        if (connectionType === 'ble') await new Promise(r => setTimeout(r, 500));
+
+        const t = await activeDevice.getTemperature();
         
         if (t !== null) {
           setTemp(t);
           setStatus('ready');
-          log(`En línea. Temp: ${t.toFixed(1)}°C`);
+          log(`En línea (${connectionType.toUpperCase()}). Temp: ${t.toFixed(1)}°C`);
         } else {
           setStatus('error');
-          log("Error: Sensor no responde. Desconecte y reconecte el USB.");
-          // Intentar cerrar para permitir reintento limpio
-          await device.disconnect();
+          log("Conectado, pero sensor no responde datos.");
+          await activeDevice.disconnect();
         }
       } else {
         setStatus('error');
-        log(`Error USB: ${res}`);
+        log(`Error Conexión: ${res}`);
       }
     } catch (e) {
       setStatus('error');
-      log("Excepción crítica en driver.");
+      log("Excepción al conectar.");
     }
     setIsBusy(false);
   };
@@ -68,7 +84,7 @@ export default function App() {
     const newState = !lamp;
     log(newState ? "Calentando lámpara..." : "Apagando lámpara...");
     
-    const ok = await device.setLamp(newState);
+    const ok = await activeDevice.setLamp(newState);
     if (ok) {
       setLamp(newState);
       log(newState ? "Lámpara ESTABLE" : "Lámpara OFF");
@@ -83,7 +99,7 @@ export default function App() {
     setIsBusy(true);
     log(`Capturando referencia ${type.toUpperCase()}...`);
     
-    const data = await device.scan();
+    const data = await activeDevice.scan();
     if (data) {
       if (type === 'dark') setDarkRef(data);
       else setWhiteRef(data);
@@ -102,23 +118,19 @@ export default function App() {
     
     setIsBusy(true);
     log("Midiendo muestra...");
-    const raw = await device.scan();
+    const raw = await activeDevice.scan();
     
     if (raw) {
       const plotData: WavelengthPoint[] = [];
       const absData: number[] = [];
       
       for(let i=0; i<raw.length; i++) {
-        // Cálculo de Absorbancia con protección contra división por cero
         const d = darkRef[i];
         const w = whiteRef[i];
         const s = raw[i];
         
-        // Evitar ceros y negativos en logaritmo
         const denominator = Math.max((w - d), 1.0);
         let reflectance = (s - d) / denominator;
-        
-        // Clampear reflectancia a valores físicos razonables
         reflectance = Math.max(0.0001, Math.min(reflectance, 1.5));
 
         const abs = -Math.log10(reflectance);
@@ -130,7 +142,6 @@ export default function App() {
 
       setSpectrum(plotData);
 
-      // Modelo PLS
       let score = CDM_MODEL.bias;
       const limit = Math.min(absData.length, CDM_MODEL.betaCoefficients.length);
       for(let i=0; i<limit; i++) {
@@ -156,10 +167,10 @@ export default function App() {
             <ShieldCheck className="text-blue-500" />
             MicroNIR <span className="text-blue-400 bg-blue-500/10 px-2 rounded text-lg border border-blue-500/20">QUANTUM</span>
           </h1>
-          <p className="text-xs text-slate-500 font-mono mt-1 uppercase ml-1">v4.0.1 Stable • FTDI Native</p>
+          <p className="text-xs text-slate-500 font-mono mt-1 uppercase ml-1">v4.1.0 Dual Link • {connectionType === 'usb' ? 'FTDI Mode' : 'BLE Mode'}</p>
         </div>
         
-        <div className="flex gap-4 items-center">
+        <div className="flex flex-col md:flex-row gap-4 items-center">
           <div className="text-right mr-2 hidden md:block">
             <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Sistema</p>
             <p className={`text-xs font-bold ${status==='ready' ? 'text-emerald-400' : status==='error' ? 'text-red-400' : 'text-amber-400'}`}>
@@ -167,10 +178,28 @@ export default function App() {
             </p>
           </div>
           
+          {/* Selector de Modo */}
+          {status === 'disconnected' && (
+            <div className="flex bg-slate-800 rounded-lg p-1 border border-slate-700">
+              <button 
+                onClick={() => setConnectionType('usb')}
+                className={`px-3 py-1 rounded text-xs font-bold flex items-center gap-1 transition-all ${connectionType === 'usb' ? 'bg-blue-600 text-white shadow' : 'text-slate-400 hover:text-white'}`}
+              >
+                <Usb size={12} /> USB
+              </button>
+              <button 
+                onClick={() => setConnectionType('ble')}
+                className={`px-3 py-1 rounded text-xs font-bold flex items-center gap-1 transition-all ${connectionType === 'ble' ? 'bg-indigo-600 text-white shadow' : 'text-slate-400 hover:text-white'}`}
+              >
+                <Bluetooth size={12} /> BLE
+              </button>
+            </div>
+          )}
+          
           {status === 'disconnected' || status === 'error' ? (
-            <button onClick={connect} disabled={isBusy} className="bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white px-6 py-3 rounded-xl font-bold flex items-center gap-2 transition-all shadow-lg shadow-blue-900/20">
-              {isBusy ? <RefreshCw className="animate-spin" size={20}/> : <Usb size={20} />} 
-              {status === 'error' ? 'REINTENTAR USB' : 'CONECTAR'}
+            <button onClick={connect} disabled={isBusy} className={`bg-gradient-to-r ${connectionType === 'usb' ? 'from-blue-600 to-blue-500' : 'from-indigo-600 to-indigo-500'} hover:opacity-90 disabled:opacity-50 text-white px-6 py-3 rounded-xl font-bold flex items-center gap-2 transition-all shadow-lg`}>
+              {isBusy ? <RefreshCw className="animate-spin" size={20}/> : (connectionType === 'usb' ? <Usb size={20} /> : <Bluetooth size={20} />)} 
+              {status === 'error' ? 'REINTENTAR' : 'CONECTAR'}
             </button>
           ) : (
             <div className="flex gap-3">
@@ -274,8 +303,8 @@ export default function App() {
                 <AreaChart data={spectrum} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
                   <defs>
                     <linearGradient id="colorAbs" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.4}/>
-                      <stop offset="95%" stopColor="#3b82f6" stopOpacity={0}/>
+                      <stop offset="5%" stopColor={connectionType==='usb' ? "#3b82f6" : "#6366f1"} stopOpacity={0.4}/>
+                      <stop offset="95%" stopColor={connectionType==='usb' ? "#3b82f6" : "#6366f1"} stopOpacity={0}/>
                     </linearGradient>
                   </defs>
                   <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} />
@@ -286,7 +315,7 @@ export default function App() {
                     itemStyle={{ color: '#60a5fa' }}
                     labelStyle={{ color: '#94a3b8', fontSize: '10px', marginBottom: '4px', textTransform: 'uppercase', letterSpacing: '1px' }}
                   />
-                  <Area type="monotone" dataKey="absorbance" stroke="#3b82f6" strokeWidth={3} fill="url(#colorAbs)" animationDuration={1500} />
+                  <Area type="monotone" dataKey="absorbance" stroke={connectionType==='usb' ? "#3b82f6" : "#6366f1"} strokeWidth={3} fill="url(#colorAbs)" animationDuration={1500} />
                 </AreaChart>
               </ResponsiveContainer>
               
