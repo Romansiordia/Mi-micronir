@@ -108,15 +108,21 @@ export class MicroNIRDriver {
       await this.sleep(200);
       await this.flushRx();
 
+      // --- CAMBIO IMPORTANTE: HARD RESET AL INICIO ---
+      this.log("Enviando HARD RESET (0x0F) para despertar lámparas...");
+      await this.send(CMD.RESET);
+      await this.sleep(800); // Esperar reinicio interno
+      // -----------------------------------------------
+
       this.log("Iniciando negociación de protocolo...");
       const success = await this.autoConfig();
       
       if (!success) {
-        // Si falla la autoconfiguración, intentamos forzar Little Endian por defecto
-        this.log("Fallback: Forzando Little Endian por defecto...");
-        const payload = this.buildPayload(100, 10000, 8, false); // false = !be = True (Little Endian)
+        // Fallback: Default a configuración "segura"
+        this.log("Fallback: Usando configuración estándar...");
+        const payload = this.buildPayload(50, 10000, 8, false); 
         await this.send(CMD.SET_INTEGRATION, payload);
-        return "OK (Forzado)";
+        return "OK (Std)";
       }
 
       return "OK";
@@ -127,29 +133,26 @@ export class MicroNIRDriver {
   }
 
   private async autoConfig(): Promise<boolean> {
-    const scanCount = 500;
-    const integrationTime = 12500;
+    const scanCount = 100;
+    const integrationTime = 10000;
 
     const formats = [
-      { size: 8, be: false },  // Little Endian (más probable)
-      { size: 8, be: true },   // Big Endian
-      { size: 16, be: false }  // Extended Little Endian
+      { size: 8, be: false },  // Little Endian
+      { size: 8, be: true }    // Big Endian
     ];
 
     for (const fmt of formats) {
-      this.log(`Probando formato: ${fmt.size} bytes, ${fmt.be ? 'BigEndian' : 'LittleEndian'}`);
+      this.log(`Configurando: ${fmt.size}B ${fmt.be ? 'BE' : 'LE'}`);
       const payload = this.buildPayload(scanCount, integrationTime, fmt.size, fmt.be);
       
       if (await this.send(CMD.SET_INTEGRATION, payload)) {
         await this.sleep(100);
-        const resp = await this.readPacket(500);
-        if (resp && resp.length >= 3) {
-          if (resp[2] === 0x15) { // NAK
-            this.log(`Rechazado (NAK)`);
-          } else {
-            this.log(`¡Conectado! Formato aceptado.`);
+        const resp = await this.readPacket(200);
+        // Si no hay respuesta o es válida, asumimos OK. Si es NAK (0x15), fallamos.
+        if (resp && resp.length >= 3 && resp[2] === 0x15) {
+            this.log(`Rechazado (NAK 0x15)`);
+        } else {
             return true;
-          }
         }
       }
       await this.sleep(50);
@@ -161,7 +164,6 @@ export class MicroNIRDriver {
     const buffer = new ArrayBuffer(size);
     const view = new DataView(buffer);
     if (size >= 8) {
-      // !be -> Si be=false (queremos Little), !be=true que es el flag de DataView para LittleEndian
       view.setUint32(0, scans, !be);
       view.setUint32(4, time, !be);
     }
@@ -205,7 +207,6 @@ export class MicroNIRDriver {
     if (await this.send(CMD.GET_TEMP)) {
       const resp = await this.readPacket(500);
       if (resp && resp.length >= 5 && resp[2] === 0x06) {
-        // Temperatura usualmente es Big Endian incluso en modos Little Endian, pero probaremos LE si falla
         const val = new DataView(resp.buffer).getUint16(3, false);
         return val / 1000.0;
       }
@@ -214,18 +215,32 @@ export class MicroNIRDriver {
   }
 
   async setLamp(on: boolean): Promise<boolean> {
-    // CRÍTICO: Muchos MicroNIR rechazan encender la lámpara si no se ha refrescado
-    // la configuración de tiempo de integración recientemente.
     if (on) {
-        this.log("Enviando Wake-Up Config antes de Lámpara...");
-        // 50 scans, 10ms, 8 bytes, Little Endian (be=false)
-        const payload = this.buildPayload(50, 10000, 8, false);
+        this.log("Refrescando Config antes de Lámpara...");
+        const payload = this.buildPayload(50, 9000, 8, false); // 9ms
         await this.send(CMD.SET_INTEGRATION, payload);
-        await this.sleep(150); // Pausa obligatoria
+        await this.sleep(100);
     }
 
-    const ok = await this.send(CMD.LAMP_CONTROL, [on ? 1 : 0]);
-    if (ok) await this.sleep(on ? 1500 : 100); 
+    // CAMBIO CRÍTICO: Enviamos padding [val, 0x00]. 
+    // Algunos equipos ignoran paquetes de 1 solo byte de payload.
+    const ok = await this.send(CMD.LAMP_CONTROL, [on ? 1 : 0, 0x00]);
+    
+    // CAMBIO CRÍTICO: Leemos la respuesta del sensor para ver si dice que NO (NAK)
+    if (ok) {
+        await this.sleep(100);
+        const resp = await this.readPacket(200);
+        if (resp && resp.length > 2) {
+             if (resp[2] === 0x15) {
+                 this.log("ERROR CRÍTICO: El sensor respondió NAK (0x15) al intento de encender lámpara.");
+                 this.log("Causa probable: Falta de corriente USB o Protección Térmica activa.");
+                 return false;
+             } else {
+                 this.log(`Respuesta Lámpara: ${toHex(resp)} (OK)`);
+             }
+        }
+        await this.sleep(on ? 1500 : 100); 
+    }
     return ok;
   }
 
@@ -237,17 +252,17 @@ export class MicroNIRDriver {
   }
 
   private parseSpectrum(buffer: Uint8Array): Uint16Array {
-    let offset = 3; // Default short format [02, LEN, 05, DATA...]
-    if (buffer[3] === 0x05) offset = 4; // Extended format [02, HI, LO, 05, DATA...]
+    let offset = 3; 
+    if (buffer[3] === 0x05) offset = 4;
     
     const s = new Uint16Array(128);
     const view = new DataView(buffer.buffer);
     
     for(let j=0; j<128; j++) {
       if (offset + (j*2) + 1 < buffer.length) {
-          // CAMBIO CRÍTICO: Usar Little Endian (true)
-          // La línea saturada suele ser por leer Big Endian cuando el sensor envía Little Endian
-          s[j] = view.getUint16(offset + (j*2), true); 
+          // Volvemos a Big Endian (false) como estándar
+          // Si el valor es saturado, lo dejamos pasar, la APP lo graficará alto.
+          s[j] = view.getUint16(offset + (j*2), false); 
       }
     }
     return s;
