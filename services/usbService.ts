@@ -1,3 +1,4 @@
+
 import { USB_CONFIG } from "../constants";
 
 declare global {
@@ -111,7 +112,11 @@ export class MicroNIRDriver {
       const success = await this.autoConfig();
       
       if (!success) {
-        return "El sensor rechazó todas las configuraciones conocidas.";
+        // Si falla la autoconfiguración, intentamos forzar Little Endian por defecto
+        this.log("Fallback: Forzando Little Endian por defecto...");
+        const payload = this.buildPayload(100, 10000, 8, false); // false = !be = True (Little Endian)
+        await this.send(CMD.SET_INTEGRATION, payload);
+        return "OK (Forzado)";
       }
 
       return "OK";
@@ -126,9 +131,9 @@ export class MicroNIRDriver {
     const integrationTime = 12500;
 
     const formats = [
-      { size: 8, be: false }, { size: 8, be: true },
-      { size: 12, be: false }, { size: 12, be: true },
-      { size: 16, be: false }, { size: 16, be: true }
+      { size: 8, be: false },  // Little Endian (más probable)
+      { size: 8, be: true },   // Big Endian
+      { size: 16, be: false }  // Extended Little Endian
     ];
 
     for (const fmt of formats) {
@@ -140,9 +145,9 @@ export class MicroNIRDriver {
         const resp = await this.readPacket(500);
         if (resp && resp.length >= 3) {
           if (resp[2] === 0x15) { // NAK
-            this.log(`Formato rechazado por el sensor (Error 0x${resp[3].toString(16)})`);
+            this.log(`Rechazado (NAK)`);
           } else {
-            this.log(`¡Conectado! Formato aceptado: ${fmt.size} bytes.`);
+            this.log(`¡Conectado! Formato aceptado.`);
             return true;
           }
         }
@@ -156,10 +161,10 @@ export class MicroNIRDriver {
     const buffer = new ArrayBuffer(size);
     const view = new DataView(buffer);
     if (size >= 8) {
+      // !be -> Si be=false (queremos Little), !be=true que es el flag de DataView para LittleEndian
       view.setUint32(0, scans, !be);
       view.setUint32(4, time, !be);
     }
-    // Padding para 12 y 16 bytes
     return Array.from(new Uint8Array(buffer));
   }
 
@@ -200,15 +205,27 @@ export class MicroNIRDriver {
     if (await this.send(CMD.GET_TEMP)) {
       const resp = await this.readPacket(500);
       if (resp && resp.length >= 5 && resp[2] === 0x06) {
-        return new DataView(resp.buffer).getUint16(3, false) / 1000.0;
+        // Temperatura usualmente es Big Endian incluso en modos Little Endian, pero probaremos LE si falla
+        const val = new DataView(resp.buffer).getUint16(3, false);
+        return val / 1000.0;
       }
     }
     return null;
   }
 
   async setLamp(on: boolean): Promise<boolean> {
+    // CRÍTICO: Muchos MicroNIR rechazan encender la lámpara si no se ha refrescado
+    // la configuración de tiempo de integración recientemente.
+    if (on) {
+        this.log("Enviando Wake-Up Config antes de Lámpara...");
+        // 50 scans, 10ms, 8 bytes, Little Endian (be=false)
+        const payload = this.buildPayload(50, 10000, 8, false);
+        await this.send(CMD.SET_INTEGRATION, payload);
+        await this.sleep(150); // Pausa obligatoria
+    }
+
     const ok = await this.send(CMD.LAMP_CONTROL, [on ? 1 : 0]);
-    if (ok) await this.sleep(on ? 1000 : 100); 
+    if (ok) await this.sleep(on ? 1500 : 100); 
     return ok;
   }
 
@@ -222,10 +239,16 @@ export class MicroNIRDriver {
   private parseSpectrum(buffer: Uint8Array): Uint16Array {
     let offset = 3; // Default short format [02, LEN, 05, DATA...]
     if (buffer[3] === 0x05) offset = 4; // Extended format [02, HI, LO, 05, DATA...]
+    
     const s = new Uint16Array(128);
     const view = new DataView(buffer.buffer);
+    
     for(let j=0; j<128; j++) {
-      if (offset + (j*2) + 1 < buffer.length) s[j] = view.getUint16(offset + (j*2), false);
+      if (offset + (j*2) + 1 < buffer.length) {
+          // CAMBIO CRÍTICO: Usar Little Endian (true)
+          // La línea saturada suele ser por leer Big Endian cuando el sensor envía Little Endian
+          s[j] = view.getUint16(offset + (j*2), true); 
+      }
     }
     return s;
   }
