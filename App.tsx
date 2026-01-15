@@ -166,7 +166,7 @@ export default function App() {
             <ShieldCheck className="text-blue-500" />
             MicroNIR <span className="text-blue-400 bg-blue-500/10 px-2 rounded text-lg border border-blue-500/20">QUANTUM</span>
           </h1>
-          <p className="text-xs text-slate-500 font-mono mt-1 uppercase ml-1">v14.0 Protocol Tuning • {connectionType.toUpperCase()}</p>
+          <p className="text-xs text-slate-500 font-mono mt-1 uppercase ml-1">v15.0 Protocol Safe • {connectionType.toUpperCase()}</p>
         </div>
         
         <div className="flex flex-col md:flex-row gap-4 items-center">
@@ -198,8 +198,8 @@ export default function App() {
           ) : (
             <div className="flex gap-3">
                <button onClick={disconnect} className="bg-slate-800 text-slate-400 px-3 py-3 rounded-xl hover:bg-red-900/30 transition-all"><Power size={18} /></button>
-              <button onClick={toggleLamp} disabled={isBusy} className={`px-5 py-3 rounded-xl font-bold border flex items-center gap-2 ${lamp ? 'bg-orange-500 text-white border-orange-400' : 'bg-slate-800 border-slate-700 text-slate-400'}`}>
-                <Zap size={18} fill={lamp ? "currentColor" : "none"} /> {lamp ? 'LÁMPARA ON' : 'LÁMPARA OFF'}
+              <button onClick={toggleLamp} disabled={isBusy} className={`px-5 py-3 rounded-xl font-bold border flex items-center gap-2 ${lamp ? 'bg-orange-500 text-white border-orange-400' : 'bg-slate-800 border-slate-700 text-slate-400 animate-pulse'}`}>
+                <Zap size={18} fill={lamp ? "currentColor" : "none"} /> {lamp ? 'LÁMPARA ON' : 'ENCENDER LÁMPARA'}
               </button>
               <div className="bg-slate-800 px-5 py-3 rounded-xl flex items-center gap-2 border border-slate-700"><Thermometer size={18} className="text-emerald-400"/><span className="font-mono font-bold text-lg">{temp ? temp.toFixed(1) : '--'}°C</span></div>
             </div>
@@ -212,8 +212,14 @@ export default function App() {
           <div className="bg-slate-900/50 p-6 rounded-3xl border border-slate-800">
             <h3 className="text-xs font-black text-slate-500 uppercase tracking-widest mb-6">Secuencia de Calibración</h3>
             <div className="space-y-3">
-              <button disabled={status !== 'ready' || !lamp || isBusy} onClick={() => calibrate('dark')} className={`w-full p-4 rounded-xl border flex items-center justify-between ${darkRef ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-400' : 'bg-slate-800 text-slate-400'}`}><span>REF. OSCURA</span>{darkRef && <CheckCircle2 size={18} />}</button>
-              <button disabled={status !== 'ready' || !lamp || isBusy} onClick={() => calibrate('white')} className={`w-full p-4 rounded-xl border flex items-center justify-between ${whiteRef ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-400' : 'bg-slate-800 text-slate-400'}`}><span>REF. BLANCA</span>{whiteRef && <CheckCircle2 size={18} />}</button>
+              <button disabled={status !== 'ready' || !lamp || isBusy} onClick={() => calibrate('dark')} className={`w-full p-4 rounded-xl border flex items-center justify-between ${darkRef ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-400' : 'bg-slate-800 text-slate-400'}`}>
+                <span>{(!lamp && status === 'ready') ? 'REQ. LÁMPARA ENCENDIDA' : '1. REF. OSCURA (TAPAR)'}</span>
+                {darkRef && <CheckCircle2 size={18} />}
+              </button>
+              <button disabled={status !== 'ready' || !lamp || isBusy} onClick={() => calibrate('white')} className={`w-full p-4 rounded-xl border flex items-center justify-between ${whiteRef ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-400' : 'bg-slate-800 text-slate-400'}`}>
+                <span>{(!lamp && status === 'ready') ? 'REQ. LÁMPARA ENCENDIDA' : '2. REF. BLANCA (MUESTRA)'}</span>
+                {whiteRef && <CheckCircle2 size={18} />}
+              </button>
             </div>
           </div>
           <button disabled={!darkRef || !whiteRef || !lamp || isBusy} onClick={measure} className={`w-full py-8 rounded-3xl font-black text-xl uppercase flex items-center justify-center gap-3 ${(darkRef && whiteRef && lamp && !isBusy) ? 'bg-gradient-to-r from-blue-600 to-indigo-600 text-white' : 'bg-slate-800 text-slate-600'}`}>

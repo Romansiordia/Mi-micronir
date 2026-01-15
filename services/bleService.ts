@@ -144,40 +144,41 @@ export class MicroNIRBLEDriver {
     this.isBusy = true;
     
     // Paso 1: Secuencia Wake-Up Progresiva
-    // Enviamos comandos inofensivos para que el procesador despierte sin carga
     this.log("Despertando MCU...");
     for(let k=0; k<3; k++) {
-        await this.send(CMD.GET_TEMP, [], true); // Ping
+        await this.send(CMD.GET_TEMP, [], true); 
         await this.sleep(300);
     }
-    this.log("Sensor Online (WakeUp OK).");
-
+    
     // Paso 2: Configuración SIN PADDING
-    // IMPORTANTE: Quitamos los ceros del final. El paquete ahora pesa 13 bytes en total.
-    // Esto previene el desbordamiento del buffer BLE (MTU 20 bytes).
     const scanCount = 100; 
     const integrationTime = 10000; 
 
     const payload = [
         (scanCount >> 24) & 0xFF, (scanCount >> 16) & 0xFF, (scanCount >> 8) & 0xFF, scanCount & 0xFF,
         (integrationTime >> 24) & 0xFF, (integrationTime >> 16) & 0xFF, (integrationTime >> 8) & 0xFF, integrationTime & 0xFF
-        // Padding ELIMINADO intencionalmente
     ];
 
-    this.log("Enviando Config (Safe Mode)...");
+    this.log("Enviando Config (Sync)...");
     
     let configured = false;
-    // Intentamos hasta 3 veces si falla
+    // Intentamos hasta 3 veces
     for(let i=0; i<3; i++) {
-        configured = await this.send(CMD.SET_CONFIG, payload, true);
-        if(configured) break;
+        // CORRECCION: silent = false para esperar el ACK y limpiar el buffer del comando de config
+        configured = await this.send(CMD.SET_CONFIG, payload, false);
+        if(configured) {
+           // Consumimos el paquete de respuesta (ACK) para que no moleste luego
+           await this.waitForPacket(1000); 
+           break;
+        }
         this.log("Reintento Configuración...");
         await this.sleep(600);
     }
     
     if (!configured) throw new Error("Fallo en configuración inicial (Reject)");
 
-    await this.sleep(500);
+    this.log("Sensor Online (Ready).");
+    await this.sleep(200);
     this.isBusy = false;
   }
 
@@ -258,8 +259,6 @@ export class MicroNIRBLEDriver {
         this.pendingResponse = true;
     }
 
-    // Packet Structure: STX (1) + LEN (1) + OP (1) + DATA (N) + CRC (1) + ETX (1)
-    // Total Size = 5 + N
     const rawPayload = new Uint8Array([data.length + 1, opcode, ...data]);
     const crc = calculateCrc8(rawPayload);
     const packet = new Uint8Array([0x02, ...rawPayload, crc, 0x03]);
@@ -301,7 +300,7 @@ export class MicroNIRBLEDriver {
   async setLamp(on: boolean): Promise<boolean> {
     this.isBusy = true; 
     const ok = await this.send(CMD.LAMP_CONTROL, [on ? 1 : 0]);
-    await this.sleep(on ? 2500 : 1000); // Tiempos extendidos para evitar picos de corriente
+    await this.sleep(on ? 2500 : 1000); 
     this.isBusy = false;
     return ok;
   }
@@ -316,7 +315,14 @@ export class MicroNIRBLEDriver {
 
   async scan(): Promise<Uint16Array | null> {
     this.isBusy = true;
+    
+    // CRITICO: Limpiar el buffer antes de pedir un escaneo nuevo
+    // Esto evita que leamos la respuesta de configuración anterior como si fuera el espectro
+    this.rxBuffer = new Uint8Array(0);
+    this.lastPacket = null;
+
     if (!await this.send(CMD.SCAN)) { this.isBusy = false; return null; }
+    
     const raw = await this.waitForPacket(8000);
     this.isBusy = false;
     if (!raw) return null;
