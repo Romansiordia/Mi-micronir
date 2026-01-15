@@ -99,7 +99,7 @@ export class MicroNIRBLEDriver {
   async connect(): Promise<string> {
     try {
       if (!navigator.bluetooth) return "Navegador incompatible";
-      await this.disconnect(); // Limpiar estado anterior
+      await this.disconnect(); 
 
       this.log("Escaneando MicroNIR...");
       this.device = await navigator.bluetooth.requestDevice({
@@ -112,7 +112,6 @@ export class MicroNIRBLEDriver {
       this.log("Conectando GATT...");
       this.server = await this.device.gatt!.connect();
       
-      // PAUSA CRITICA: Esperar a que el hardware estabilice voltaje tras conexión
       this.log("Estabilizando enlace...");
       await this.sleep(2000); 
 
@@ -128,7 +127,6 @@ export class MicroNIRBLEDriver {
       this.isConnected = true;
       this.log("Canales Listos.");
 
-      // Inicializar SUAVE
       await this.softStartSensor();
       this.startKeepAlive();
       
@@ -143,14 +141,12 @@ export class MicroNIRBLEDriver {
   private async softStartSensor() {
     this.isBusy = true;
     
-    // Paso 1: Secuencia Wake-Up Progresiva
     this.log("Despertando MCU...");
     for(let k=0; k<3; k++) {
         await this.send(CMD.GET_TEMP, [], true); 
         await this.sleep(300);
     }
     
-    // Paso 2: Configuración SIN PADDING
     const scanCount = 100; 
     const integrationTime = 10000; 
 
@@ -162,12 +158,9 @@ export class MicroNIRBLEDriver {
     this.log("Enviando Config (Sync)...");
     
     let configured = false;
-    // Intentamos hasta 3 veces
     for(let i=0; i<3; i++) {
-        // CORRECCION: silent = false para esperar el ACK y limpiar el buffer del comando de config
         configured = await this.send(CMD.SET_CONFIG, payload, false);
         if(configured) {
-           // Consumimos el paquete de respuesta (ACK) para que no moleste luego
            await this.waitForPacket(1000); 
            break;
         }
@@ -192,7 +185,6 @@ export class MicroNIRBLEDriver {
   private startKeepAlive() {
     if (this.keepAliveInterval) clearInterval(this.keepAliveInterval);
     this.keepAliveInterval = setInterval(() => {
-      // Keep-Alive muy lento (8s) para no saturar
       if (this.isConnected && !this.pendingResponse && !this.isBusy) { 
          this.getTemperature().catch(() => {});
       }
@@ -219,6 +211,9 @@ export class MicroNIRBLEDriver {
     if (!value) return;
 
     const chunk = new Uint8Array(value.buffer);
+    // LOG VERBOSE: Ver qué llega
+    this.log(`RX <<< Chunk ${chunk.length} bytes`);
+    
     const newBuffer = new Uint8Array(this.rxBuffer.length + chunk.length);
     newBuffer.set(this.rxBuffer);
     newBuffer.set(chunk, this.rxBuffer.length);
@@ -230,7 +225,10 @@ export class MicroNIRBLEDriver {
   private scanForPackets() {
     const stxIndex = this.rxBuffer.indexOf(0x02);
     if (stxIndex === -1) {
-       if (this.rxBuffer.length > 512) this.rxBuffer = new Uint8Array(0);
+       if (this.rxBuffer.length > 1024) { // Limite aumentado para espectros grandes
+          this.log("Buffer overflow (limpieza)");
+          this.rxBuffer = new Uint8Array(0);
+       }
        return;
     }
 
@@ -241,6 +239,7 @@ export class MicroNIRBLEDriver {
                 const payloadForCrc = candidate.slice(1, candidate.length - 2);
                 const packetCrc = candidate[candidate.length - 2];
                 if (calculateCrc8(payloadForCrc) === packetCrc) {
+                    this.log(`Packet Found: Len ${candidate.length}`);
                     this.lastPacket = candidate;
                     this.pendingResponse = false;
                     this.rxBuffer = this.rxBuffer.slice(i + 1);
@@ -262,6 +261,9 @@ export class MicroNIRBLEDriver {
     const rawPayload = new Uint8Array([data.length + 1, opcode, ...data]);
     const crc = calculateCrc8(rawPayload);
     const packet = new Uint8Array([0x02, ...rawPayload, crc, 0x03]);
+    
+    // LOG VERBOSE: Ver qué sale
+    if (!silent) this.log(`TX >>> Op ${opcode} (${packet.length}B)`);
 
     try {
       await this.txChar.writeValue(packet);
@@ -284,6 +286,7 @@ export class MicroNIRBLEDriver {
       await this.sleep(50);
     }
     this.pendingResponse = false;
+    this.log("Timeout esperando respuesta");
     return null;
   }
 
@@ -316,25 +319,40 @@ export class MicroNIRBLEDriver {
   async scan(): Promise<Uint16Array | null> {
     this.isBusy = true;
     
-    // CRITICO: Limpiar el buffer antes de pedir un escaneo nuevo
-    // Esto evita que leamos la respuesta de configuración anterior como si fuera el espectro
+    this.log("Iniciando Scan...");
     this.rxBuffer = new Uint8Array(0);
     this.lastPacket = null;
 
-    if (!await this.send(CMD.SCAN)) { this.isBusy = false; return null; }
+    // Opcode SCAN = 0x05
+    if (!await this.send(CMD.SCAN)) { 
+        this.isBusy = false; 
+        return null; 
+    }
     
-    const raw = await this.waitForPacket(8000);
+    // Esperamos mas tiempo (10s) para espectro completo por BLE
+    const raw = await this.waitForPacket(10000);
+    
     this.isBusy = false;
-    if (!raw) return null;
+    if (!raw) {
+        this.log("Fallo: No llegó espectro");
+        return null;
+    }
+
+    this.log(`Espectro recibido (${raw.length} bytes)`);
 
     let offset = 3;
     if (raw.length > 3 && raw[3] === 0x05) offset = 4;
     
     const s = new Uint16Array(128);
     const view = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
-    for(let j=0; j<128; j++) {
-       const idx = offset + (j*2);
-       if (idx + 1 < raw.length) s[j] = view.getUint16(idx, false);
+    // Protección contra buffer corto
+    try {
+        for(let j=0; j<128; j++) {
+            const idx = offset + (j*2);
+            if (idx + 1 < raw.length) s[j] = view.getUint16(idx, false);
+        }
+    } catch(err) {
+        this.log("Error parseando espectro");
     }
     return s;
   }

@@ -123,6 +123,9 @@ export default function App() {
       if (type === 'dark') setDarkRef(data);
       else setWhiteRef(data);
       setStatusMsg(`Calibración ${type} OK`);
+    } else {
+      setStatusMsg(`Error al leer ${type}`);
+      addLogEntry(`Fallo calibración ${type} (Scan null)`);
     }
     setIsBusy(false);
   };
@@ -147,6 +150,9 @@ export default function App() {
       }
       setPrediction(score.toFixed(2));
       getAIInterpretation(plotData, score.toFixed(2), lamp ? 'ok' : 'off').then(setAiAnalysis);
+    } else {
+       if(!raw) setStatusMsg("Error en escaneo");
+       else setStatusMsg("Falta Calibración");
     }
     setIsBusy(false);
   };
