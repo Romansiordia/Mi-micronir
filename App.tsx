@@ -2,7 +2,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { 
   Usb, Activity, RefreshCw, Zap, AlertCircle, CheckCircle2, 
-  BarChart3, Settings2, ShieldCheck, Thermometer, Power, Bluetooth, XCircle, Terminal, Trash2, ShieldAlert
+  BarChart3, Settings2, ShieldCheck, Thermometer, Power, Bluetooth, XCircle, Terminal, Trash2, ShieldAlert, Timer
 } from 'lucide-react';
 import { 
   AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer
@@ -31,8 +31,13 @@ export default function App() {
   const [temp, setTemp] = useState<number | null>(null);
   const [lamp, setLamp] = useState(false);
   const [isBusy, setIsBusy] = useState(false);
-  const [compatibilityError, setCompatibilityError] = useState<string | null>(null);
   
+  // Lógica de Dwell
+  const [isStabilizing, setIsStabilizing] = useState(false);
+  const [stabilizeProgress, setStabilizeProgress] = useState(0);
+  const [lastLampAction, setLastLampAction] = useState<number>(0);
+  
+  const [compatibilityError, setCompatibilityError] = useState<string | null>(null);
   const [darkRef, setDarkRef] = useState<Uint16Array | null>(null);
   const [whiteRef, setWhiteRef] = useState<Uint16Array | null>(null);
   const [spectrum, setSpectrum] = useState<WavelengthPoint[]>([]);
@@ -71,7 +76,7 @@ export default function App() {
     if (isBusy) return;
     setIsBusy(true);
     setStatus('connecting');
-    setStatusMsg("Conectando...");
+    setStatusMsg("Despertando hardware...");
     
     try {
       const res = await activeDevice.connect();
@@ -79,7 +84,7 @@ export default function App() {
         const t = await activeDevice.getTemperature();
         setTemp(t);
         setStatus('ready');
-        setStatusMsg(`Sensor Online (${connectionType.toUpperCase()})`);
+        setStatusMsg(`MicroNIR Online (${connectionType.toUpperCase()})`);
       } else {
         setStatus('error');
         setStatusMsg(res);
@@ -91,45 +96,65 @@ export default function App() {
     setIsBusy(false);
   };
 
-  const hardReset = async () => {
-    if (activeDevice.resetHardware) {
-        addLogEntry("Ejecutando Hard Reset...");
-        await activeDevice.resetHardware();
-        setStatusMsg("Hardware Reseteado. Intenta conectar.");
+  const runDwell = async (ms: number) => {
+    setIsStabilizing(true);
+    setStabilizeProgress(0);
+    const steps = 10;
+    for (let i = 1; i <= steps; i++) {
+      await new Promise(r => setTimeout(r, ms / steps));
+      setStabilizeProgress((i / steps) * 100);
     }
-  };
-
-  const disconnect = async () => {
-    await activeDevice.disconnect();
-    setStatus('disconnected');
-    setStatusMsg("Desconectado");
-    setTemp(null);
-    setLamp(false);
+    setIsStabilizing(false);
   };
 
   const toggleLamp = async () => {
-    if (status !== 'ready' || isBusy) return;
+    if (status !== 'ready' || isBusy || isStabilizing) return;
     setIsBusy(true);
-    const ok = await activeDevice.setLamp(!lamp);
-    if (ok) setLamp(!lamp);
+    const newState = !lamp;
+    const ok = await activeDevice.setLamp(newState);
+    if (ok) {
+      setLamp(newState);
+      setLastLampAction(Date.now());
+      if (newState) {
+        addLogEntry("Lámpara encendida. Estabilizando radiación térmica...");
+        await runDwell(3000); // 3s Dwell ON
+      } else {
+        addLogEntry("Lámpara apagada. Esperando enfriamiento de filamento...");
+        await runDwell(1500); // 1.5s Dwell OFF
+      }
+    }
     setIsBusy(false);
   };
 
   const calibrate = async (type: 'dark' | 'white') => {
-    if (isBusy) return;
+    if (isBusy || isStabilizing) return;
+    
+    // Protección VIAVI: Si la lámpara se acaba de apagar, esperar Dwell OFF para Dark Ref
+    if (type === 'dark' && lamp) {
+        addLogEntry("Error: Lámpara encendida durante Ref. Oscura. Apagando...");
+        await activeDevice.setLamp(false);
+        setLamp(false);
+        await runDwell(2000);
+    }
+
     setIsBusy(true);
+    setStatusMsg(`Capturando ${type}...`);
     const data = await activeDevice.scan();
     if (data) {
       if (type === 'dark') setDarkRef(data);
       else setWhiteRef(data);
       setStatusMsg(`Calibración ${type} OK`);
+      addLogEntry(`Calibración ${type} exitosa.`);
+    } else {
+      setStatusMsg(`Fallo en captura ${type}`);
     }
     setIsBusy(false);
   };
 
   const measure = async () => {
-    if (isBusy) return;
+    if (isBusy || isStabilizing) return;
     setIsBusy(true);
+    setStatusMsg("Escaneando muestra...");
     const raw = await activeDevice.scan();
     if (raw && darkRef && whiteRef) {
       const plotData: WavelengthPoint[] = [];
@@ -147,8 +172,20 @@ export default function App() {
       }
       setPrediction(score.toFixed(2));
       getAIInterpretation(plotData, score.toFixed(2), lamp ? 'ok' : 'off').then(setAiAnalysis);
+      setStatusMsg("Análisis completado");
+    } else {
+      setStatusMsg("Error en escaneo");
+      addLogEntry("Error: Verifique calibración y lámpara.");
     }
     setIsBusy(false);
+  };
+
+  const disconnect = async () => {
+    await activeDevice.disconnect();
+    setStatus('disconnected');
+    setStatusMsg("Desconectado");
+    setTemp(null);
+    setLamp(false);
   };
 
   return (
@@ -166,22 +203,22 @@ export default function App() {
             <ShieldCheck className="text-blue-500" />
             MicroNIR <span className="text-blue-400 bg-blue-500/10 px-2 rounded text-lg border border-blue-500/20">QUANTUM</span>
           </h1>
-          <p className="text-xs text-slate-500 font-mono mt-1 uppercase ml-1">v14.0 Protocol Tuning • {connectionType.toUpperCase()}</p>
+          <p className="text-xs text-slate-500 font-mono mt-1 uppercase ml-1">Protocol: VIAVI OnSite-W Sync • {connectionType.toUpperCase()}</p>
         </div>
         
         <div className="flex flex-col md:flex-row gap-4 items-center">
           <div className="text-right mr-2 hidden md:block">
             <p className={`text-xs font-bold ${status==='ready' ? 'text-emerald-400' : status==='error' ? 'text-red-400' : 'text-amber-400'}`}>
-              {statusMsg}
+              {isStabilizing ? "ESTABILIZANDO LÁMPARA..." : statusMsg}
             </p>
           </div>
           
-          {status === 'disconnected' && (
+          {status === 'disconnected' ? (
             <div className="flex bg-slate-800 rounded-lg p-1 border border-slate-700">
               <button onClick={() => setConnectionType('usb')} className={`px-3 py-1 rounded text-xs font-bold transition-all ${connectionType === 'usb' ? 'bg-blue-600 text-white' : 'text-slate-400'}`}><Usb size={12} /></button>
               <button onClick={() => setConnectionType('ble')} className={`px-3 py-1 rounded text-xs font-bold transition-all ${connectionType === 'ble' ? 'bg-indigo-600 text-white' : 'text-slate-400'}`}><Bluetooth size={12} /></button>
             </div>
-          )}
+          ) : null}
           
           {status === 'disconnected' || status === 'error' ? (
              <div className="flex gap-2">
@@ -189,17 +226,13 @@ export default function App() {
                     {isBusy ? <RefreshCw className="animate-spin" size={20}/> : <Power size={20} />} 
                     {status === 'error' ? 'REINTENTAR' : 'CONECTAR'}
                 </button>
-                {status === 'error' && (
-                    <button onClick={hardReset} className="bg-slate-800 text-slate-400 px-3 py-3 rounded-xl hover:bg-slate-700" title="Hard Reset Sensor">
-                        <Trash2 size={20} />
-                    </button>
-                )}
             </div>
           ) : (
             <div className="flex gap-3">
                <button onClick={disconnect} className="bg-slate-800 text-slate-400 px-3 py-3 rounded-xl hover:bg-red-900/30 transition-all"><Power size={18} /></button>
-              <button onClick={toggleLamp} disabled={isBusy} className={`px-5 py-3 rounded-xl font-bold border flex items-center gap-2 ${lamp ? 'bg-orange-500 text-white border-orange-400' : 'bg-slate-800 border-slate-700 text-slate-400'}`}>
-                <Zap size={18} fill={lamp ? "currentColor" : "none"} /> {lamp ? 'LÁMPARA ON' : 'LÁMPARA OFF'}
+              <button onClick={toggleLamp} disabled={isBusy || isStabilizing} className={`px-5 py-3 rounded-xl font-bold border flex items-center gap-2 transition-all ${lamp ? 'bg-orange-500 text-white border-orange-400 shadow-[0_0_15px_rgba(249,115,22,0.4)]' : 'bg-slate-800 border-slate-700 text-slate-400'}`}>
+                {isStabilizing ? <Timer className="animate-pulse" size={18} /> : <Zap size={18} fill={lamp ? "currentColor" : "none"} />} 
+                {lamp ? 'LÁMPARA ON' : 'LÁMPARA OFF'}
               </button>
               <div className="bg-slate-800 px-5 py-3 rounded-xl flex items-center gap-2 border border-slate-700"><Thermometer size={18} className="text-emerald-400"/><span className="font-mono font-bold text-lg">{temp ? temp.toFixed(1) : '--'}°C</span></div>
             </div>
@@ -207,19 +240,33 @@ export default function App() {
         </div>
       </header>
 
+      {isStabilizing && (
+        <div className="mb-6 bg-blue-500/10 border border-blue-500/30 p-4 rounded-2xl overflow-hidden relative">
+            <div className="flex justify-between items-center mb-2">
+                <div className="flex items-center gap-2 text-blue-400 text-sm font-bold uppercase tracking-wider">
+                    <Timer size={16} className="animate-spin" /> Estabilizando radiación de cuerpo negro
+                </div>
+                <span className="text-xs font-mono text-blue-500">{Math.round(stabilizeProgress)}%</span>
+            </div>
+            <div className="h-1 bg-slate-800 rounded-full w-full">
+                <div className="h-full bg-blue-500 transition-all duration-300" style={{ width: `${stabilizeProgress}%` }} />
+            </div>
+        </div>
+      )}
+
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         <div className="lg:col-span-4 space-y-6">
           <div className="bg-slate-900/50 p-6 rounded-3xl border border-slate-800">
             <h3 className="text-xs font-black text-slate-500 uppercase tracking-widest mb-6">Secuencia de Calibración</h3>
             <div className="space-y-3">
-              <button disabled={status !== 'ready' || !lamp || isBusy} onClick={() => calibrate('dark')} className={`w-full p-4 rounded-xl border flex items-center justify-between ${darkRef ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-400' : 'bg-slate-800 text-slate-400'}`}><span>REF. OSCURA</span>{darkRef && <CheckCircle2 size={18} />}</button>
-              <button disabled={status !== 'ready' || !lamp || isBusy} onClick={() => calibrate('white')} className={`w-full p-4 rounded-xl border flex items-center justify-between ${whiteRef ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-400' : 'bg-slate-800 text-slate-400'}`}><span>REF. BLANCA</span>{whiteRef && <CheckCircle2 size={18} />}</button>
+              <button disabled={status !== 'ready' || isBusy || isStabilizing} onClick={() => calibrate('dark')} className={`w-full p-4 rounded-xl border flex items-center justify-between transition-all ${darkRef ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-400' : 'bg-slate-800 text-slate-400'}`}><span>REF. OSCURA (DARK)</span>{darkRef && <CheckCircle2 size={18} />}</button>
+              <button disabled={status !== 'ready' || !lamp || isBusy || isStabilizing} onClick={() => calibrate('white')} className={`w-full p-4 rounded-xl border flex items-center justify-between transition-all ${whiteRef ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-400' : 'bg-slate-800 text-slate-400'}`}><span>REF. BLANCA (WHITE)</span>{whiteRef && <CheckCircle2 size={18} />}</button>
             </div>
           </div>
-          <button disabled={!darkRef || !whiteRef || !lamp || isBusy} onClick={measure} className={`w-full py-8 rounded-3xl font-black text-xl uppercase flex items-center justify-center gap-3 ${(darkRef && whiteRef && lamp && !isBusy) ? 'bg-gradient-to-r from-blue-600 to-indigo-600 text-white' : 'bg-slate-800 text-slate-600'}`}>
+          <button disabled={!darkRef || !whiteRef || !lamp || isBusy || isStabilizing} onClick={measure} className={`w-full py-8 rounded-3xl font-black text-xl uppercase flex items-center justify-center gap-3 transition-all ${(darkRef && whiteRef && lamp && !isBusy && !isStabilizing) ? 'bg-gradient-to-r from-blue-600 to-indigo-600 text-white shadow-lg shadow-blue-900/20 cursor-pointer' : 'bg-slate-800 text-slate-600 cursor-not-allowed'}`}>
             {isBusy ? <RefreshCw className="animate-spin" size={28} /> : <Activity size={28} />} Analizar Muestra
           </button>
-           <div className={`bg-slate-900 p-8 rounded-3xl border text-center ${prediction !== "--" ? 'border-emerald-500/30' : 'border-slate-800'}`}>
+           <div className={`bg-slate-900 p-8 rounded-3xl border text-center transition-all ${prediction !== "--" ? 'border-emerald-500/30 bg-emerald-500/5' : 'border-slate-800'}`}>
                <span className="text-xs text-slate-500 font-bold uppercase block mb-2">Contenido de Proteína</span>
                <div className="flex items-baseline justify-center gap-1"><span className="text-7xl font-black text-white">{prediction}</span><span className="text-2xl text-slate-600 font-bold">%</span></div>
             </div>
@@ -227,30 +274,36 @@ export default function App() {
 
         <div className="lg:col-span-8 bg-slate-900/50 p-6 rounded-3xl border border-slate-800 flex flex-col min-h-[500px]">
           <div className="flex justify-between items-center mb-6 px-2">
-            <h3 className="text-xs font-black text-slate-500 uppercase tracking-widest"><BarChart3 size={14} className="inline mr-2" /> Espectro NIR</h3>
+            <h3 className="text-xs font-black text-slate-500 uppercase tracking-widest"><BarChart3 size={14} className="inline mr-2" /> Espectro NIR (128 canales)</h3>
             {aiAnalysis && <div className="bg-blue-500/10 px-4 py-2 rounded-xl border border-blue-500/20 text-[11px] text-blue-200">{aiAnalysis}</div>}
           </div>
           <div className="flex-1 w-full bg-slate-950/30 rounded-2xl border border-slate-800/50 p-4">
              <ResponsiveContainer width="100%" height="100%">
                 <AreaChart data={spectrum} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+                  <defs>
+                    <linearGradient id="colorAbs" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.8}/>
+                      <stop offset="95%" stopColor="#3b82f6" stopOpacity={0}/>
+                    </linearGradient>
+                  </defs>
                   <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} />
                   <XAxis dataKey="nm" stroke="#475569" fontSize={10} tickFormatter={v => `${v}nm`} />
-                  <YAxis stroke="#475569" fontSize={10} />
-                  <Tooltip contentStyle={{ background: '#0f172a', border: '1px solid #334155' }} />
-                  <Area type="monotone" dataKey="absorbance" stroke="#3b82f6" fillOpacity={0.4} fill="url(#colorAbs)" />
+                  <YAxis stroke="#475569" fontSize={10} domain={[0, 'auto']} />
+                  <Tooltip contentStyle={{ background: '#0f172a', border: '1px solid #334155', borderRadius: '8px' }} />
+                  <Area type="monotone" dataKey="absorbance" stroke="#3b82f6" strokeWidth={3} fillOpacity={1} fill="url(#colorAbs)" animationDuration={1000} />
                 </AreaChart>
             </ResponsiveContainer>
           </div>
         </div>
       </div>
 
-      <div className={`fixed bottom-0 left-0 right-0 bg-slate-950/95 border-t border-slate-800 transition-all ${showLogs ? 'h-80' : 'h-10'}`}>
+      <div className={`fixed bottom-0 left-0 right-0 bg-slate-950/95 border-t border-slate-800 transition-all z-50 ${showLogs ? 'h-80' : 'h-10'}`}>
         <div className="flex items-center justify-between px-4 h-10 bg-slate-900 cursor-pointer" onClick={() => setShowLogs(!showLogs)}>
-            <div className="flex items-center gap-2 text-xs font-mono text-slate-400"><Terminal size={14} /> <b>TERMINAL</b></div>
-            <button onClick={(e) => { e.stopPropagation(); setLogs([]); }} className="text-slate-500"><Trash2 size={14} /></button>
+            <div className="flex items-center gap-2 text-xs font-mono text-slate-400"><Terminal size={14} /> <b>DIAGNÓSTICO TERMINAL</b></div>
+            <button onClick={(e) => { e.stopPropagation(); setLogs([]); }} className="text-slate-500 hover:text-white transition-colors"><Trash2 size={14} /></button>
         </div>
         {showLogs && (
-            <div className="flex-1 overflow-y-auto p-4 font-mono text-xs space-y-1">
+            <div className="flex-1 overflow-y-auto p-4 font-mono text-xs space-y-1 bg-slate-950">
                 {logs.map((log, i) => (
                     <div key={i} className={`break-all ${log.includes('RX') ? 'text-emerald-400' : log.includes('TX') ? 'text-blue-400' : log.includes('Error') ? 'text-red-400' : 'text-slate-400'}`}>{log}</div>
                 ))}
