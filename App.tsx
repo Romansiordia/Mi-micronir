@@ -2,7 +2,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { 
   Usb, Activity, RefreshCw, Zap, AlertCircle, CheckCircle2, 
-  BarChart3, Settings2, ShieldCheck, Thermometer, Power, Bluetooth, XCircle, Terminal, Trash2
+  BarChart3, Settings2, ShieldCheck, Thermometer, Power, Bluetooth, XCircle, Terminal, Trash2, ShieldAlert
 } from 'lucide-react';
 import { 
   AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer
@@ -13,7 +13,6 @@ import { CDM_MODEL } from './constants';
 import { getAIInterpretation } from './services/geminiService';
 import { WavelengthPoint } from './types';
 
-// Interfaz unificada para usar cualquiera de los dos drivers
 interface IDeviceDriver {
   connect(): Promise<string>;
   disconnect(): Promise<void>;
@@ -21,6 +20,7 @@ interface IDeviceDriver {
   getTemperature(): Promise<number | null>;
   scan(): Promise<Uint16Array | null>;
   setLogger(fn: (msg: string) => void): void;
+  resetHardware?(): Promise<boolean>;
   isConnected: boolean;
 }
 
@@ -31,6 +31,7 @@ export default function App() {
   const [temp, setTemp] = useState<number | null>(null);
   const [lamp, setLamp] = useState(false);
   const [isBusy, setIsBusy] = useState(false);
+  const [compatibilityError, setCompatibilityError] = useState<string | null>(null);
   
   const [darkRef, setDarkRef] = useState<Uint16Array | null>(null);
   const [whiteRef, setWhiteRef] = useState<Uint16Array | null>(null);
@@ -38,373 +39,225 @@ export default function App() {
   const [prediction, setPrediction] = useState<string>("--");
   const [aiAnalysis, setAiAnalysis] = useState<string>("");
 
-  // Terminal de depuración
   const [logs, setLogs] = useState<string[]>([]);
   const [showLogs, setShowLogs] = useState(false);
   const logsEndRef = useRef<HTMLDivElement>(null);
 
-  // Selector del driver activo
   const activeDevice: IDeviceDriver = connectionType === 'usb' ? usbDevice : bleDevice;
 
-  const log = (msg: string) => setStatusMsg(msg);
-  
   const addLogEntry = (msg: string) => {
     const time = new Date().toLocaleTimeString().split(' ')[0];
-    setLogs(prev => [`[${time}] ${msg}`, ...prev.slice(0, 199)]); // Max 200 logs
+    setLogs(prev => [`[${time}] ${msg}`, ...prev.slice(0, 199)]);
   };
 
-  // Conectar el logger cuando cambia el dispositivo
+  useEffect(() => {
+    const isSecure = window.location.protocol === 'https:' || window.location.hostname === 'localhost';
+    if (!isSecure) {
+      setCompatibilityError("WebUSB/BLE requieren HTTPS. La aplicación no funcionará correctamente en HTTP.");
+    } else if (connectionType === 'usb' && !navigator.usb) {
+      setCompatibilityError("Tu navegador no soporta WebUSB. Usa Chrome o Edge.");
+    } else if (connectionType === 'ble' && !navigator.bluetooth) {
+      setCompatibilityError("Tu navegador no soporta Web Bluetooth.");
+    } else {
+      setCompatibilityError(null);
+    }
+  }, [connectionType]);
+
   useEffect(() => {
     activeDevice.setLogger(addLogEntry);
-    addLogEntry(`Sistema listo. Modo seleccionado: ${connectionType.toUpperCase()}`);
   }, [connectionType]);
 
   const connect = async () => {
     if (isBusy) return;
     setIsBusy(true);
     setStatus('connecting');
-    log(connectionType === 'usb' ? "Iniciando USB..." : "Buscando BLE...");
+    setStatusMsg("Conectando...");
     
     try {
       const res = await activeDevice.connect();
       if (res === "OK") {
-        log("Conectado. Obteniendo telemetría...");
-        
-        // Esperar un poco más en BLE para estabilizar conexión
-        if (connectionType === 'ble') await new Promise(r => setTimeout(r, 1000));
-
         const t = await activeDevice.getTemperature();
-        
-        if (t !== null) {
-          setTemp(t);
-          setStatus('ready');
-          log(`En línea (${connectionType.toUpperCase()}). Temp: ${t.toFixed(1)}°C`);
-        } else {
-          setStatus('error');
-          log("Conectado, pero sensor no responde datos.");
-          // No desconectar automáticamente para permitir debug o reintento manual
-        }
+        setTemp(t);
+        setStatus('ready');
+        setStatusMsg(`Sensor Online (${connectionType.toUpperCase()})`);
       } else {
         setStatus('error');
-        log(`Error Conexión: ${res}`);
+        setStatusMsg(res);
       }
-    } catch (e) {
+    } catch (e: any) {
       setStatus('error');
-      log("Excepción al conectar.");
+      setStatusMsg(e.message || "Fallo crítico");
     }
     setIsBusy(false);
   };
 
-  const disconnect = async () => {
-    try {
-        await activeDevice.disconnect();
-        setStatus('disconnected');
-        setTemp(null);
-        setLamp(false);
-        log("Desconectado correctamente.");
-    } catch(e) {
-        log("Error al desconectar.");
+  const hardReset = async () => {
+    if (activeDevice.resetHardware) {
+        addLogEntry("Ejecutando Hard Reset...");
+        await activeDevice.resetHardware();
+        setStatusMsg("Hardware Reseteado. Intenta conectar.");
     }
+  };
+
+  const disconnect = async () => {
+    await activeDevice.disconnect();
+    setStatus('disconnected');
+    setStatusMsg("Desconectado");
+    setTemp(null);
+    setLamp(false);
   };
 
   const toggleLamp = async () => {
     if (status !== 'ready' || isBusy) return;
     setIsBusy(true);
-    const newState = !lamp;
-    log(newState ? "Calentando lámpara..." : "Apagando lámpara...");
-    
-    const ok = await activeDevice.setLamp(newState);
-    if (ok) {
-      setLamp(newState);
-      log(newState ? "Lámpara ESTABLE" : "Lámpara OFF");
-    } else {
-      log("Error: Fallo al cambiar estado de lámpara");
-    }
+    const ok = await activeDevice.setLamp(!lamp);
+    if (ok) setLamp(!lamp);
     setIsBusy(false);
   };
 
   const calibrate = async (type: 'dark' | 'white') => {
     if (isBusy) return;
     setIsBusy(true);
-    log(`Capturando referencia ${type.toUpperCase()}...`);
-    
     const data = await activeDevice.scan();
     if (data) {
       if (type === 'dark') setDarkRef(data);
       else setWhiteRef(data);
-      log(`Referencia ${type} guardada OK.`);
-    } else {
-      log("Error de lectura (Timeout o datos corruptos)");
+      setStatusMsg(`Calibración ${type} OK`);
     }
     setIsBusy(false);
   };
 
   const measure = async () => {
-    if (!darkRef || !whiteRef || isBusy) {
-      log("Falta calibración o el dispositivo está ocupado");
-      return;
-    }
-    
+    if (isBusy) return;
     setIsBusy(true);
-    log("Midiendo muestra...");
     const raw = await activeDevice.scan();
-    
-    if (raw) {
+    if (raw && darkRef && whiteRef) {
       const plotData: WavelengthPoint[] = [];
       const absData: number[] = [];
-      
       for(let i=0; i<raw.length; i++) {
-        const d = darkRef[i];
-        const w = whiteRef[i];
-        const s = raw[i];
-        
-        const denominator = Math.max((w - d), 1.0);
-        let reflectance = (s - d) / denominator;
-        reflectance = Math.max(0.0001, Math.min(reflectance, 1.5));
-
-        const abs = -Math.log10(reflectance);
+        const refl = Math.max(0.0001, (raw[i] - darkRef[i]) / Math.max(whiteRef[i] - darkRef[i], 1));
+        const abs = -Math.log10(refl);
         absData.push(abs);
-        
-        const wl = 908 + (i * 6.25);
-        plotData.push({ nm: Math.round(wl), absorbance: abs });
+        plotData.push({ nm: Math.round(908 + i * 6.25), absorbance: abs });
       }
-
       setSpectrum(plotData);
-
       let score = CDM_MODEL.bias;
-      const limit = Math.min(absData.length, CDM_MODEL.betaCoefficients.length);
-      for(let i=0; i<limit; i++) {
+      for(let i=0; i<Math.min(absData.length, CDM_MODEL.betaCoefficients.length); i++) {
         score += absData[i] * CDM_MODEL.betaCoefficients[i];
       }
-      
-      const result = score.toFixed(2);
-      setPrediction(result);
-      log("Análisis completado.");
-
-      getAIInterpretation(plotData, result, lamp ? 'ok' : 'off').then(setAiAnalysis);
-    } else {
-      log("Error en escaneo de muestra.");
+      setPrediction(score.toFixed(2));
+      getAIInterpretation(plotData, score.toFixed(2), lamp ? 'ok' : 'off').then(setAiAnalysis);
     }
     setIsBusy(false);
   };
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-200 p-4 md:p-8 font-sans pb-32">
+      {compatibilityError && (
+        <div className="mb-6 bg-red-500/10 border border-red-500/50 p-4 rounded-xl flex items-center gap-3 text-red-400 animate-pulse">
+            <ShieldAlert size={20} />
+            <p className="text-sm font-bold">{compatibilityError}</p>
+        </div>
+      )}
+
       <header className="flex flex-col md:flex-row justify-between items-center mb-8 bg-slate-900/80 backdrop-blur p-6 rounded-2xl border border-slate-800 shadow-xl">
         <div className="mb-4 md:mb-0">
           <h1 className="text-2xl font-black text-white tracking-tight flex items-center gap-3">
             <ShieldCheck className="text-blue-500" />
             MicroNIR <span className="text-blue-400 bg-blue-500/10 px-2 rounded text-lg border border-blue-500/20">QUANTUM</span>
           </h1>
-          <p className="text-xs text-slate-500 font-mono mt-1 uppercase ml-1">v4.3.0 Debug • {connectionType === 'usb' ? 'FTDI Mode' : 'BLE Mode'}</p>
+          <p className="text-xs text-slate-500 font-mono mt-1 uppercase ml-1">v14.0 Protocol Tuning • {connectionType.toUpperCase()}</p>
         </div>
         
         <div className="flex flex-col md:flex-row gap-4 items-center">
           <div className="text-right mr-2 hidden md:block">
-            <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Sistema</p>
             <p className={`text-xs font-bold ${status==='ready' ? 'text-emerald-400' : status==='error' ? 'text-red-400' : 'text-amber-400'}`}>
               {statusMsg}
             </p>
           </div>
           
-          {/* Selector de Modo */}
           {status === 'disconnected' && (
             <div className="flex bg-slate-800 rounded-lg p-1 border border-slate-700">
-              <button 
-                onClick={() => setConnectionType('usb')}
-                className={`px-3 py-1 rounded text-xs font-bold flex items-center gap-1 transition-all ${connectionType === 'usb' ? 'bg-blue-600 text-white shadow' : 'text-slate-400 hover:text-white'}`}
-              >
-                <Usb size={12} /> USB
-              </button>
-              <button 
-                onClick={() => setConnectionType('ble')}
-                className={`px-3 py-1 rounded text-xs font-bold flex items-center gap-1 transition-all ${connectionType === 'ble' ? 'bg-indigo-600 text-white shadow' : 'text-slate-400 hover:text-white'}`}
-              >
-                <Bluetooth size={12} /> BLE
-              </button>
+              <button onClick={() => setConnectionType('usb')} className={`px-3 py-1 rounded text-xs font-bold transition-all ${connectionType === 'usb' ? 'bg-blue-600 text-white' : 'text-slate-400'}`}><Usb size={12} /></button>
+              <button onClick={() => setConnectionType('ble')} className={`px-3 py-1 rounded text-xs font-bold transition-all ${connectionType === 'ble' ? 'bg-indigo-600 text-white' : 'text-slate-400'}`}><Bluetooth size={12} /></button>
             </div>
           )}
           
           {status === 'disconnected' || status === 'error' ? (
              <div className="flex gap-2">
-                <button onClick={connect} disabled={isBusy} className={`bg-gradient-to-r ${connectionType === 'usb' ? 'from-blue-600 to-blue-500' : 'from-indigo-600 to-indigo-500'} hover:opacity-90 disabled:opacity-50 text-white px-6 py-3 rounded-xl font-bold flex items-center gap-2 transition-all shadow-lg`}>
-                {isBusy ? <RefreshCw className="animate-spin" size={20}/> : (connectionType === 'usb' ? <Usb size={20} /> : <Bluetooth size={20} />)} 
-                {status === 'error' ? 'REINTENTAR' : 'CONECTAR'}
+                <button onClick={connect} disabled={isBusy} className="bg-blue-600 hover:bg-blue-500 text-white px-6 py-3 rounded-xl font-bold flex items-center gap-2">
+                    {isBusy ? <RefreshCw className="animate-spin" size={20}/> : <Power size={20} />} 
+                    {status === 'error' ? 'REINTENTAR' : 'CONECTAR'}
                 </button>
-                {/* Botón de pánico para limpiar estado BLE */}
-                {status === 'error' && connectionType === 'ble' && (
-                    <button onClick={disconnect} className="bg-red-900/50 border border-red-800 text-red-200 px-3 py-3 rounded-xl hover:bg-red-900 transition-colors" title="Forzar Reinicio Driver">
-                        <XCircle size={20} />
+                {status === 'error' && (
+                    <button onClick={hardReset} className="bg-slate-800 text-slate-400 px-3 py-3 rounded-xl hover:bg-slate-700" title="Hard Reset Sensor">
+                        <Trash2 size={20} />
                     </button>
                 )}
             </div>
           ) : (
             <div className="flex gap-3">
-               <button onClick={disconnect} className="bg-slate-800 border border-slate-700 text-slate-400 px-3 py-3 rounded-xl hover:bg-red-900/30 hover:text-red-300 hover:border-red-800 transition-all" title="Desconectar">
-                  <Power size={18} />
-               </button>
-              <button 
-                onClick={toggleLamp} 
-                disabled={isBusy}
-                className={`px-5 py-3 rounded-xl font-bold border flex items-center gap-2 transition-all ${lamp ? 'bg-orange-500 text-white border-orange-400 shadow-lg shadow-orange-900/20' : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-white'}`}
-              >
-                <Zap size={18} fill={lamp ? "currentColor" : "none"} />
-                {lamp ? 'LÁMPARA ON' : 'LÁMPARA OFF'}
+               <button onClick={disconnect} className="bg-slate-800 text-slate-400 px-3 py-3 rounded-xl hover:bg-red-900/30 transition-all"><Power size={18} /></button>
+              <button onClick={toggleLamp} disabled={isBusy} className={`px-5 py-3 rounded-xl font-bold border flex items-center gap-2 ${lamp ? 'bg-orange-500 text-white border-orange-400' : 'bg-slate-800 border-slate-700 text-slate-400'}`}>
+                <Zap size={18} fill={lamp ? "currentColor" : "none"} /> {lamp ? 'LÁMPARA ON' : 'LÁMPARA OFF'}
               </button>
-              
-              <div className="bg-slate-800 px-5 py-3 rounded-xl flex items-center gap-2 border border-slate-700 shadow-inner">
-                <Thermometer size={18} className="text-emerald-400"/>
-                <span className="font-mono font-bold text-lg">{temp ? temp.toFixed(1) : '--'}°C</span>
-              </div>
+              <div className="bg-slate-800 px-5 py-3 rounded-xl flex items-center gap-2 border border-slate-700"><Thermometer size={18} className="text-emerald-400"/><span className="font-mono font-bold text-lg">{temp ? temp.toFixed(1) : '--'}°C</span></div>
             </div>
           )}
         </div>
       </header>
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-        {/* Panel de Control */}
         <div className="lg:col-span-4 space-y-6">
-          {/* Calibración */}
-          <div className="bg-slate-900/50 p-6 rounded-3xl border border-slate-800 relative overflow-hidden group">
-            <div className="absolute top-0 right-0 p-4 opacity-10 group-hover:opacity-20 transition-opacity">
-              <Settings2 size={100} />
-            </div>
-            <h3 className="text-xs font-black text-slate-500 uppercase tracking-widest mb-6 flex gap-2 items-center relative z-10">
-              <Settings2 size={14} /> Secuencia de Calibración
-            </h3>
-            
-            <div className="space-y-3 relative z-10">
-              <button 
-                disabled={status !== 'ready' || !lamp || isBusy}
-                onClick={() => calibrate('dark')}
-                className={`w-full p-4 rounded-xl border flex items-center justify-between transition-all ${darkRef ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-400' : 'bg-slate-800 border-white/5 hover:border-blue-500/30 text-slate-400'}`}
-              >
-                <div className="flex items-center gap-3">
-                  <div className="w-3 h-3 rounded-full bg-slate-950 border border-slate-700"></div>
-                  <span className="font-bold text-sm">REFERENCIA OSCURA</span>
-                </div>
-                {darkRef ? <CheckCircle2 size={18} /> : <span className="text-[10px] opacity-50">REQUERIDO</span>}
-              </button>
-
-              <button 
-                disabled={status !== 'ready' || !lamp || isBusy}
-                onClick={() => calibrate('white')}
-                className={`w-full p-4 rounded-xl border flex items-center justify-between transition-all ${whiteRef ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-400' : 'bg-slate-800 border-white/5 hover:border-blue-500/30 text-slate-400'}`}
-              >
-                <div className="flex items-center gap-3">
-                  <div className="w-3 h-3 rounded-full bg-white border border-slate-200"></div>
-                  <span className="font-bold text-sm">REFERENCIA BLANCA</span>
-                </div>
-                {whiteRef ? <CheckCircle2 size={18} /> : <span className="text-[10px] opacity-50">REQUERIDO</span>}
-              </button>
+          <div className="bg-slate-900/50 p-6 rounded-3xl border border-slate-800">
+            <h3 className="text-xs font-black text-slate-500 uppercase tracking-widest mb-6">Secuencia de Calibración</h3>
+            <div className="space-y-3">
+              <button disabled={status !== 'ready' || !lamp || isBusy} onClick={() => calibrate('dark')} className={`w-full p-4 rounded-xl border flex items-center justify-between ${darkRef ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-400' : 'bg-slate-800 text-slate-400'}`}><span>REF. OSCURA</span>{darkRef && <CheckCircle2 size={18} />}</button>
+              <button disabled={status !== 'ready' || !lamp || isBusy} onClick={() => calibrate('white')} className={`w-full p-4 rounded-xl border flex items-center justify-between ${whiteRef ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-400' : 'bg-slate-800 text-slate-400'}`}><span>REF. BLANCA</span>{whiteRef && <CheckCircle2 size={18} />}</button>
             </div>
           </div>
-
-          {/* Botón Principal */}
-          <button 
-            disabled={!darkRef || !whiteRef || !lamp || isBusy}
-            onClick={measure}
-            className={`w-full py-8 rounded-3xl font-black text-xl uppercase tracking-wider shadow-2xl transition-all flex items-center justify-center gap-3 relative overflow-hidden
-              ${(darkRef && whiteRef && lamp && !isBusy) 
-                ? 'bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white shadow-blue-900/30 transform hover:scale-[1.02]' 
-                : 'bg-slate-800 text-slate-600 cursor-not-allowed border border-slate-700 grayscale opacity-70'}`}
-          >
-            {isBusy ? <RefreshCw className="animate-spin" size={28} /> : <Activity size={28} />}
-            {isBusy ? 'Procesando...' : 'Analizar Muestra'}
+          <button disabled={!darkRef || !whiteRef || !lamp || isBusy} onClick={measure} className={`w-full py-8 rounded-3xl font-black text-xl uppercase flex items-center justify-center gap-3 ${(darkRef && whiteRef && lamp && !isBusy) ? 'bg-gradient-to-r from-blue-600 to-indigo-600 text-white' : 'bg-slate-800 text-slate-600'}`}>
+            {isBusy ? <RefreshCw className="animate-spin" size={28} /> : <Activity size={28} />} Analizar Muestra
           </button>
-
-           {/* Resultado */}
-           <div className={`bg-slate-900 p-8 rounded-3xl border text-center transition-all duration-500 ${prediction !== "--" ? 'border-emerald-500/30 bg-emerald-900/10' : 'border-slate-800'}`}>
-               <span className="text-xs text-slate-500 font-bold uppercase tracking-widest block mb-2">Contenido de Proteína</span>
-               <div className="flex items-baseline justify-center gap-1">
-                 <span className={`text-7xl font-black tracking-tighter ${prediction !== "--" ? 'text-white' : 'text-slate-700'}`}>{prediction}</span>
-                 <span className="text-2xl text-slate-600 font-bold">%</span>
-               </div>
-               {prediction !== "--" && <div className="mt-4 text-[10px] text-emerald-500 font-bold uppercase tracking-widest bg-emerald-500/10 inline-block px-3 py-1 rounded-full">Análisis Completado</div>}
+           <div className={`bg-slate-900 p-8 rounded-3xl border text-center ${prediction !== "--" ? 'border-emerald-500/30' : 'border-slate-800'}`}>
+               <span className="text-xs text-slate-500 font-bold uppercase block mb-2">Contenido de Proteína</span>
+               <div className="flex items-baseline justify-center gap-1"><span className="text-7xl font-black text-white">{prediction}</span><span className="text-2xl text-slate-600 font-bold">%</span></div>
             </div>
         </div>
 
-        {/* Gráfico */}
         <div className="lg:col-span-8 bg-slate-900/50 p-6 rounded-3xl border border-slate-800 flex flex-col min-h-[500px]">
           <div className="flex justify-between items-center mb-6 px-2">
-            <h3 className="text-xs font-black text-slate-500 uppercase tracking-widest flex gap-2 items-center">
-              <BarChart3 size={14} /> Espectro de Absorbancia (NIR)
-            </h3>
-            {aiAnalysis && (
-              <div className="bg-blue-500/10 px-4 py-2 rounded-xl border border-blue-500/20 flex items-center gap-3 max-w-md">
-                 <div className="bg-blue-500 rounded-full p-1"><Zap size={10} className="text-white" /></div>
-                 <span className="text-[11px] text-blue-200 font-medium leading-tight">{aiAnalysis}</span>
-              </div>
-            )}
+            <h3 className="text-xs font-black text-slate-500 uppercase tracking-widest"><BarChart3 size={14} className="inline mr-2" /> Espectro NIR</h3>
+            {aiAnalysis && <div className="bg-blue-500/10 px-4 py-2 rounded-xl border border-blue-500/20 text-[11px] text-blue-200">{aiAnalysis}</div>}
           </div>
-          
-          <div className="flex-1 w-full bg-slate-950/30 rounded-2xl border border-slate-800/50 p-4 relative">
+          <div className="flex-1 w-full bg-slate-950/30 rounded-2xl border border-slate-800/50 p-4">
              <ResponsiveContainer width="100%" height="100%">
                 <AreaChart data={spectrum} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
-                  <defs>
-                    <linearGradient id="colorAbs" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor={connectionType==='usb' ? "#3b82f6" : "#6366f1"} stopOpacity={0.4}/>
-                      <stop offset="95%" stopColor={connectionType==='usb' ? "#3b82f6" : "#6366f1"} stopOpacity={0}/>
-                    </linearGradient>
-                  </defs>
                   <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} />
-                  <XAxis dataKey="nm" stroke="#475569" fontSize={10} tickLine={false} axisLine={false} tickFormatter={v => `${v} nm`} />
-                  <YAxis stroke="#475569" fontSize={10} tickLine={false} axisLine={false} domain={[0, 'auto']} />
-                  <Tooltip 
-                    contentStyle={{ background: 'rgba(15, 23, 42, 0.9)', border: '1px solid #334155', borderRadius: '12px', boxShadow: '0 10px 15px -3px rgba(0, 0, 0, 0.5)' }}
-                    itemStyle={{ color: '#60a5fa' }}
-                    labelStyle={{ color: '#94a3b8', fontSize: '10px', marginBottom: '4px', textTransform: 'uppercase', letterSpacing: '1px' }}
-                  />
-                  <Area type="monotone" dataKey="absorbance" stroke={connectionType==='usb' ? "#3b82f6" : "#6366f1"} strokeWidth={3} fill="url(#colorAbs)" animationDuration={1500} />
+                  <XAxis dataKey="nm" stroke="#475569" fontSize={10} tickFormatter={v => `${v}nm`} />
+                  <YAxis stroke="#475569" fontSize={10} />
+                  <Tooltip contentStyle={{ background: '#0f172a', border: '1px solid #334155' }} />
+                  <Area type="monotone" dataKey="absorbance" stroke="#3b82f6" fillOpacity={0.4} fill="url(#colorAbs)" />
                 </AreaChart>
-              </ResponsiveContainer>
-              
-              {spectrum.length === 0 && (
-                <div className="absolute inset-0 flex flex-col items-center justify-center text-slate-700 pointer-events-none">
-                  <Activity size={48} className="mb-4 opacity-20" />
-                  <p className="text-sm font-bold uppercase tracking-widest opacity-40">Esperando adquisición de datos</p>
-                </div>
-              )}
+            </ResponsiveContainer>
           </div>
         </div>
       </div>
 
-      {/* TERMINAL DE DEPURACIÓN (FLOTANTE / EXPANDIBLE) */}
-      <div className={`fixed bottom-0 left-0 right-0 bg-slate-950/95 border-t border-slate-800 transition-all duration-300 z-50 flex flex-col ${showLogs ? 'h-80' : 'h-10'}`}>
-        <div 
-            className="flex items-center justify-between px-4 h-10 bg-slate-900 cursor-pointer hover:bg-slate-800 transition-colors"
-            onClick={() => setShowLogs(!showLogs)}
-        >
-            <div className="flex items-center gap-2 text-xs font-mono text-slate-400">
-                <Terminal size={14} />
-                <span className="font-bold">TERMINAL DE COMUNICACIÓN</span>
-                <span className="bg-slate-800 px-2 rounded text-[10px]">{logs.length} Eventos</span>
-            </div>
-            <div className="flex items-center gap-3">
-                <button 
-                    onClick={(e) => { e.stopPropagation(); setLogs([]); }}
-                    className="p-1 hover:text-red-400 text-slate-500 transition-colors"
-                    title="Limpiar Logs"
-                >
-                    <Trash2 size={14} />
-                </button>
-                <span className="text-[10px] text-slate-600">{showLogs ? '▼ Ocultar' : '▲ Mostrar'}</span>
-            </div>
+      <div className={`fixed bottom-0 left-0 right-0 bg-slate-950/95 border-t border-slate-800 transition-all ${showLogs ? 'h-80' : 'h-10'}`}>
+        <div className="flex items-center justify-between px-4 h-10 bg-slate-900 cursor-pointer" onClick={() => setShowLogs(!showLogs)}>
+            <div className="flex items-center gap-2 text-xs font-mono text-slate-400"><Terminal size={14} /> <b>TERMINAL</b></div>
+            <button onClick={(e) => { e.stopPropagation(); setLogs([]); }} className="text-slate-500"><Trash2 size={14} /></button>
         </div>
-        
         {showLogs && (
             <div className="flex-1 overflow-y-auto p-4 font-mono text-xs space-y-1">
-                {logs.length === 0 && <p className="text-slate-600 italic">Esperando eventos de comunicación...</p>}
                 {logs.map((log, i) => (
-                    <div key={i} className={`break-all ${log.includes('RX') ? 'text-emerald-400' : log.includes('TX') ? 'text-blue-400' : log.includes('Error') || log.includes('NAK') ? 'text-red-400' : 'text-slate-400'}`}>
-                        {log}
-                    </div>
+                    <div key={i} className={`break-all ${log.includes('RX') ? 'text-emerald-400' : log.includes('TX') ? 'text-blue-400' : log.includes('Error') ? 'text-red-400' : 'text-slate-400'}`}>{log}</div>
                 ))}
                 <div ref={logsEndRef} />
             </div>
         )}
       </div>
-
     </div>
   );
 }

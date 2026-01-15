@@ -1,7 +1,13 @@
-
 import { USB_CONFIG } from "../constants";
 
-// Comandos del Protocolo MicroNIR
+declare global {
+  interface Navigator {
+    usb: {
+      requestDevice(options: { filters: { vendorId: number }[] }): Promise<any>;
+    };
+  }
+}
+
 const CMD = {
   LAMP_CONTROL: 0x01,
   SET_INTEGRATION: 0x02,
@@ -11,7 +17,6 @@ const CMD = {
   RESET: 0x0F
 };
 
-// Tabla CRC8
 const CRC8_TABLE = new Uint8Array([
   0x00, 0x5e, 0xbc, 0xe2, 0x61, 0x3f, 0xdd, 0x83, 0xc2, 0x9c, 0x7e, 0x20, 0xa3, 0xfd, 0x1f, 0x41,
   0x9d, 0xc3, 0x21, 0x7f, 0xfc, 0xa2, 0x40, 0x1e, 0x5f, 0x01, 0xe3, 0xbd, 0x3e, 0x60, 0x82, 0xdc,
@@ -63,10 +68,8 @@ export class MicroNIRDriver {
     return new Promise(r => setTimeout(r, ms));
   }
 
-  // Enviar comando de control al chip FTDI (Vendor Request)
   private async ctrl(req: number, val: number, idx: number) {
     if (!this.device) return;
-    this.log(`FTDI CTRL Req:${req.toString(16)} Val:${val.toString(16)}`);
     return this.device.controlTransferOut({
       requestType: 'vendor', recipient: 'device', request: req, value: val, index: idx
     });
@@ -74,12 +77,12 @@ export class MicroNIRDriver {
 
   async connect(): Promise<string> {
     try {
-      this.log("Solicitando dispositivo...");
-      this.device = await (navigator as any).usb.requestDevice({
+      if (!navigator.usb) return "Navegador incompatible (requiere Chrome/Edge)";
+
+      this.device = await navigator.usb.requestDevice({
         filters: [{ vendorId: USB_CONFIG.vendorId }]
       });
 
-      this.log(`Dispositivo seleccionado: ${this.device.productName}`);
       await this.device.open();
       if (this.device.configuration === null) await this.device.selectConfiguration(1);
       
@@ -89,70 +92,90 @@ export class MicroNIRDriver {
       const epIn = alt.endpoints.find((e: any) => e.direction === 'in');
       const epOut = alt.endpoints.find((e: any) => e.direction === 'out');
 
-      this.inEndpoint = epIn ? epIn.endpointNumber : 2;
-      this.outEndpoint = epOut ? epOut.endpointNumber : 1;
+      this.inEndpoint = epIn?.endpointNumber || 2;
+      this.outEndpoint = epOut?.endpointNumber || 1;
       
-      this.log(`Endpoints: IN=${this.inEndpoint}, OUT=${this.outEndpoint}`);
+      try { await this.device.claimInterface(intf.interfaceNumber); } catch(e) {}
 
-      try { await this.device.claimInterface(intf.interfaceNumber); } 
-      catch(e) { this.log("Interface ya reclamada o ocupada"); }
-
-      // --- CONFIGURACIÓN FTDI ---
-      this.log("Configurando FTDI Serial (115200 8N1)...");
-      await this.ctrl(0x00, 0x00, 0x00); // Reset
-      await this.ctrl(0x03, 0x401A, 0x00); // Baud 115200
+      // FTDI Init
+      await this.ctrl(0x00, 0x00, 0x00);
+      await this.ctrl(0x03, 0x401A, 0x00); // 115200
       await this.ctrl(0x04, 0x0008, 0x00); // 8N1
-      await this.ctrl(0x09, 0x0010, 0x00); // Latency 16ms
-      await this.ctrl(0x02, 0x0000, 0x00); // Flow Ctrl Off
-      await this.ctrl(0x01, 0x0303, 0x00); // DTR/RTS High
+      await this.ctrl(0x01, 0x0303, 0x00);
 
       this.isConnected = true;
-      
       await this.sleep(200);
       await this.flushRx();
-      
-      // --- V13: BIG ENDIAN CONFIGURATION ATTEMPT ---
-      // Persistent "Invalid Length" errors suggest the byte order might be wrong.
-      // Trying Big Endian with the 16-byte payload structure.
-      const scanCount = 500;
-      const integrationTime = 12500;
 
-      const payload = [
-          // Scans Count (Big Endian)
-          (scanCount >> 24) & 0xFF, (scanCount >> 16) & 0xFF, (scanCount >> 8) & 0xFF, scanCount & 0xFF,
-          // Integration Time (Big Endian)
-          (integrationTime >> 24) & 0xFF, (integrationTime >> 16) & 0xFF, (integrationTime >> 8) & 0xFF, integrationTime & 0xFF,
-          // Padding (8 Bytes to reach 16 bytes struct)
-          0, 0, 0, 0, 0, 0, 0, 0
-      ];
+      this.log("Iniciando negociación de protocolo...");
+      const success = await this.autoConfig();
       
-      this.log(`Enviando Init V13 (BE 16 Bytes): [${payload.join(',')}]`);
-      // Aún no validamos la respuesta, pero la enviamos. El siguiente comando fallará si esta no funciona.
-      await this.send(CMD.SET_INTEGRATION, payload);
-      
+      if (!success) {
+        return "El sensor rechazó todas las configuraciones conocidas.";
+      }
+
       return "OK";
     } catch (error: any) {
       this.isConnected = false;
-      this.log(`Error Critico: ${error.message}`);
-      console.error(error);
-      return error.message || "Error USB Desconocido";
+      return error.message || "Error USB";
     }
+  }
+
+  private async autoConfig(): Promise<boolean> {
+    const scanCount = 500;
+    const integrationTime = 12500;
+
+    const formats = [
+      { size: 8, be: false }, { size: 8, be: true },
+      { size: 12, be: false }, { size: 12, be: true },
+      { size: 16, be: false }, { size: 16, be: true }
+    ];
+
+    for (const fmt of formats) {
+      this.log(`Probando formato: ${fmt.size} bytes, ${fmt.be ? 'BigEndian' : 'LittleEndian'}`);
+      const payload = this.buildPayload(scanCount, integrationTime, fmt.size, fmt.be);
+      
+      if (await this.send(CMD.SET_INTEGRATION, payload)) {
+        await this.sleep(100);
+        const resp = await this.readPacket(500);
+        if (resp && resp.length >= 3) {
+          if (resp[2] === 0x15) { // NAK
+            this.log(`Formato rechazado por el sensor (Error 0x${resp[3].toString(16)})`);
+          } else {
+            this.log(`¡Conectado! Formato aceptado: ${fmt.size} bytes.`);
+            return true;
+          }
+        }
+      }
+      await this.sleep(50);
+    }
+    return false;
+  }
+
+  private buildPayload(scans: number, time: number, size: number, be: boolean): number[] {
+    const buffer = new ArrayBuffer(size);
+    const view = new DataView(buffer);
+    if (size >= 8) {
+      view.setUint32(0, scans, !be);
+      view.setUint32(4, time, !be);
+    }
+    // Padding para 12 y 16 bytes
+    return Array.from(new Uint8Array(buffer));
+  }
+
+  async resetHardware(): Promise<boolean> {
+      this.log("Enviando comando de RESET (0x0F)...");
+      return await this.send(CMD.RESET);
   }
 
   async disconnect() {
-    if (this.device && this.device.opened) {
-      try { await this.setLamp(false); } catch(e) {}
-      await this.device.close();
-    }
+    if (this.device?.opened) await this.device.close();
     this.isConnected = false;
-    this.log("Desconectado.");
   }
 
   private async flushRx() {
-    if (!this.isConnected) return;
     try {
-      this.log("Limpiando buffer RX...");
-      for(let i=0; i<5; i++) {
+      for(let i=0; i<3; i++) {
         const res = await this.device.transferIn(this.inEndpoint, 64);
         if (!res.data || res.data.byteLength <= 2) break;
       }
@@ -161,115 +184,48 @@ export class MicroNIRDriver {
 
   async send(opcode: number, data: number[] = []): Promise<boolean> {
     if (!this.isConnected) return false;
-
-    await this.flushRx();
-
     const len = data.length + 1;
     const rawPayload = new Uint8Array([len, opcode, ...data]);
-    const crc = calculateCrc8(rawPayload);
-
-    const packet = new Uint8Array([0x02, ...rawPayload, crc, 0x03]);
-    
+    const packet = new Uint8Array([0x02, ...rawPayload, calculateCrc8(rawPayload), 0x03]);
     this.log(`TX >>> ${toHex(packet)}`);
-
     try {
       const res = await this.device.transferOut(this.outEndpoint, packet);
       return res.status === 'ok';
     } catch (e) {
-      this.log(`TX Falló: ${e}`);
       return false;
     }
   }
 
   async getTemperature(): Promise<number | null> {
-    for(let attempt=0; attempt<3; attempt++) {
-      if (await this.send(CMD.GET_TEMP)) {
-        await this.sleep(50);
-        const resp = await this.readPacket(500);
-        
-        if (resp && resp.length >= 5) {
-           // Buscar respuesta válida
-           for(let i=0; i<resp.length-2; i++) {
-             // 0x06 es el Opcode de GET_TEMP Response (echo del comando o específico)
-             // Ajustar lógica según logs
-             if (resp[i] === 0x06) {
-               const view = new DataView(resp.buffer);
-               if (i + 2 < resp.length) {
-                 const rawTemp = view.getUint16(i+1, false); 
-                 return rawTemp / 1000.0;
-               }
-             }
-           }
-        }
+    if (await this.send(CMD.GET_TEMP)) {
+      const resp = await this.readPacket(500);
+      if (resp && resp.length >= 5 && resp[2] === 0x06) {
+        return new DataView(resp.buffer).getUint16(3, false) / 1000.0;
       }
-      await this.sleep(100);
     }
     return null;
   }
 
   async setLamp(on: boolean): Promise<boolean> {
     const ok = await this.send(CMD.LAMP_CONTROL, [on ? 1 : 0]);
-    if (ok) await this.sleep(on ? 1500 : 200); 
+    if (ok) await this.sleep(on ? 1000 : 100); 
     return ok;
   }
 
   async scan(): Promise<Uint16Array | null> {
-    this.log("Iniciando SCAN...");
     if (!await this.send(CMD.SCAN)) return null;
-
-    await this.sleep(100); 
-
     const raw = await this.readPacket(3000);
-    if (!raw) {
-        this.log("SCAN Timeout: No se recibieron datos");
-        return null;
-    }
-
-    this.log(`SCAN RX Total Bytes: ${raw.length}`);
-    let spectrum: Uint16Array | null = null;
-
-    for(let i=0; i < raw.length - 10; i++) {
-      if (raw[i] === 0x02) { 
-        // Formato Corto: [02, LEN, 05, DATA...]
-        if (raw[i+2] === 0x05) {
-          const len = raw[i+1] - 1;
-          const dataStart = i + 3;
-          if (dataStart + len <= raw.length) {
-             spectrum = this.parseSpectrum(raw, dataStart, len/2);
-             break;
-          }
-        }
-        // Formato Largo: [02, HI, LO, 05, DATA...]
-        else if (raw[i+3] === 0x05) {
-          const len = (raw[i+1] << 8 | raw[i+2]) - 1;
-          const dataStart = i + 4;
-          if (dataStart + len <= raw.length) {
-             spectrum = this.parseSpectrum(raw, dataStart, len/2);
-             break;
-          }
-        }
-      }
-    }
-
-    if (!spectrum && raw.length >= 256) {
-       this.log("SCAN Fallback (Raw size match)");
-       spectrum = this.parseSpectrum(raw, 0, 128);
-    }
-
-    return spectrum;
+    if (!raw) return null;
+    return this.parseSpectrum(raw);
   }
 
-  private parseSpectrum(buffer: Uint8Array, offset: number, pixels: number): Uint16Array {
-    const bytesAvailable = buffer.length - offset;
-    const pixelsPossible = Math.floor(bytesAvailable / 2);
-    const targetPixels = (pixelsPossible >= 128) ? 128 : pixels;
-
-    const s = new Uint16Array(targetPixels);
+  private parseSpectrum(buffer: Uint8Array): Uint16Array {
+    let offset = 3; // Default short format [02, LEN, 05, DATA...]
+    if (buffer[3] === 0x05) offset = 4; // Extended format [02, HI, LO, 05, DATA...]
+    const s = new Uint16Array(128);
     const view = new DataView(buffer.buffer);
-    for(let j=0; j<targetPixels; j++) {
-      if (offset + (j*2) + 1 < buffer.length) {
-        s[j] = view.getUint16(offset + (j*2), false);
-      }
+    for(let j=0; j<128; j++) {
+      if (offset + (j*2) + 1 < buffer.length) s[j] = view.getUint16(offset + (j*2), false);
     }
     return s;
   }
@@ -277,30 +233,17 @@ export class MicroNIRDriver {
   private async readPacket(timeoutMs: number): Promise<Uint8Array | null> {
     const startTime = Date.now();
     let acc = new Uint8Array(0);
-
     while ((Date.now() - startTime) < timeoutMs) {
       try {
         const res = await this.device.transferIn(this.inEndpoint, 64);
-        
         if (res.status === 'ok' && res.data.byteLength > 2) {
-          const chunk = new Uint8Array(res.data.buffer.slice(2)); // Remover FTDI header (2 bytes status)
-          
-          if (chunk.length > 0) {
-             this.log(`RX Chunk (No Header) <<< ${toHex(chunk)}`);
-             const next = new Uint8Array(acc.length + chunk.length);
-             next.set(acc);
-             next.set(chunk, acc.length);
-             acc = next;
-
-             if (acc.length > 5 && acc[acc.length-1] === 0x03) {
-                if (acc.length >= 256) return acc;
-                if (acc.length < 50) return acc;
-             }
-          }
+          const chunk = new Uint8Array(res.data.buffer.slice(2)); 
+          const next = new Uint8Array(acc.length + chunk.length);
+          next.set(acc); next.set(chunk, acc.length);
+          acc = next;
+          if (acc.length > 3 && acc[acc.length-1] === 0x03) return acc;
         }
-      } catch (e) {
-        await this.sleep(10);
-      }
+      } catch (e) { await this.sleep(20); }
     }
     return acc.length > 0 ? acc : null;
   }
