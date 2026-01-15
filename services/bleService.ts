@@ -114,7 +114,7 @@ export class MicroNIRBLEDriver {
       
       // PAUSA CRITICA: Esperar a que el hardware estabilice voltaje tras conexión
       this.log("Estabilizando enlace...");
-      await this.sleep(1500); 
+      await this.sleep(2000); 
 
       const service = await this.server.getPrimaryService(BLE_CONFIG.serviceUUID);
 
@@ -143,31 +143,40 @@ export class MicroNIRBLEDriver {
   private async softStartSensor() {
     this.isBusy = true;
     
-    // Paso 1: Preguntar estado primero (comando ligero)
-    this.log("Check Estado (Ping)...");
-    await this.send(CMD.GET_INFO, [], true);
-    await this.sleep(500);
+    // Paso 1: Secuencia Wake-Up Progresiva
+    // Enviamos comandos inofensivos para que el procesador despierte sin carga
+    this.log("Despertando MCU...");
+    for(let k=0; k<3; k++) {
+        await this.send(CMD.GET_TEMP, [], true); // Ping
+        await this.sleep(300);
+    }
+    this.log("Sensor Online (WakeUp OK).");
 
-    // Paso 2: Configuración de bajo consumo para empezar
-    // Reducimos scanCount para no estresar la batería en el arranque
+    // Paso 2: Configuración SIN PADDING
+    // IMPORTANTE: Quitamos los ceros del final. El paquete ahora pesa 13 bytes en total.
+    // Esto previene el desbordamiento del buffer BLE (MTU 20 bytes).
     const scanCount = 100; 
     const integrationTime = 10000; 
 
     const payload = [
         (scanCount >> 24) & 0xFF, (scanCount >> 16) & 0xFF, (scanCount >> 8) & 0xFF, scanCount & 0xFF,
-        (integrationTime >> 24) & 0xFF, (integrationTime >> 16) & 0xFF, (integrationTime >> 8) & 0xFF, integrationTime & 0xFF,
-        0, 0, 0, 0, 0, 0, 0, 0 
+        (integrationTime >> 24) & 0xFF, (integrationTime >> 16) & 0xFF, (integrationTime >> 8) & 0xFF, integrationTime & 0xFF
+        // Padding ELIMINADO intencionalmente
     ];
 
-    this.log("Enviando Config Inicial (Low Power)...");
+    this.log("Enviando Config (Safe Mode)...");
+    
+    let configured = false;
     // Intentamos hasta 3 veces si falla
     for(let i=0; i<3; i++) {
-        const ok = await this.send(CMD.SET_CONFIG, payload, true);
-        if(ok) break;
-        this.log("Reintento Config...");
-        await this.sleep(500);
+        configured = await this.send(CMD.SET_CONFIG, payload, true);
+        if(configured) break;
+        this.log("Reintento Configuración...");
+        await this.sleep(600);
     }
     
+    if (!configured) throw new Error("Fallo en configuración inicial (Reject)");
+
     await this.sleep(500);
     this.isBusy = false;
   }
@@ -249,6 +258,8 @@ export class MicroNIRBLEDriver {
         this.pendingResponse = true;
     }
 
+    // Packet Structure: STX (1) + LEN (1) + OP (1) + DATA (N) + CRC (1) + ETX (1)
+    // Total Size = 5 + N
     const rawPayload = new Uint8Array([data.length + 1, opcode, ...data]);
     const crc = calculateCrc8(rawPayload);
     const packet = new Uint8Array([0x02, ...rawPayload, crc, 0x03]);
