@@ -1,3 +1,4 @@
+
 import { USB_CONFIG } from "../constants";
 
 declare global {
@@ -70,15 +71,20 @@ export class MicroNIRDriver {
 
   private async ctrl(req: number, val: number, idx: number) {
     if (!this.device) return;
-    return this.device.controlTransferOut({
-      requestType: 'vendor', recipient: 'device', request: req, value: val, index: idx
-    });
+    try {
+        await this.device.controlTransferOut({
+            requestType: 'vendor', recipient: 'device', request: req, value: val, index: idx
+        });
+    } catch(e) {
+        this.log(`Warning Control USB: ${e}`);
+    }
   }
 
   async connect(): Promise<string> {
     try {
-      if (!navigator.usb) return "Navegador incompatible (requiere Chrome/Edge)";
+      if (!navigator.usb) return "Requiere Chrome en PC/Android";
 
+      // Filtro genérico para FTDI (Vendor 0x0403)
       this.device = await navigator.usb.requestDevice({
         filters: [{ vendorId: USB_CONFIG.vendorId }]
       });
@@ -87,80 +93,69 @@ export class MicroNIRDriver {
       if (this.device.configuration === null) await this.device.selectConfiguration(1);
       
       const intf = this.device.configuration.interfaces[0];
+      await this.device.claimInterface(intf.interfaceNumber);
+
       const alt = intf.alternates[0];
-      
       const epIn = alt.endpoints.find((e: any) => e.direction === 'in');
       const epOut = alt.endpoints.find((e: any) => e.direction === 'out');
-
       this.inEndpoint = epIn?.endpointNumber || 2;
       this.outEndpoint = epOut?.endpointNumber || 1;
       
-      try { await this.device.claimInterface(intf.interfaceNumber); } catch(e) {}
-
-      // FTDI Init
+      this.log("Inicializando UART FTDI...");
+      // Reset FTDI
       await this.ctrl(0x00, 0x00, 0x00);
-      await this.ctrl(0x03, 0x401A, 0x00); // 115200
-      await this.ctrl(0x04, 0x0008, 0x00); // 8N1
-      await this.ctrl(0x01, 0x0303, 0x00);
+      // Baud Rate 115200 (MicroNIR standard)
+      await this.ctrl(0x03, 0x4138, 0x00); 
+      // Latency timer 16ms
+      await this.ctrl(0x09, 0x10, 0x00);
+      // Data Control 8N1
+      await this.ctrl(0x04, 0x0008, 0x00);
 
       this.isConnected = true;
       await this.sleep(200);
+      
+      // Limpiar buffers viejos
       await this.flushRx();
 
-      this.log("Iniciando negociación de protocolo...");
-      const success = await this.autoConfig();
-      
-      if (!success) {
-        return "El sensor rechazó todas las configuraciones conocidas.";
+      // Probar conexión simple
+      this.log("Ping al sensor...");
+      if (await this.send(CMD.GET_INFO)) {
+          await this.sleep(100);
+          const resp = await this.readPacket(500);
+          if (resp) {
+              this.log("Sensor Responde OK.");
+              return "OK";
+          }
       }
+
+      // Si falla ping, intentamos configuración básica
+      this.log("Negociando formato...");
+      const success = await this.trySimpleConfig();
+      if (!success) return "Error de protocolo (USB Driver)";
 
       return "OK";
     } catch (error: any) {
       this.isConnected = false;
-      return error.message || "Error USB";
+      return error.message || "Fallo USB";
     }
   }
 
-  private async autoConfig(): Promise<boolean> {
-    const scanCount = 500;
-    const integrationTime = 12500;
-
-    const formats = [
-      { size: 8, be: false }, { size: 8, be: true },
-      { size: 12, be: false }, { size: 12, be: true },
-      { size: 16, be: false }, { size: 16, be: true }
-    ];
-
-    for (const fmt of formats) {
-      this.log(`Probando formato: ${fmt.size} bytes, ${fmt.be ? 'BigEndian' : 'LittleEndian'}`);
-      const payload = this.buildPayload(scanCount, integrationTime, fmt.size, fmt.be);
-      
-      if (await this.send(CMD.SET_INTEGRATION, payload)) {
-        await this.sleep(100);
-        const resp = await this.readPacket(500);
-        if (resp && resp.length >= 3) {
-          if (resp[2] === 0x15) { // NAK
-            this.log(`Formato rechazado por el sensor (Error 0x${resp[3].toString(16)})`);
-          } else {
-            this.log(`¡Conectado! Formato aceptado: ${fmt.size} bytes.`);
-            return true;
-          }
-        }
-      }
-      await this.sleep(50);
-    }
-    return false;
-  }
-
-  private buildPayload(scans: number, time: number, size: number, be: boolean): number[] {
-    const buffer = new ArrayBuffer(size);
-    const view = new DataView(buffer);
-    if (size >= 8) {
-      view.setUint32(0, scans, !be);
-      view.setUint32(4, time, !be);
-    }
-    // Padding para 12 y 16 bytes
-    return Array.from(new Uint8Array(buffer));
+  private async trySimpleConfig(): Promise<boolean> {
+     // Configuración simple: 16-bit Big Endian (Standard)
+     const payload = [
+         0,0,1,244, // 500 scans
+         0,0,48,212, // 12500 time
+         0,0,0,0,0,0,0,0 // padding
+     ];
+     
+     if(await this.send(CMD.SET_INTEGRATION, payload)) {
+         await this.sleep(200);
+         const resp = await this.readPacket(1000);
+         if(resp && resp.length > 2 && resp[2] !== 0x15) {
+             return true;
+         }
+     }
+     return false;
   }
 
   async resetHardware(): Promise<boolean> {
@@ -169,16 +164,16 @@ export class MicroNIRDriver {
   }
 
   async disconnect() {
-    if (this.device?.opened) await this.device.close();
+    if (this.device?.opened) {
+        try { await this.device.close(); } catch(e){}
+    }
     this.isConnected = false;
   }
 
   private async flushRx() {
     try {
-      for(let i=0; i<3; i++) {
-        const res = await this.device.transferIn(this.inEndpoint, 64);
-        if (!res.data || res.data.byteLength <= 2) break;
-      }
+      // Leer basura que haya quedado en el buffer
+      await this.device.transferIn(this.inEndpoint, 64);
     } catch(e) {}
   }
 
@@ -220,8 +215,9 @@ export class MicroNIRDriver {
   }
 
   private parseSpectrum(buffer: Uint8Array): Uint16Array {
-    let offset = 3; // Default short format [02, LEN, 05, DATA...]
-    if (buffer[3] === 0x05) offset = 4; // Extended format [02, HI, LO, 05, DATA...]
+    let offset = 3; 
+    if (buffer.length > 3 && buffer[3] === 0x05) offset = 4;
+    
     const s = new Uint16Array(128);
     const view = new DataView(buffer.buffer);
     for(let j=0; j<128; j++) {
@@ -237,10 +233,17 @@ export class MicroNIRDriver {
       try {
         const res = await this.device.transferIn(this.inEndpoint, 64);
         if (res.status === 'ok' && res.data.byteLength > 2) {
-          const chunk = new Uint8Array(res.data.buffer.slice(2)); 
-          const next = new Uint8Array(acc.length + chunk.length);
-          next.set(acc); next.set(chunk, acc.length);
-          acc = next;
+          const chunk = new Uint8Array(res.data.buffer); 
+          // Detectar STX (0x02)
+          if(acc.length === 0) {
+              const start = chunk.indexOf(0x02);
+              if(start >= 0) acc = chunk.slice(start);
+          } else {
+              const next = new Uint8Array(acc.length + chunk.length);
+              next.set(acc); next.set(chunk, acc.length);
+              acc = next;
+          }
+          
           if (acc.length > 3 && acc[acc.length-1] === 0x03) return acc;
         }
       } catch (e) { await this.sleep(20); }
