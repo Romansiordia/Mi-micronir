@@ -20,14 +20,14 @@ const CMD = {
   RESET: 0x0F
 };
 
-// Payload de Configuración Basado en la Imagen:
+// Payload de Configuración de Diagnóstico:
 // [Intensity(1), Freq(2), Exposure(4), Scans(4)]
-// 100% (0x64), 10kHz (0x2710), 12500us (0x000030D4), 500 Scans (0x000001F4)
-const OFFICIAL_CONFIG = [
+// 100% (0x64), 10kHz (0x2710), 12500us (0x000030D4), 50 Scans (0x00000032)
+const DIAGNOSTIC_CONFIG = [
     0x64,               // Intensity 100%
     0x27, 0x10,         // Freq 10000 Hz
     0x00, 0x00, 0x30, 0xD4, // Exposure 12500 us (12.5 ms)
-    0x00, 0x00, 0x01, 0xF4  // Scan Count 500
+    0x00, 0x00, 0x00, 0x32  // Scan Count 50 (Modo de Diagnóstico)
 ];
 
 const CRC8_TABLE = new Uint8Array([
@@ -108,11 +108,11 @@ export class MicroNIRDriver {
       await this.send(CMD.PING);
       await this.sleep(100);
       
-      this.log("Configurando Exposición (12.5ms) y Scans (500)...");
-      await this.send(CMD.SET_CONFIG, OFFICIAL_CONFIG); 
+      this.log("Modo Diagnóstico: 12.5ms / 50 Scans...");
+      await this.send(CMD.SET_CONFIG, DIAGNOSTIC_CONFIG); 
       await this.sleep(300);
 
-      this.log("Hardware VIAVI Pro Desbloqueado.");
+      this.log("Hardware VIAVI Pro Listo.");
       return "OK";
     } catch (error: any) {
       this.isConnected = false;
@@ -180,14 +180,14 @@ export class MicroNIRDriver {
 
   async setLamp(on: boolean): Promise<boolean> {
     if (on) {
-        await this.send(CMD.SET_CONFIG, OFFICIAL_CONFIG);
+        await this.send(CMD.SET_CONFIG, DIAGNOSTIC_CONFIG);
         await this.sleep(200);
     }
 
     const ok = await this.send(CMD.LAMP_CONTROL, [on ? 1 : 0]);
     
     if (on && ok) {
-        this.log("Calentando Lámpara (Wait for stable emission)...");
+        this.log("Calentando Lámpara...");
         for(let i=1; i<=5; i++) {
             await this.sleep(1000);
             await this.send(CMD.STATUS_REPORT);
@@ -199,14 +199,12 @@ export class MicroNIRDriver {
 
   async scan(): Promise<Uint16Array | null> {
     await this.flushRx();
-    // Re-configurar antes de scan para asegurar 12.5ms/500
-    await this.send(CMD.SET_CONFIG, OFFICIAL_CONFIG);
+    await this.send(CMD.SET_CONFIG, DIAGNOSTIC_CONFIG);
     await this.sleep(100);
 
     if (!await this.send(CMD.SCAN)) return null;
-    this.log("Capturando 500 scans (Promediando)...");
+    this.log("Capturando espectro (50 scans rápidos)...");
     
-    // 500 scans * 12.5ms = 6.25s. Timeout 20s es seguro.
     const raw = await this.readPacket(20000); 
     if (!raw) return null;
     

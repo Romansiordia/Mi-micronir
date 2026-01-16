@@ -72,12 +72,12 @@ const CMD = {
   RESET: 0x0F
 };
 
-// Configuración Basada en la Imagen (idéntica a USB)
-const OFFICIAL_CONFIG = [
+// Configuración de Diagnóstico (50 scans)
+const DIAGNOSTIC_CONFIG = [
     0x64,               // Intensity 100%
     0x27, 0x10,         // Freq 10000 Hz
     0x00, 0x00, 0x30, 0xD4, // Exposure 12500 us (12.5 ms)
-    0x00, 0x00, 0x01, 0xF4  // Scan Count 500
+    0x00, 0x00, 0x00, 0x32  // Scan Count 50
 ];
 
 export class MicroNIRBLEDriver {
@@ -139,12 +139,12 @@ export class MicroNIRBLEDriver {
 
   private async softStartSensor() {
     this.isBusy = true;
-    this.log("Enviando config VIAVI (12.5ms / 500 scans)...");
+    this.log("Iniciando modo diagnóstico (50 scans)...");
     await this.send(CMD.GET_INFO, [], true);
     await this.sleep(500);
-    await this.send(CMD.SET_CONFIG, OFFICIAL_CONFIG);
+    await this.send(CMD.SET_CONFIG, DIAGNOSTIC_CONFIG);
     await this.waitForPacket(2000);
-    this.log("Hardware listo.");
+    this.log("Hardware listo para lectura rápida.");
     this.isBusy = false;
   }
 
@@ -283,14 +283,14 @@ export class MicroNIRBLEDriver {
   async setLamp(on: boolean): Promise<boolean> {
     this.isBusy = true; 
     if (on) {
-        await this.send(CMD.SET_CONFIG, OFFICIAL_CONFIG);
+        await this.send(CMD.SET_CONFIG, DIAGNOSTIC_CONFIG);
         await this.sleep(300);
     }
 
     const ok = await this.send(CMD.LAMP_CONTROL, [on ? 1 : 0]);
     await this.waitForPacket(2000);
     if (on && ok) {
-        this.log("Calentando lámpara (Wireless Dwell)...");
+        this.log("Calentando filamento...");
         await this.sleep(5000);
         await this.send(CMD.STATUS_REPORT, [], true); 
     }
@@ -308,18 +308,16 @@ export class MicroNIRBLEDriver {
 
   async scan(): Promise<Uint16Array | null> {
     this.isBusy = true;
-    this.log("Capturando espectro (500 scans)...");
+    this.log("Capturando espectro (50 scans rápidos)...");
     this.rxBuffer = new Uint8Array(0);
     this.lastPacket = null;
 
-    // Asegurar config 12.5ms/500
-    await this.send(CMD.SET_CONFIG, OFFICIAL_CONFIG);
+    await this.send(CMD.SET_CONFIG, DIAGNOSTIC_CONFIG);
     await this.sleep(200);
 
     if (!await this.send(CMD.SCAN)) { this.isBusy = false; return null; }
     
-    // Captura extendida (25 segundos de margen para Wireless)
-    const raw = await this.waitForPacket(25000); 
+    const raw = await this.waitForPacket(20000); 
     this.isBusy = false;
     if (!raw) return null;
     
