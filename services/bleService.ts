@@ -211,8 +211,8 @@ export class MicroNIRBLEDriver {
     if (!value) return;
 
     const chunk = new Uint8Array(value.buffer);
-    // LOG VERBOSE: Ver qué llega
-    this.log(`RX <<< Chunk ${chunk.length} bytes`);
+    // LOG VERBOSE: Ver qué llega en HEX
+    this.log(`RX <<< ${toHex(chunk)}`);
     
     const newBuffer = new Uint8Array(this.rxBuffer.length + chunk.length);
     newBuffer.set(this.rxBuffer);
