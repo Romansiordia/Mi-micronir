@@ -16,12 +16,10 @@ interface BluetoothRemoteGATTServer {
 
 interface BluetoothRemoteGATTService {
   getCharacteristic(characteristic: string): Promise<BluetoothRemoteGATTCharacteristic>;
-  getCharacteristics(): Promise<BluetoothRemoteGATTCharacteristic[]>;
 }
 
 interface BluetoothRemoteGATTCharacteristic extends EventTarget {
   uuid: string;
-  properties: { write: boolean; writeWithoutResponse: boolean; notify: boolean; indicate: boolean; read: boolean; };
   value?: DataView;
   writeValue(value: BufferSource): Promise<void>;
   startNotifications(): Promise<BluetoothRemoteGATTCharacteristic>;
@@ -63,11 +61,6 @@ function calculateCrc8(data: Uint8Array): number {
   return crc;
 }
 
-function toHex(buffer: Uint8Array | number[]): string {
-  const arr = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
-  return Array.from(arr).map(b => b.toString(16).padStart(2, '0').toUpperCase()).join(' ');
-}
-
 const CMD = {
   LAMP_CONTROL: 0x01,
   SET_CONFIG: 0x02, 
@@ -86,6 +79,7 @@ export class MicroNIRBLEDriver {
   private keepAliveInterval: any = null;
   private pendingResponse = false;
   private isBusy = false; 
+  private writeInProgress = false; // Mutex para evitar GATT busy
 
   public isConnected = false;
   private rxBuffer: Uint8Array = new Uint8Array(0);
@@ -101,7 +95,7 @@ export class MicroNIRBLEDriver {
       if (!navigator.bluetooth) return "Navegador incompatible";
       await this.disconnect(); 
 
-      this.log("Buscando MicroNIR...");
+      this.log("Buscando dispositivo...");
       this.device = await navigator.bluetooth.requestDevice({
         filters: [{ namePrefix: BLE_CONFIG.namePrefix }],
         optionalServices: [BLE_CONFIG.serviceUUID]
@@ -109,41 +103,42 @@ export class MicroNIRBLEDriver {
 
       this.device.addEventListener('gattserverdisconnected', this.onDisconnected);
       
-      this.log("Conectando...");
+      this.log("Estableciendo conexión GATT...");
       this.server = await this.device.gatt!.connect();
       
-      this.log("Estabilizando enlace (3s)...");
-      await this.sleep(3000); 
+      this.log("Esperando estabilización (4s)...");
+      await this.sleep(4000); 
 
       const service = await this.server.getPrimaryService(BLE_CONFIG.serviceUUID);
       this.txChar = await service.getCharacteristic(BLE_CONFIG.txCharUUID);
       this.rxChar = await service.getCharacteristic(BLE_CONFIG.rxCharUUID);
 
-      this.log("Abriendo canal de datos...");
+      this.log("Iniciando flujo de datos...");
       await this.rxChar.startNotifications();
       this.rxChar.addEventListener('characteristicvaluechanged', this.handleNotifications);
 
       this.isConnected = true;
       
-      // Lanzamos la identificación en segundo plano para no bloquear
-      this.softStartSensor().catch(err => this.log(`Identificación diferida: ${err.message}`));
+      // Sincronización controlada
+      await this.sleep(1000);
+      await this.softStartSensor();
       this.startKeepAlive();
       
       return "OK";
     } catch (error: any) {
       this.isConnected = false;
-      this.log(`Error: ${error.message}`);
+      this.log(`Fallo: ${error.message}`);
       return error.message || "Error BLE";
     }
   }
 
   private async softStartSensor() {
     this.isBusy = true;
-    this.log("Sincronizando con hardware...");
+    this.log("Sincronizando firmware...");
     
-    // Simplemente enviamos un GET_INFO para despertar al sensor
+    // Solo un comando de info para asegurar que el canal está vivo
     await this.send(CMD.GET_INFO, [], true);
-    await this.sleep(1000);
+    await this.sleep(1500);
 
     const scanCount = 100;
     const integrationTime = 10000;
@@ -152,14 +147,10 @@ export class MicroNIRBLEDriver {
         (integrationTime >> 8) & 0xFF, integrationTime & 0xFF
     ];
 
-    // Intentamos configurar, si hay NAK 0x15 lo registramos pero no abortamos
     await this.send(CMD.SET_CONFIG, payload);
-    const ack = await this.waitForPacket(1500);
-    if (ack && ack[2] === 0x15) {
-        this.log("Aviso: Parámetros fijos en firmware (NAK 0x15).");
-    }
+    await this.waitForPacket(2000);
 
-    this.log("Sistema en línea.");
+    this.log("Hardware preparado.");
     this.isBusy = false;
   }
 
@@ -176,15 +167,17 @@ export class MicroNIRBLEDriver {
   private startKeepAlive() {
     if (this.keepAliveInterval) clearInterval(this.keepAliveInterval);
     this.keepAliveInterval = setInterval(() => {
-      if (this.isConnected && !this.pendingResponse && !this.isBusy) { 
+      // No pedir temperatura si estamos haciendo algo pesado o la lámpara acaba de encender
+      if (this.isConnected && !this.pendingResponse && !this.isBusy && !this.writeInProgress) { 
          this.getTemperature().catch(() => {});
       }
-    }, 20000); 
+    }, 25000); 
   }
 
   private disconnectCleanly() {
     this.isConnected = false;
     this.isBusy = false;
+    this.writeInProgress = false;
     this.pendingResponse = false;
     if (this.keepAliveInterval) clearInterval(this.keepAliveInterval);
     this.rxBuffer = new Uint8Array(0);
@@ -201,7 +194,6 @@ export class MicroNIRBLEDriver {
     const value = (event.target as BluetoothRemoteGATTCharacteristic).value;
     if (!value) return;
     const chunk = new Uint8Array(value.buffer);
-    this.log(`RX <<< ${toHex(chunk)}`);
     
     const newBuffer = new Uint8Array(this.rxBuffer.length + chunk.length);
     newBuffer.set(this.rxBuffer);
@@ -236,6 +228,19 @@ export class MicroNIRBLEDriver {
 
   async send(opcode: number, data: number[] = [], silent = false): Promise<boolean> {
     if (!this.isConnected || !this.txChar) return false;
+    
+    // Implementación de Mutex simple para evitar "GATT operation in progress"
+    let retries = 5;
+    while (this.writeInProgress && retries > 0) {
+        await this.sleep(200);
+        retries--;
+    }
+
+    if (this.writeInProgress) {
+        this.log("Fallo: Canal ocupado persistentemente.");
+        return false;
+    }
+
     if (!silent) { this.lastPacket = null; this.pendingResponse = true; }
 
     const len = data.length + 1;
@@ -245,13 +250,17 @@ export class MicroNIRBLEDriver {
     
     if (!silent) this.log(`TX >>> OP ${opcode.toString(16).toUpperCase()}`);
 
+    this.writeInProgress = true;
     try {
       await this.txChar.writeValue(packet);
+      await this.sleep(150); // Pequeño margen para que el hardware procese
       return true;
     } catch (e: any) {
-      this.log(`Error TX: ${e.message}`);
+      this.log(`Error de escritura: ${e.message}`);
       if (!silent) this.pendingResponse = false;
       return false;
+    } finally {
+      this.writeInProgress = false;
     }
   }
 
@@ -284,8 +293,11 @@ export class MicroNIRBLEDriver {
     this.isBusy = true; 
     const ok = await this.send(CMD.LAMP_CONTROL, [on ? 1 : 0]);
     await this.waitForPacket(2000);
+    
     if (on && ok) {
-        this.log("Calentando lámpara (5s)...");
+        this.log("Iniciando ciclo de encendido físico...");
+        await this.sleep(2000); // Esperar a que el LED cambie de amarillo a blanco
+        this.log("Estabilizando potencia térmica (5s)...");
         await this.sleep(5000); 
     }
     this.isBusy = false;
@@ -295,24 +307,25 @@ export class MicroNIRBLEDriver {
   async resetHardware(): Promise<boolean> {
       this.isBusy = true;
       const ok = await this.send(CMD.RESET);
-      await this.sleep(4000);
+      await this.sleep(5000);
       this.isBusy = false;
       return ok;
   }
 
   async scan(): Promise<Uint16Array | null> {
     this.isBusy = true;
-    this.log("Iniciando escaneo...");
+    this.log("Iniciando captura espectral...");
     this.rxBuffer = new Uint8Array(0);
     this.lastPacket = null;
 
     if (!await this.send(CMD.SCAN)) { this.isBusy = false; return null; }
     
-    const raw = await this.waitForPacket(12000); 
+    // Tiempos largos para Web Bluetooth
+    const raw = await this.waitForPacket(15000); 
     this.isBusy = false;
 
     if (!raw) {
-        this.log("Error: Tiempo de espera agotado.");
+        this.log("Error: El hardware no devolvió el espectro.");
         return null;
     }
 
@@ -327,7 +340,7 @@ export class MicroNIRBLEDriver {
             if (idx + 1 < raw.length) s[j] = view.getUint16(idx, false);
         }
     } catch(err) {
-        this.log("Error de datos espectrales.");
+        this.log("Error de procesamiento.");
     }
     return s;
   }
