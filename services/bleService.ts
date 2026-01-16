@@ -67,9 +67,18 @@ const CMD = {
   GET_INFO: 0x03, 
   SCAN: 0x05,
   GET_TEMP: 0x06,
+  STATUS_REPORT: 0x18,
   PING: 0x14,
   RESET: 0x0F
 };
+
+// Configuración Basada en la Imagen (idéntica a USB)
+const OFFICIAL_CONFIG = [
+    0x64,               // Intensity 100%
+    0x27, 0x10,         // Freq 10000 Hz
+    0x00, 0x00, 0x30, 0xD4, // Exposure 12500 us (12.5 ms)
+    0x00, 0x00, 0x01, 0xF4  // Scan Count 500
+];
 
 export class MicroNIRBLEDriver {
   private device: BluetoothDevice | null = null;
@@ -105,7 +114,7 @@ export class MicroNIRBLEDriver {
       this.device.addEventListener('gattserverdisconnected', this.onDisconnected);
       this.server = await this.device.gatt!.connect();
       
-      this.log("Estabilizando...");
+      this.log("Estabilizando enlace...");
       await this.sleep(3000); 
 
       const service = await this.server.getPrimaryService(BLE_CONFIG.serviceUUID);
@@ -130,12 +139,12 @@ export class MicroNIRBLEDriver {
 
   private async softStartSensor() {
     this.isBusy = true;
-    this.log("Sincronizando Firmware...");
+    this.log("Enviando config VIAVI (12.5ms / 500 scans)...");
     await this.send(CMD.GET_INFO, [], true);
     await this.sleep(500);
-    const payload = [0x00, 0x64, 0x27, 0x10]; 
-    await this.send(CMD.SET_CONFIG, payload);
-    await this.waitForPacket(1500);
+    await this.send(CMD.SET_CONFIG, OFFICIAL_CONFIG);
+    await this.waitForPacket(2000);
+    this.log("Hardware listo.");
     this.isBusy = false;
   }
 
@@ -155,7 +164,7 @@ export class MicroNIRBLEDriver {
       if (this.isConnected && !this.pendingResponse && !this.isBusy && !this.writeInProgress) { 
          this.send(CMD.PING, [], true).catch(() => {});
       }
-    }, 12000); 
+    }, 15000); 
   }
 
   private disconnectCleanly() {
@@ -170,7 +179,7 @@ export class MicroNIRBLEDriver {
   }
 
   private onDisconnected = () => {
-    this.log("Conexión perdida.");
+    this.log("Desconexión detectada.");
     this.disconnectCleanly();
   };
 
@@ -188,7 +197,7 @@ export class MicroNIRBLEDriver {
   private scanForPackets() {
     let stxIndex = this.rxBuffer.indexOf(0x02);
     if (stxIndex === -1) {
-       if (this.rxBuffer.length > 4096) this.rxBuffer = new Uint8Array(0);
+       if (this.rxBuffer.length > 8192) this.rxBuffer = new Uint8Array(0);
        return;
     }
     for (let i = stxIndex + 1; i < this.rxBuffer.length; i++) {
@@ -223,7 +232,7 @@ export class MicroNIRBLEDriver {
     this.writeInProgress = true;
     try {
       await this.txChar.writeValue(packet);
-      await this.sleep(50);
+      await this.sleep(80);
       return true;
     } catch (e: any) {
       if (!silent) this.pendingResponse = false;
@@ -241,7 +250,7 @@ export class MicroNIRBLEDriver {
         this.lastPacket = null;
         return pkt;
       }
-      await this.sleep(30);
+      await this.sleep(50);
     }
     this.pendingResponse = false;
     return null;
@@ -254,34 +263,36 @@ export class MicroNIRBLEDriver {
   }
 
   async getTemperature(): Promise<number | null> {
-    for (let i = 0; i < 2; i++) {
-        try {
-            if (await this.send(CMD.GET_TEMP, [], true)) {
-                const resp = await this.waitForPacket(2000); 
-                if (resp) {
-                    const idx = resp.indexOf(CMD.GET_TEMP);
-                    if (idx !== -1 && idx + 2 < resp.length) {
-                        const view = new DataView(resp.buffer, resp.byteOffset, resp.byteLength);
-                        const rawTemp = view.getUint16(idx + 1, false);
-                        const t = this.convertADT7320(rawTemp);
-                        if (t > 5 && t < 85) return t;
-                    }
+    try {
+        if (await this.send(CMD.GET_TEMP, [], true)) {
+            const resp = await this.waitForPacket(3000); 
+            if (resp) {
+                const idx = resp.indexOf(CMD.GET_TEMP);
+                if (idx !== -1 && idx + 2 < resp.length) {
+                    const view = new DataView(resp.buffer, resp.byteOffset, resp.byteLength);
+                    const rawTemp = view.getUint16(idx + 1, false);
+                    const t = this.convertADT7320(rawTemp);
+                    if (t > 5 && t < 85) return t;
                 }
             }
-        } catch (e) {}
-        await this.sleep(300);
-    }
+        }
+    } catch (e) {}
     return null;
   }
 
   async setLamp(on: boolean): Promise<boolean> {
     this.isBusy = true; 
+    if (on) {
+        await this.send(CMD.SET_CONFIG, OFFICIAL_CONFIG);
+        await this.sleep(300);
+    }
+
     const ok = await this.send(CMD.LAMP_CONTROL, [on ? 1 : 0]);
-    await this.waitForPacket(1500);
+    await this.waitForPacket(2000);
     if (on && ok) {
-        this.log("Calentando sensor...");
-        await this.sleep(4000);
-        await this.send(CMD.PING, [], true); 
+        this.log("Calentando lámpara (Wireless Dwell)...");
+        await this.sleep(5000);
+        await this.send(CMD.STATUS_REPORT, [], true); 
     }
     this.isBusy = false;
     return ok;
@@ -290,18 +301,25 @@ export class MicroNIRBLEDriver {
   async resetHardware(): Promise<boolean> {
       this.isBusy = true;
       const ok = await this.send(CMD.RESET);
-      await this.sleep(4000);
+      await this.sleep(5000);
       this.isBusy = false;
       return ok;
   }
 
   async scan(): Promise<Uint16Array | null> {
     this.isBusy = true;
-    this.log("Scan iniciado...");
+    this.log("Capturando espectro (500 scans)...");
     this.rxBuffer = new Uint8Array(0);
     this.lastPacket = null;
+
+    // Asegurar config 12.5ms/500
+    await this.send(CMD.SET_CONFIG, OFFICIAL_CONFIG);
+    await this.sleep(200);
+
     if (!await this.send(CMD.SCAN)) { this.isBusy = false; return null; }
-    const raw = await this.waitForPacket(15000); 
+    
+    // Captura extendida (25 segundos de margen para Wireless)
+    const raw = await this.waitForPacket(25000); 
     this.isBusy = false;
     if (!raw) return null;
     

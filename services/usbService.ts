@@ -11,13 +11,24 @@ declare global {
 
 const CMD = {
   LAMP_CONTROL: 0x01,
+  SET_CONFIG: 0x02,    
   GET_INFO: 0x03,
   SCAN: 0x05,
   GET_TEMP: 0x06,
-  STATUS_REPORT: 0x18, // Comando 'X' mencionado en el doc
+  STATUS_REPORT: 0x18, 
   PING: 0x14,
   RESET: 0x0F
 };
+
+// Payload de Configuración Basado en la Imagen:
+// [Intensity(1), Freq(2), Exposure(4), Scans(4)]
+// 100% (0x64), 10kHz (0x2710), 12500us (0x000030D4), 500 Scans (0x000001F4)
+const OFFICIAL_CONFIG = [
+    0x64,               // Intensity 100%
+    0x27, 0x10,         // Freq 10000 Hz
+    0x00, 0x00, 0x30, 0xD4, // Exposure 12500 us (12.5 ms)
+    0x00, 0x00, 0x01, 0xF4  // Scan Count 500
+];
 
 const CRC8_TABLE = new Uint8Array([
   0x00, 0x5e, 0xbc, 0xe2, 0x61, 0x3f, 0xdd, 0x83, 0xc2, 0x9c, 0x7e, 0x20, 0xa3, 0xfd, 0x1f, 0x41,
@@ -93,9 +104,15 @@ export class MicroNIRDriver {
 
       this.isConnected = true;
       await this.flushRx();
+      
       await this.send(CMD.PING);
+      await this.sleep(100);
+      
+      this.log("Configurando Exposición (12.5ms) y Scans (500)...");
+      await this.send(CMD.SET_CONFIG, OFFICIAL_CONFIG); 
+      await this.sleep(300);
 
-      this.log("Hardware listo.");
+      this.log("Hardware VIAVI Pro Desbloqueado.");
       return "OK";
     } catch (error: any) {
       this.isConnected = false;
@@ -140,23 +157,16 @@ export class MicroNIRDriver {
   }
 
   private convertADT7320(raw: number): number {
-    // El doc menciona ADT7320: 13-bit signed fixed-point.
-    // Estructura: [D15-D3] es el dato. D15 es signo.
-    // Convertimos a 16 bits con signo real.
     let val = (raw & 0xFFF8) >> 3; 
-    if (val & 0x1000) { // Si el bit 13 (signo) está activo
-      val -= 0x2000; 
-    }
+    if (val & 0x1000) val -= 0x2000; 
     return val / 16.0;
   }
 
   async getTemperature(): Promise<number | null> {
-    // Según SpectraDataPacket, la temperatura viene en el bloque extendido
     if (await this.send(CMD.GET_TEMP)) {
         const resp = await this.readPacket(1000);
         if (resp) {
             const view = new DataView(resp.buffer, resp.byteOffset, resp.byteLength);
-            // El offset suele ser fijo después de los píxeles en el paquete de 288 bytes
             const tempIdx = resp.indexOf(CMD.GET_TEMP) + 1;
             if (tempIdx > 0 && tempIdx + 2 < resp.length) {
                 const rawTemp = view.getUint16(tempIdx, false);
@@ -169,22 +179,37 @@ export class MicroNIRDriver {
   }
 
   async setLamp(on: boolean): Promise<boolean> {
+    if (on) {
+        await this.send(CMD.SET_CONFIG, OFFICIAL_CONFIG);
+        await this.sleep(200);
+    }
+
     const ok = await this.send(CMD.LAMP_CONTROL, [on ? 1 : 0]);
+    
     if (on && ok) {
-        this.log("Calentando Lámpara (Dwell)...");
-        await this.sleep(3000);
-        // Verificamos estado con comando 'X' (STATUS_REPORT)
-        await this.send(CMD.STATUS_REPORT);
+        this.log("Calentando Lámpara (Wait for stable emission)...");
+        for(let i=1; i<=5; i++) {
+            await this.sleep(1000);
+            await this.send(CMD.STATUS_REPORT);
+            this.log(`Estabilizando filamento... ${i}/5s`);
+        }
     }
     return ok;
   }
 
   async scan(): Promise<Uint16Array | null> {
+    await this.flushRx();
+    // Re-configurar antes de scan para asegurar 12.5ms/500
+    await this.send(CMD.SET_CONFIG, OFFICIAL_CONFIG);
+    await this.sleep(100);
+
     if (!await this.send(CMD.SCAN)) return null;
-    const raw = await this.readPacket(15000);
+    this.log("Capturando 500 scans (Promediando)...");
+    
+    // 500 scans * 12.5ms = 6.25s. Timeout 20s es seguro.
+    const raw = await this.readPacket(20000); 
     if (!raw) return null;
     
-    // PacketSize = 288 bytes. 128 píxeles * 2 bytes = 256 bytes.
     let offset = raw.indexOf(CMD.SCAN) + 1;
     const s = new Uint16Array(128);
     const view = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
@@ -206,12 +231,11 @@ export class MicroNIRDriver {
           const next = new Uint8Array(acc.length + chunk.length);
           next.set(acc); next.set(chunk, acc.length);
           acc = next;
-          // Buscamos terminador ETX y longitud profesional
           if (acc.includes(0x03) && acc.includes(0x02)) {
-              if (acc.length >= 288 || acc.length >= 64) return acc;
+             if (acc.length >= 288 || (acc.length >= 64 && acc[1] < 10)) return acc;
           }
         }
-      } catch (e) { await this.sleep(20); }
+      } catch (e) { await this.sleep(50); }
     }
     return acc.length > 0 ? acc : null;
   }
