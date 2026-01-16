@@ -45,11 +45,6 @@ function calculateCrc8(data: Uint8Array): number {
   return crc;
 }
 
-function toHex(buffer: Uint8Array | number[]): string {
-  const arr = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
-  return Array.from(arr).map(b => b.toString(16).padStart(2, '0').toUpperCase()).join(' ');
-}
-
 export class MicroNIRDriver {
   private device: any | null = null;
   private inEndpoint = 0; 
@@ -57,17 +52,9 @@ export class MicroNIRDriver {
   public isConnected = false;
   private logger: (msg: string) => void = () => {};
 
-  public setLogger(fn: (msg: string) => void) {
-    this.logger = fn;
-  }
-
-  private log(msg: string) {
-    this.logger(`[USB] ${msg}`);
-  }
-
-  private async sleep(ms: number) {
-    return new Promise(r => setTimeout(r, ms));
-  }
+  public setLogger(fn: (msg: string) => void) { this.logger = fn; }
+  private log(msg: string) { this.logger(`[USB] ${msg}`); }
+  private async sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
 
   private async ctrl(req: number, val: number, idx: number) {
     if (!this.device) return;
@@ -75,99 +62,83 @@ export class MicroNIRDriver {
         await this.device.controlTransferOut({
             requestType: 'vendor', recipient: 'device', request: req, value: val, index: idx
         });
-    } catch(e) {
-        this.log(`Warning Control USB: ${e}`);
-    }
+    } catch(e) {}
   }
 
   async connect(): Promise<string> {
     try {
-      if (!navigator.usb) return "Requiere Chrome en PC/Android";
-
-      this.device = await navigator.usb.requestDevice({
-        filters: [{ vendorId: USB_CONFIG.vendorId }]
-      });
-
+      if (!navigator.usb) return "Usa Chrome/Edge";
+      this.device = await navigator.usb.requestDevice({ filters: [{ vendorId: USB_CONFIG.vendorId }] });
       await this.device.open();
       if (this.device.configuration === null) await this.device.selectConfiguration(1);
-      
       const intf = this.device.configuration.interfaces[0];
       await this.device.claimInterface(intf.interfaceNumber);
 
       const alt = intf.alternates[0];
-      const epIn = alt.endpoints.find((e: any) => e.direction === 'in');
-      const epOut = alt.endpoints.find((e: any) => e.direction === 'out');
-      this.inEndpoint = epIn?.endpointNumber || 2;
-      this.outEndpoint = epOut?.endpointNumber || 1;
+      this.inEndpoint = alt.endpoints.find((e: any) => e.direction === 'in').endpointNumber;
+      this.outEndpoint = alt.endpoints.find((e: any) => e.direction === 'out').endpointNumber;
       
-      this.log("Configurando FTDI UART...");
-      // Reset FTDI
-      await this.ctrl(0x00, 0x00, 0x00);
-      // Baud Rate 115200 (Corregido para 1700 OnSite-W)
-      // Divisor para 115200 en FTDI es 26 (0x1A)
-      await this.ctrl(0x03, 0x001A, 0x0000); 
-      // Latency timer 2ms (Ultra rápido para espectroscopia)
-      await this.ctrl(0x09, 0x02, 0x00);
-      // Data Control 8N1
-      await this.ctrl(0x04, 0x0008, 0x00);
+      this.log("Inicializando UART FTDI...");
+      await this.ctrl(0x00, 0x00, 0x00); // Reset
+      await this.ctrl(0x03, 0x4138, 0x00); // Baud 115200 exact
+      await this.ctrl(0x04, 0x0008, 0x00); // 8N1
+      await this.ctrl(0x09, 0x02, 0x00);   // Latency
 
       this.isConnected = true;
-      await this.sleep(300);
-      
-      // Limpieza profunda de buffers
       await this.flushRx();
       
-      this.log("Canal USB establecido.");
-      // No bloqueamos si el ping inicial es lento, permitimos la entrada al App
-      this.send(CMD.GET_INFO, []).catch(() => {});
-
+      this.log("USB Listo.");
       return "OK";
     } catch (error: any) {
       this.isConnected = false;
-      return error.message || "Fallo USB";
+      return error.message || "Error USB";
     }
   }
 
-  async resetHardware(): Promise<boolean> {
-      this.log("Reiniciando hardware...");
-      return await this.send(CMD.RESET);
-  }
-
-  async disconnect() {
-    if (this.device?.opened) {
-        try { await this.device.close(); } catch(e){}
+  // Implementation of disconnect to satisfy IDeviceDriver interface
+  async disconnect(): Promise<void> {
+    if (this.device) {
+      try {
+        await this.device.close();
+      } catch (e) {}
     }
+    this.device = null;
     this.isConnected = false;
+    this.log("USB Desconectado.");
   }
 
-  private async flushRx() {
+  // Implementation of resetHardware to satisfy IDeviceDriver interface
+  async resetHardware(): Promise<boolean> {
+    if (!this.device) return false;
+    const ok = await this.send(CMD.RESET);
+    if (ok) {
+        await this.sleep(4000);
+    }
+    return ok;
+  }
+
+  async flushRx() {
     try {
-      // Intentar vaciar buffer remanente
-      for(let i=0; i<3; i++) {
         await this.device.transferIn(this.inEndpoint, 64);
-        await this.sleep(10);
-      }
+        await this.sleep(50);
     } catch(e) {}
   }
 
   async send(opcode: number, data: number[] = []): Promise<boolean> {
     if (!this.isConnected) return false;
     const len = data.length + 1;
-    const rawPayload = new Uint8Array([len, opcode, ...data]);
-    const packet = new Uint8Array([0x02, ...rawPayload, calculateCrc8(rawPayload), 0x03]);
-    this.log(`TX >>> OP ${opcode.toString(16).toUpperCase()}`);
+    const payload = new Uint8Array([len, opcode, ...data]);
+    const packet = new Uint8Array([0x02, ...payload, calculateCrc8(payload), 0x03]);
     try {
       const res = await this.device.transferOut(this.outEndpoint, packet);
       return res.status === 'ok';
-    } catch (e) {
-      return false;
-    }
+    } catch (e) { return false; }
   }
 
   async getTemperature(): Promise<number | null> {
     if (await this.send(CMD.GET_TEMP)) {
-      const resp = await this.readPacket(800);
-      if (resp && resp.length >= 5 && (resp[2] === 0x06 || resp[3] === 0x06)) {
+      const resp = await this.readPacket(1000);
+      if (resp && resp.includes(0x06)) {
         const offset = resp.indexOf(0x06);
         const view = new DataView(resp.buffer, resp.byteOffset, resp.byteLength);
         return view.getUint16(offset + 1, false) / 1000.0;
@@ -178,49 +149,45 @@ export class MicroNIRDriver {
 
   async setLamp(on: boolean): Promise<boolean> {
     const ok = await this.send(CMD.LAMP_CONTROL, [on ? 1 : 0]);
-    if (ok) await this.sleep(on ? 1000 : 100); 
+    if (on && ok) {
+        this.log("Calentando (USB)...");
+        for(let i=0; i<5; i++) {
+            await this.sleep(1000);
+            await this.send(CMD.GET_INFO);
+        }
+    }
     return ok;
   }
 
   async scan(): Promise<Uint16Array | null> {
     if (!await this.send(CMD.SCAN)) return null;
-    const raw = await this.readPacket(8000);
+    const raw = await this.readPacket(10000);
     if (!raw) return null;
-    return this.parseSpectrum(raw);
-  }
-
-  private parseSpectrum(buffer: Uint8Array): Uint16Array {
-    let offset = buffer.indexOf(0x05);
-    if (offset === -1) offset = 3; 
-    else offset += 1;
     
+    let offset = raw.indexOf(0x05) + 1;
     const s = new Uint16Array(128);
-    const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+    const view = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
     for(let j=0; j<128; j++) {
       const idx = offset + (j*2);
-      if (idx + 1 < buffer.length) s[j] = view.getUint16(idx, false);
+      if (idx + 1 < raw.length) s[j] = view.getUint16(idx, false);
     }
     return s;
   }
 
-  private async readPacket(timeoutMs: number): Promise<Uint8Array | null> {
-    const startTime = Date.now();
+  private async readPacket(timeout: number): Promise<Uint8Array | null> {
+    const start = Date.now();
     let acc = new Uint8Array(0);
-    while ((Date.now() - startTime) < timeoutMs) {
+    while ((Date.now() - start) < timeout) {
       try {
         const res = await this.device.transferIn(this.inEndpoint, 1024);
-        if (res.status === 'ok' && res.data.byteLength > 2) {
-          const chunk = new Uint8Array(res.data.buffer); 
-          const start = chunk.indexOf(0x02);
-          if (start >= 0 || acc.length > 0) {
-              const base = start >= 0 ? chunk.slice(start) : chunk;
-              const next = new Uint8Array(acc.length + base.length);
-              next.set(acc); next.set(base, acc.length);
-              acc = next;
-              if (acc.length > 5 && acc.includes(0x03)) return acc;
-          }
+        if (res.status === 'ok') {
+          const chunk = new Uint8Array(res.data.buffer);
+          const next = new Uint8Array(acc.length + chunk.length);
+          next.set(acc); next.set(chunk, acc.length);
+          acc = next;
+          if (acc.includes(0x03) && acc.includes(0x02)) return acc;
         }
-      } catch (e) { await this.sleep(20); }
+      } catch (e) { await this.sleep(50); }
     }
     return acc.length > 0 ? acc : null;
   }
