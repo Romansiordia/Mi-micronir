@@ -15,7 +15,7 @@ const CMD = {
   GET_INFO: 0x03,
   SCAN: 0x05,
   GET_TEMP: 0x06,
-  STATUS_TEMP_PCB: 0x07, // Inferido de metadata STATUS_TEMP_PCB
+  STATUS_TEMP_PCB: 0x07, // Registro específico para sensores ADT7320 en VIAVI
   RESET: 0x0F
 };
 
@@ -69,7 +69,6 @@ export class MicroNIRDriver {
   async connect(): Promise<string> {
     try {
       if (!navigator.usb) return "Usa Chrome/Edge";
-      // Filtro extendido con IDs de VIAVI
       this.device = await navigator.usb.requestDevice({ 
         filters: [
             { vendorId: USB_CONFIG.vendorId },
@@ -87,8 +86,8 @@ export class MicroNIRDriver {
       this.outEndpoint = alt.endpoints.find((e: any) => e.direction === 'out').endpointNumber;
       
       this.log("Inicializando MicroNIR Pro...");
-      await this.ctrl(0x00, 0x00, 0x00); // Reset FTDI
-      await this.ctrl(0x03, 0x4138, 0x00); // Baudrate oficial
+      await this.ctrl(0x00, 0x00, 0x00);
+      await this.ctrl(0x03, 0x4138, 0x00);
       await this.ctrl(0x04, 0x0008, 0x00); 
       await this.ctrl(0x09, 0x02, 0x00);   
 
@@ -142,38 +141,45 @@ export class MicroNIRDriver {
   }
 
   async getTemperature(): Promise<number | null> {
-    // 3 reintentos con doble estrategia (Opcode 0x06 y 0x07 para PCB)
-    for (let i = 0; i < 3; i++) {
+    // Implementación robusta de lectura de temperatura para sensor ADT7320
+    const strategies = [CMD.GET_TEMP, CMD.STATUS_TEMP_PCB, CMD.GET_INFO];
+    
+    for (const cmd of strategies) {
         try {
-            const cmdToUse = i === 2 ? CMD.STATUS_TEMP_PCB : CMD.GET_TEMP;
-            if (await this.send(cmdToUse)) {
-                const resp = await this.readPacket(2000); 
-                if (resp && (resp.includes(0x06) || resp.includes(0x07))) {
-                    const opcodeFound = resp.includes(0x06) ? 0x06 : 0x07;
-                    const offset = resp.indexOf(opcodeFound);
-                    const view = new DataView(resp.buffer, resp.byteOffset, resp.byteLength);
-                    
-                    // Lógica ADT7320: 16-bit Big Endian
-                    const tempRaw = view.getUint16(offset + 1, false);
-                    if (tempRaw > 0 && tempRaw < 0xFFFF) {
-                        return tempRaw / 1000.0;
+            if (await this.send(cmd)) {
+                const resp = await this.readPacket(1200); 
+                if (resp && resp.length >= 5) {
+                    // Buscamos el opcode de respuesta en el paquete
+                    const idx = resp.indexOf(cmd);
+                    if (idx !== -1 && idx + 2 < resp.length) {
+                        const view = new DataView(resp.buffer, resp.byteOffset, resp.byteLength);
+                        const tempRaw = view.getUint16(idx + 1, false); // Big Endian
+                        
+                        // Validación de rango físico (0 a 100 grados C)
+                        // Muchos firmwares VIAVI devuelven temp * 1000 o temp * 100
+                        if (tempRaw > 0 && tempRaw < 65000) {
+                            let processed = tempRaw;
+                            if (processed > 1000) processed /= 1000.0;
+                            else if (processed > 500) processed /= 100.0;
+                            
+                            if (processed > 10 && processed < 90) return processed;
+                        }
                     }
                 }
             }
         } catch (e) {}
-        await this.sleep(350);
+        await this.sleep(150);
     }
     return null;
   }
 
   async setLamp(on: boolean): Promise<boolean> {
-    // Envío de comando con pequeño delay para estabilizar PWM detectado en metadata
     const ok = await this.send(CMD.LAMP_CONTROL, [on ? 1 : 0]);
     if (on && ok) {
         this.log("Estabilizando Lámpara (VIAVI)...");
         for(let i=0; i<6; i++) {
             await this.sleep(800);
-            await this.send(CMD.GET_INFO); // Poll para mantener el bus activo
+            await this.send(CMD.GET_INFO);
         }
     }
     return ok;
@@ -200,14 +206,15 @@ export class MicroNIRDriver {
     while ((Date.now() - start) < timeout) {
       try {
         const res = await this.device.transferIn(this.inEndpoint, 1024);
-        if (res.status === 'ok') {
+        if (res.status === 'ok' && res.data) {
           const chunk = new Uint8Array(res.data.buffer);
           const next = new Uint8Array(acc.length + chunk.length);
           next.set(acc); next.set(chunk, acc.length);
           acc = next;
+          // Un paquete MicroNIR completo debe tener STX(0x02) y ETX(0x03)
           if (acc.includes(0x03) && acc.includes(0x02)) return acc;
         }
-      } catch (e) { await this.sleep(50); }
+      } catch (e) { await this.sleep(30); }
     }
     return acc.length > 0 ? acc : null;
   }

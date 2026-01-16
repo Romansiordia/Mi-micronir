@@ -102,8 +102,6 @@ export class MicroNIRBLEDriver {
       });
 
       this.device.addEventListener('gattserverdisconnected', this.onDisconnected);
-      
-      this.log("Conectando GATT...");
       this.server = await this.device.gatt!.connect();
       
       this.log("Estabilizando...");
@@ -113,7 +111,6 @@ export class MicroNIRBLEDriver {
       this.txChar = await service.getCharacteristic(BLE_CONFIG.txCharUUID);
       this.rxChar = await service.getCharacteristic(BLE_CONFIG.rxCharUUID);
 
-      this.log("Iniciando Notificaciones...");
       await this.rxChar.startNotifications();
       this.rxChar.addEventListener('characteristicvaluechanged', this.handleNotifications);
 
@@ -222,11 +219,10 @@ export class MicroNIRBLEDriver {
     const rawPayload = new Uint8Array([len, opcode, ...data]);
     const crc = calculateCrc8(rawPayload);
     const packet = new Uint8Array([0x02, ...rawPayload, crc, 0x03]);
-    if (!silent) this.log(`TX >>> OP ${opcode.toString(16).toUpperCase()}`);
     this.writeInProgress = true;
     try {
       await this.txChar.writeValue(packet);
-      await this.sleep(100); 
+      await this.sleep(50);
       return true;
     } catch (e: any) {
       if (!silent) this.pendingResponse = false;
@@ -251,22 +247,25 @@ export class MicroNIRBLEDriver {
   }
 
   async getTemperature(): Promise<number | null> {
-    // 3 reintentos robustos para BLE con timeout extendido a 2.5s
-    for (let i = 0; i < 3; i++) {
+    // Reintentos agresivos para BLE
+    for (let i = 0; i < 4; i++) {
         try {
             if (await this.send(CMD.GET_TEMP, [], true)) {
-                const resp = await this.waitForPacket(2500); 
-                if (resp && resp.includes(0x06)) {
-                    const offset = resp.indexOf(0x06);
+                const resp = await this.waitForPacket(2000); 
+                if (resp && resp.includes(CMD.GET_TEMP)) {
+                    const idx = resp.indexOf(CMD.GET_TEMP);
                     const view = new DataView(resp.buffer, resp.byteOffset, resp.byteLength);
-                    const tempRaw = view.getUint16(offset + 1, false); // ADT7320 Big Endian
-                    if (tempRaw > 0 && tempRaw < 0xFFFF) {
-                        return tempRaw / 1000.0;
+                    const tempRaw = view.getUint16(idx + 1, false);
+                    
+                    if (tempRaw > 0 && tempRaw < 65000) {
+                        let t = tempRaw;
+                        if (t > 1000) t /= 1000.0; else if (t > 500) t /= 100.0;
+                        if (t > 10 && t < 95) return t;
                     }
                 }
             }
         } catch (e) {}
-        await this.sleep(400);
+        await this.sleep(300);
     }
     return null;
   }
