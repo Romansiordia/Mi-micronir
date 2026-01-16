@@ -81,7 +81,7 @@ export class MicroNIRBLEDriver {
   private device: BluetoothDevice | null = null;
   private server: BluetoothRemoteGATTServer | null = null;
   private txChar: BluetoothRemoteGATTCharacteristic | null = null;
-  private listeningChars: BluetoothRemoteGATTCharacteristic[] = [];
+  private rxChar: BluetoothRemoteGATTCharacteristic | null = null;
   
   private keepAliveInterval: any = null;
   private pendingResponse = false;
@@ -101,7 +101,7 @@ export class MicroNIRBLEDriver {
       if (!navigator.bluetooth) return "Navegador incompatible";
       await this.disconnect(); 
 
-      this.log("Escaneando MicroNIR...");
+      this.log("Iniciando 'Impressa Approach' (VIAVI OnSite-W)...");
       this.device = await navigator.bluetooth.requestDevice({
         filters: [{ namePrefix: BLE_CONFIG.namePrefix }],
         optionalServices: [BLE_CONFIG.serviceUUID]
@@ -112,76 +112,93 @@ export class MicroNIRBLEDriver {
       this.log("Conectando GATT...");
       this.server = await this.device.gatt!.connect();
       
-      this.log("Estabilizando...");
-      await this.sleep(2000); 
+      this.log("Estabilizando stack (3s)...");
+      await this.sleep(3000); 
 
       const service = await this.server.getPrimaryService(BLE_CONFIG.serviceUUID);
       this.txChar = await service.getCharacteristic(BLE_CONFIG.txCharUUID);
-      const rxChar = await service.getCharacteristic(BLE_CONFIG.rxCharUUID);
+      this.rxChar = await service.getCharacteristic(BLE_CONFIG.rxCharUUID);
 
-      await rxChar.startNotifications();
-      rxChar.addEventListener('characteristicvaluechanged', this.handleNotifications);
-      this.listeningChars.push(rxChar);
+      this.log("Habilitando notificaciones (Impressa Method)...");
+      await this.rxChar.startNotifications();
+      this.rxChar.addEventListener('characteristicvaluechanged', this.handleNotifications);
 
       this.isConnected = true;
-      this.log("Canales Listos.");
+      this.log("Conexión establecida.");
 
+      // Secuencia crítica de arranque para OnSite-W
       await this.softStartSensor();
       this.startKeepAlive();
       
       return "OK";
     } catch (error: any) {
       this.isConnected = false;
-      this.log(`Error: ${error.message}`);
+      this.log(`Error de conexión: ${error.message}`);
       return error.message || "Error BLE";
     }
   }
 
   private async softStartSensor() {
     this.isBusy = true;
-    this.log("Sincronizando Sensor...");
+    this.log("Sincronizando parámetros MicroNIR 1700...");
 
-    // Limpiar ruidos
+    // Paso 1: Limpiar la tubería con un GET_INFO (Ping)
     await this.send(CMD.GET_INFO, [], true);
-    await this.sleep(300);
+    await this.sleep(1000);
 
-    // Parámetros
-    const scanCount = 100; 
-    const integrationTime = 12000; 
+    // Valores del XML de VIAVI: 500 scans, 12.5ms (12500 us)
+    const scanCount = 500; 
+    const integrationTime = 12500; 
 
-    // Payload de 16 bytes (8 datos + 8 ceros)
-    const payload = [
+    // Payload A: Estándar (8 bytes)
+    const payload8 = [
         (scanCount >> 24) & 0xFF, (scanCount >> 16) & 0xFF, (scanCount >> 8) & 0xFF, scanCount & 0xFF,
-        (integrationTime >> 24) & 0xFF, (integrationTime >> 16) & 0xFF, (integrationTime >> 8) & 0xFF, integrationTime & 0xFF,
-        0,0,0,0,0,0,0,0
+        (integrationTime >> 24) & 0xFF, (integrationTime >> 16) & 0xFF, (integrationTime >> 8) & 0xFF, integrationTime & 0xFF
     ];
 
+    // Payload B: Expandido (16 bytes con padding de ceros) - Común en OnSite-W
+    const payload16 = [...payload8, 0,0,0,0,0,0,0,0];
+
     let configured = false;
-    for(let i=0; i<3; i++) {
-        configured = await this.send(CMD.SET_CONFIG, payload);
-        const ack = await this.waitForPacket(1500);
-        
-        if (ack && ack.length > 2) {
-            const opcode = ack[2]; // Con LEN, el opcode está en el byte 2
-            if (opcode !== 0x15) {
-                this.log("Config OK.");
+    
+    // Intento 1: Formato 8 bytes
+    this.log("Intento 1: Configuración 8-byte...");
+    if (await this.send(CMD.SET_CONFIG, payload8)) {
+        const ack = await this.waitForPacket(2000);
+        if (ack && ack[2] !== 0x15) {
+            configured = true;
+        } else if (ack && ack[2] === 0x15) {
+            this.log("Rechazo NAK 0x15 (8b). Intentando formato 16-byte...");
+        }
+    }
+
+    // Intento 2: Formato 16 bytes (si falló el anterior)
+    if (!configured) {
+        await this.sleep(500);
+        if (await this.send(CMD.SET_CONFIG, payload16)) {
+            const ack = await this.waitForPacket(2000);
+            if (ack && ack[2] !== 0x15) {
                 configured = true;
-                break;
-            } else {
-                this.log("Sensor NAK 0x15. Reintentando...");
             }
         }
-        await this.sleep(500);
     }
     
-    if (!configured) throw new Error("Fallo en configuración (NAK)");
+    if (!configured) {
+        this.log("Error: El sensor no aceptó ninguno de los formatos de configuración.");
+        throw new Error("NAK Config persistente");
+    }
 
-    this.log("Sensor Listo.");
+    this.log("Sensor M1-0000343 Listo.");
     this.isBusy = false;
   }
 
   async disconnect(): Promise<void> {
-    if (this.server && this.server.connected) this.server.disconnect();
+    if (this.server && this.server.connected) {
+        if (this.rxChar) {
+            try { await this.rxChar.stopNotifications(); } catch(e){}
+        }
+        this.server.disconnect();
+    }
     this.disconnectCleanly();
   }
 
@@ -191,7 +208,7 @@ export class MicroNIRBLEDriver {
       if (this.isConnected && !this.pendingResponse && !this.isBusy) { 
          this.getTemperature().catch(() => {});
       }
-    }, 10000); 
+    }, 15000); 
   }
 
   private disconnectCleanly() {
@@ -199,13 +216,13 @@ export class MicroNIRBLEDriver {
     this.isBusy = false;
     this.pendingResponse = false;
     if (this.keepAliveInterval) clearInterval(this.keepAliveInterval);
-    this.listeningChars = [];
     this.rxBuffer = new Uint8Array(0);
     this.txChar = null;
+    this.rxChar = null;
   }
 
   private onDisconnected = () => {
-    this.log("Desconectado.");
+    this.log("Dispositivo desconectado.");
     this.disconnectCleanly();
   };
 
@@ -223,16 +240,16 @@ export class MicroNIRBLEDriver {
   };
 
   private scanForPackets() {
-    const stxIndex = this.rxBuffer.indexOf(0x02);
+    let stxIndex = this.rxBuffer.indexOf(0x02);
     if (stxIndex === -1) {
-       if (this.rxBuffer.length > 4096) this.rxBuffer = new Uint8Array(0);
+       if (this.rxBuffer.length > 8192) this.rxBuffer = new Uint8Array(0);
        return;
     }
 
     for (let i = stxIndex + 1; i < this.rxBuffer.length; i++) {
         if (this.rxBuffer[i] === 0x03) {
             const candidate = this.rxBuffer.slice(stxIndex, i + 1);
-            if (candidate.length >= 5) { // STX + LEN + OP + CRC + ETX = min 5
+            if (candidate.length >= 5) {
                 const payloadForCrc = candidate.slice(1, candidate.length - 2);
                 const packetCrc = candidate[candidate.length - 2];
                 if (calculateCrc8(payloadForCrc) === packetCrc) {
@@ -250,18 +267,18 @@ export class MicroNIRBLEDriver {
     if (!this.isConnected || !this.txChar) return false;
     if (!silent) { this.lastPacket = null; this.pendingResponse = true; }
 
-    // PROTOCOLO ESTÁNDAR: [STX] [LEN] [OPCODE] [DATA...] [CRC8] [ETX]
     const len = data.length + 1;
     const rawPayload = new Uint8Array([len, opcode, ...data]);
     const crc = calculateCrc8(rawPayload);
     const packet = new Uint8Array([0x02, ...rawPayload, crc, 0x03]);
     
-    if (!silent) this.log(`TX >>> Op ${opcode} (${packet.length}B)`);
+    if (!silent) this.log(`TX >>> OP ${opcode.toString(16).toUpperCase()} (${packet.length} bytes)`);
 
     try {
       await this.txChar.writeValue(packet);
       return true;
     } catch (e) {
+      this.log(`Error al enviar TX: ${e}`);
       if (!silent) this.pendingResponse = false;
       return false;
     }
@@ -294,8 +311,11 @@ export class MicroNIRBLEDriver {
   async setLamp(on: boolean): Promise<boolean> {
     this.isBusy = true; 
     const ok = await this.send(CMD.LAMP_CONTROL, [on ? 1 : 0]);
-    await this.waitForPacket(1500);
-    await this.sleep(on ? 2500 : 500); 
+    await this.waitForPacket(2000);
+    if (on) {
+        this.log("Calentando lámpara (5s)...");
+        await this.sleep(5000); 
+    }
     this.isBusy = false;
     return ok;
   }
@@ -303,35 +323,37 @@ export class MicroNIRBLEDriver {
   async resetHardware(): Promise<boolean> {
       this.isBusy = true;
       const ok = await this.send(CMD.RESET);
-      await this.sleep(2000);
+      await this.sleep(3000);
       this.isBusy = false;
       return ok;
   }
 
   async scan(): Promise<Uint16Array | null> {
     this.isBusy = true;
-    this.log("Escaneando...");
+    this.log("Capturando espectro (500 scans @ 12.5ms)...");
     this.rxBuffer = new Uint8Array(0);
     this.lastPacket = null;
 
     if (!await this.send(CMD.SCAN)) { this.isBusy = false; return null; }
     
-    const raw = await this.waitForPacket(15000); // 15s para espectro completo
+    // 500 * 12.5ms = 6.25s. Damos 12s para seguridad por el stack Bluetooth.
+    const raw = await this.waitForPacket(12000); 
     this.isBusy = false;
 
-    if (!raw || (raw.length > 2 && raw[2] === 0x15)) {
-        this.log(raw && raw[2] === 0x15 ? "Error: NAK 0x15" : "Error: Sin respuesta");
+    if (!raw) {
+        this.log("Error: Tiempo de espera agotado en captura.");
         return null;
     }
 
-    this.log(`Datos recibidos (${raw.length} bytes)`);
+    if (raw[2] === 0x15) {
+        this.log("Error: El sensor denegó el escaneo (NAK).");
+        return null;
+    }
 
-    // El espectro son 128 pixeles * 2 bytes = 256 bytes de datos.
-    // [02] [LEN_MSB] [LEN_LSB] [05] [DATA...] [CRC] [03] -> MicroNIR a veces usa 2 bytes para LEN si es > 255
-    let dataOffset = 3;
-    if (raw[1] === 0x05) dataOffset = 2; // Caso sin LEN (poco probable)
-    else if (raw[2] === 0x05) dataOffset = 3; // Caso LEN 1 byte
-    else if (raw[3] === 0x05) dataOffset = 4; // Caso LEN 2 bytes (Muy probable para espectro)
+    // Offset adaptativo basado en el byte de longitud devuelto por MicroNIR
+    let dataOffset = 3; 
+    if (raw[1] > 0x80) dataOffset = 4; // Indica que la longitud usa 2 bytes (común en espectros largos)
+    else if (raw[2] === 0x05) dataOffset = 3;
 
     const s = new Uint16Array(128);
     const view = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
@@ -341,7 +363,7 @@ export class MicroNIRBLEDriver {
             if (idx + 1 < raw.length) s[j] = view.getUint16(idx, false);
         }
     } catch(err) {
-        this.log("Error parseando espectro.");
+        this.log("Error en procesamiento de píxeles.");
     }
     return s;
   }
