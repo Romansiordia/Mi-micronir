@@ -67,7 +67,6 @@ const CMD = {
   GET_INFO: 0x03, 
   SCAN: 0x05,
   GET_TEMP: 0x06,
-  TEMP_INIT: 0x08,
   PING: 0x14,
   RESET: 0x0F
 };
@@ -134,9 +133,6 @@ export class MicroNIRBLEDriver {
     this.log("Sincronizando Firmware...");
     await this.send(CMD.GET_INFO, [], true);
     await this.sleep(500);
-    // Inicialización térmica
-    await this.send(CMD.TEMP_INIT, [], true);
-    await this.sleep(1000);
     const payload = [0x00, 0x64, 0x27, 0x10]; 
     await this.send(CMD.SET_CONFIG, payload);
     await this.waitForPacket(1500);
@@ -159,7 +155,7 @@ export class MicroNIRBLEDriver {
       if (this.isConnected && !this.pendingResponse && !this.isBusy && !this.writeInProgress) { 
          this.send(CMD.PING, [], true).catch(() => {});
       }
-    }, 10000); 
+    }, 15000); 
   }
 
   private disconnectCleanly() {
@@ -252,23 +248,24 @@ export class MicroNIRBLEDriver {
   }
 
   async getTemperature(): Promise<number | null> {
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < 2; i++) {
         try {
             if (await this.send(CMD.GET_TEMP, [], true)) {
                 const resp = await this.waitForPacket(2000); 
-                if (resp && resp.includes(CMD.GET_TEMP)) {
+                if (resp) {
                     const idx = resp.indexOf(CMD.GET_TEMP);
-                    const view = new DataView(resp.buffer, resp.byteOffset, resp.byteLength);
-                    
-                    // Parsing estructurado (Board en idx+1, Detector en idx+3)
-                    const tempDetector = (idx + 4 < resp.length) ? view.getUint16(idx + 3, false) : 0;
-                    const tempBoard = (idx + 2 < resp.length) ? view.getUint16(idx + 1, false) : 0;
-                    
-                    const raw = tempDetector > 0 ? tempDetector : tempBoard;
-                    if (raw > 0 && raw < 65000) {
-                        let t = raw;
-                        if (t > 10000) t /= 1000.0; else if (t > 1000) t /= 100.0;
-                        if (t > 5 && t < 95) return t;
+                    if (idx !== -1 && idx + 4 < resp.length) {
+                        const view = new DataView(resp.buffer, resp.byteOffset, resp.byteLength);
+                        // Probamos offset de detector
+                        const tempDetector = view.getUint16(idx + 3, false);
+                        const tempBoard = view.getUint16(idx + 1, false);
+                        const raw = tempDetector > 0 ? tempDetector : tempBoard;
+                        
+                        if (raw > 0 && raw < 65000) {
+                            let t = raw;
+                            if (t > 10000) t /= 1000.0; else if (t > 1000) t /= 100.0;
+                            if (t > 5 && t < 95) return t;
+                        }
                     }
                 }
             }

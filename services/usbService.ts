@@ -11,13 +11,11 @@ declare global {
 
 const CMD = {
   LAMP_CONTROL: 0x01,
-  SET_INTEGRATION: 0x02,
   GET_INFO: 0x03,
   SCAN: 0x05,
   GET_TEMP: 0x06,
   STATUS_TEMP_PCB: 0x07,
-  TEMP_INIT: 0x08,      // Comando detectado para inicialización térmica
-  PING: 0x14,           // Comando de Keep-Alive detectado
+  PING: 0x14,
   RESET: 0x0F
 };
 
@@ -95,10 +93,6 @@ export class MicroNIRDriver {
 
       this.isConnected = true;
       await this.flushRx();
-      
-      // Inicialización térmica específica para modelos Pro
-      await this.send(CMD.TEMP_INIT);
-      await this.sleep(200);
       await this.send(CMD.PING);
 
       this.log("Hardware VIAVI/JDSU Listo.");
@@ -123,9 +117,7 @@ export class MicroNIRDriver {
   async resetHardware(): Promise<boolean> {
     if (!this.device) return false;
     const ok = await this.send(CMD.RESET);
-    if (ok) {
-        await this.sleep(4000);
-    }
+    if (ok) { await this.sleep(4000); }
     return ok;
   }
 
@@ -147,45 +139,68 @@ export class MicroNIRDriver {
     } catch (e) { return false; }
   }
 
-  async getTemperature(): Promise<number | null> {
-    // Nueva lógica de extracción multivariable basada en el volcado de DLL
-    const strategies = [CMD.GET_TEMP, CMD.STATUS_TEMP_PCB];
+  private parseTemperature(buffer: Uint8Array, opcode: number): number | null {
+    // Buscamos el opcode dentro de la estructura STX [0x02] [LEN] [OPCODE] [DATA]
+    const stxIdx = buffer.indexOf(0x02);
+    if (stxIdx === -1) return null;
     
-    for (const cmd of strategies) {
-        try {
-            if (await this.send(cmd)) {
-                const resp = await this.readPacket(1500); 
-                if (resp && resp.length >= 7) {
-                    const idx = resp.indexOf(cmd);
-                    if (idx !== -1 && idx + 2 < resp.length) {
-                        const view = new DataView(resp.buffer, resp.byteOffset, resp.byteLength);
-                        
-                        // Los modelos Pro suelen enviar un paquete estructurado:
-                        // Byte idx+1, idx+2: Placa (Board)
-                        // Byte idx+3, idx+4: Detector (NIR)
-                        // Byte idx+5, idx+6: Frontal (Forward)
-                        
-                        const tempBoard = view.getUint16(idx + 1, false);
-                        const tempDetector = view.getUint16(idx + 3, false);
-                        const tempForward = (idx + 5 < resp.length) ? view.getUint16(idx + 5, false) : 0;
+    // El opcode debería estar en stxIdx + 2
+    const opIdx = buffer.indexOf(opcode, stxIdx);
+    if (opIdx === -1 || opIdx + 2 >= buffer.length) return null;
 
-                        // Seleccionamos el sensor más estable (Detector) o el que no sea cero
-                        let raw = tempDetector > 0 ? tempDetector : tempBoard;
-                        if (raw === 0) continue;
+    const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+    
+    // Según la DLL, existen varios offsets. Probamos el Detector (más común en Pro)
+    // El offset suele ser +1 (2 bytes) para Board, +3 (2 bytes) para Detector
+    const tempDetector = view.getUint16(opIdx + 3, false);
+    const tempBoard = view.getUint16(opIdx + 1, false);
 
-                        // Conversión de formato VIAVI (normalmente 0.01C o 0.001C)
-                        let processed = raw;
-                        if (processed > 10000) processed /= 1000.0;
-                        else if (processed > 1000) processed /= 100.0;
-                        else if (processed > 500) processed /= 10.0;
-                        
-                        if (processed > 5 && processed < 95) return processed;
-                    }
-                }
-            }
-        } catch (e) {}
-        await this.sleep(100);
+    let raw = tempDetector > 0 && tempDetector < 65000 ? tempDetector : tempBoard;
+    if (raw === 0) return null;
+
+    // Normalización: 25000 -> 25.0C o 250 -> 25.0C
+    let t = raw;
+    if (t > 10000) t /= 1000.0;
+    else if (t > 1000) t /= 100.0;
+    else if (t > 500) t /= 10.0;
+
+    return (t > 5 && t < 95) ? t : null;
+  }
+
+  async getTemperature(): Promise<number | null> {
+    // Estrategia 1: Comando específico (0x06)
+    if (await this.send(CMD.GET_TEMP)) {
+        const resp = await this.readPacket(800);
+        if (resp) {
+            const t = this.parseTemperature(resp, CMD.GET_TEMP);
+            if (t !== null) return t;
+        }
     }
+
+    // Estrategia 2: Fallback al registro STATUS_TEMP_PCB (0x07)
+    await this.sleep(100);
+    if (await this.send(CMD.STATUS_TEMP_PCB)) {
+        const resp = await this.readPacket(800);
+        if (resp) {
+            const t = this.parseTemperature(resp, CMD.STATUS_TEMP_PCB);
+            if (t !== null) return t;
+        }
+    }
+
+    // Estrategia 3: Fallback a GET_INFO (0x03) - Muchos Pro incluyen telemetría aquí
+    await this.sleep(100);
+    if (await this.send(CMD.GET_INFO)) {
+        const resp = await this.readPacket(800);
+        if (resp) {
+            // En INFO, los offsets suelen ser fijos al final del paquete (bytes 20-30 aprox)
+            const view = new DataView(resp.buffer, resp.byteOffset, resp.byteLength);
+            for (let i = 4; i < resp.length - 2; i += 2) {
+                const val = view.getUint16(i, false);
+                if (val > 20000 && val < 45000) return val / 1000.0;
+            }
+        }
+    }
+
     return null;
   }
 
@@ -195,7 +210,7 @@ export class MicroNIRDriver {
         this.log("Estabilizando Lámpara (VIAVI)...");
         for(let i=0; i<6; i++) {
             await this.sleep(800);
-            await this.send(CMD.PING); // Usamos PING en lugar de GET_INFO para no saturar
+            await this.send(CMD.PING);
         }
     }
     return ok;
