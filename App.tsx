@@ -50,20 +50,16 @@ export default function App() {
     setLogs(prev => [`[${time}] ${msg}`, ...prev.slice(0, 199)]);
   };
 
-  // Efecto para monitoreo automático de temperatura
   useEffect(() => {
     let interval: any;
 
     if (status === 'ready') {
       const updateTemp = async () => {
-        // Solo pedimos temperatura si no estamos haciendo un scan o calibración
         if (!isBusy) {
           try {
             const currentTemp = await activeDevice.getTemperature();
             if (currentTemp !== null) {
               setTemp(currentTemp);
-              // Solo logueamos si el cambio es relevante para no saturar la terminal
-              // addLogEntry(`Temperatura: ${currentTemp.toFixed(1)}°C`);
             }
           } catch (e) {
             console.error("Error polling temperature", e);
@@ -71,10 +67,7 @@ export default function App() {
         }
       };
 
-      // Primera ejecución inmediata
       updateTemp();
-      
-      // Intervalo cada 10 segundos
       interval = setInterval(updateTemp, 10000);
     } else {
       setTemp(null);
@@ -151,7 +144,6 @@ export default function App() {
     if (ok) {
       setLamp(newState);
       addLogEntry(`Lámpara ${newState ? 'ENCENDIDA' : 'APAGADA'}`);
-      // Pedimos temperatura inmediatamente después de cambiar la lámpara
       const t = await activeDevice.getTemperature();
       if (t !== null) setTemp(t);
     }
@@ -256,7 +248,15 @@ export default function App() {
           ) : (
             <div className="flex gap-3">
                <button onClick={disconnect} className="bg-slate-800 text-slate-400 px-3 py-3 rounded-xl hover:bg-red-900/30 transition-all"><Power size={18} /></button>
-              <button onClick={toggleLamp} disabled={isBusy} className={`px-5 py-3 rounded-xl font-bold border flex items-center gap-2 ${lamp ? 'bg-orange-500 text-white border-orange-400' : 'bg-slate-800 border-slate-700 text-slate-400 animate-pulse'}`}>
+              <button 
+                onClick={toggleLamp} 
+                disabled={isBusy} 
+                className={`px-5 py-3 rounded-xl font-bold border flex items-center gap-2 transition-all duration-500 ${
+                  lamp 
+                    ? 'bg-yellow-400 text-slate-900 border-yellow-200 shadow-[0_0_15px_rgba(250,204,21,0.6)]' 
+                    : 'bg-slate-800 border-slate-700 text-slate-400 animate-pulse'
+                }`}
+              >
                 <Zap size={18} fill={lamp ? "currentColor" : "none"} /> {lamp ? 'LÁMPARA ON' : 'ENCENDER LÁMPARA'}
               </button>
               <div className="bg-slate-800 px-5 py-3 rounded-xl flex items-center gap-2 border border-slate-700">

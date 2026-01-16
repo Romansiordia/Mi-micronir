@@ -140,25 +140,25 @@ export class MicroNIRDriver {
   }
 
   private parseTemperature(buffer: Uint8Array, opcode: number): number | null {
-    // Buscamos el opcode dentro de la estructura STX [0x02] [LEN] [OPCODE] [DATA]
     const stxIdx = buffer.indexOf(0x02);
     if (stxIdx === -1) return null;
     
-    // El opcode debería estar en stxIdx + 2
     const opIdx = buffer.indexOf(opcode, stxIdx);
     if (opIdx === -1 || opIdx + 2 >= buffer.length) return null;
 
     const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
     
-    // Según la DLL, existen varios offsets. Probamos el Detector (más común en Pro)
-    // El offset suele ser +1 (2 bytes) para Board, +3 (2 bytes) para Detector
-    const tempDetector = view.getUint16(opIdx + 3, false);
-    const tempBoard = view.getUint16(opIdx + 1, false);
+    // Telemetría Pro: Detector en +3, Board en +1
+    let tempDetector = view.getUint16(opIdx + 3, false);
+    let tempBoard = view.getUint16(opIdx + 1, false);
 
-    let raw = tempDetector > 0 && tempDetector < 65000 ? tempDetector : tempBoard;
-    if (raw === 0) return null;
+    // Si los valores parecen Little Endian por error, los invertimos
+    if (tempDetector > 60000) tempDetector = ((tempDetector & 0xFF) << 8) | (tempDetector >> 8);
+    if (tempBoard > 60000) tempBoard = ((tempBoard & 0xFF) << 8) | (tempBoard >> 8);
 
-    // Normalización: 25000 -> 25.0C o 250 -> 25.0C
+    let raw = (tempDetector > 500 && tempDetector < 55000) ? tempDetector : tempBoard;
+    if (raw === 0 || raw > 60000) return null;
+
     let t = raw;
     if (t > 10000) t /= 1000.0;
     else if (t > 1000) t /= 100.0;
@@ -168,7 +168,7 @@ export class MicroNIRDriver {
   }
 
   async getTemperature(): Promise<number | null> {
-    // Estrategia 1: Comando específico (0x06)
+    // Intentar GET_TEMP (0x06) primero
     if (await this.send(CMD.GET_TEMP)) {
         const resp = await this.readPacket(800);
         if (resp) {
@@ -177,26 +177,17 @@ export class MicroNIRDriver {
         }
     }
 
-    // Estrategia 2: Fallback al registro STATUS_TEMP_PCB (0x07)
-    await this.sleep(100);
-    if (await this.send(CMD.STATUS_TEMP_PCB)) {
-        const resp = await this.readPacket(800);
-        if (resp) {
-            const t = this.parseTemperature(resp, CMD.STATUS_TEMP_PCB);
-            if (t !== null) return t;
-        }
-    }
-
-    // Estrategia 3: Fallback a GET_INFO (0x03) - Muchos Pro incluyen telemetría aquí
+    // Estrategia GET_INFO (0x03) - Muchos modelos Pro mandan telemetría aquí
     await this.sleep(100);
     if (await this.send(CMD.GET_INFO)) {
         const resp = await this.readPacket(800);
-        if (resp) {
-            // En INFO, los offsets suelen ser fijos al final del paquete (bytes 20-30 aprox)
+        if (resp && resp.length > 20) {
             const view = new DataView(resp.buffer, resp.byteOffset, resp.byteLength);
-            for (let i = 4; i < resp.length - 2; i += 2) {
+            // Escaneo de posibles candidatos a temperatura en el paquete INFO
+            for (let i = 8; i < resp.length - 4; i += 2) {
                 const val = view.getUint16(i, false);
-                if (val > 20000 && val < 45000) return val / 1000.0;
+                if (val > 25000 && val < 45000) return val / 1000.0;
+                if (val > 250 && val < 450) return val / 10.0;
             }
         }
     }
@@ -207,10 +198,12 @@ export class MicroNIRDriver {
   async setLamp(on: boolean): Promise<boolean> {
     const ok = await this.send(CMD.LAMP_CONTROL, [on ? 1 : 0]);
     if (on && ok) {
-        this.log("Estabilizando Lámpara (VIAVI)...");
-        for(let i=0; i<6; i++) {
-            await this.sleep(800);
+        this.log("Calentando Lámpara (Dwell VIAVI)...");
+        // Los Pro requieren ~5 segundos de estabilización
+        for(let i=1; i<=5; i++) {
+            await this.sleep(1000);
             await this.send(CMD.PING);
+            this.log(`Estabilizando... ${i}/5s`);
         }
     }
     return ok;
