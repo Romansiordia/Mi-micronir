@@ -142,17 +142,22 @@ export class MicroNIRBLEDriver {
     this.isBusy = true;
     
     this.log("Despertando MCU...");
-    for(let k=0; k<3; k++) {
-        await this.send(CMD.GET_TEMP, [], true); 
+    // Intentamos limpiar cualquier estado previo
+    for(let k=0; k<2; k++) {
+        await this.send(CMD.GET_INFO, [], true); 
         await this.sleep(300);
     }
     
-    const scanCount = 100; 
-    const integrationTime = 10000; 
+    // Configuración ajustada para BLE (menos escaneos para evitar timeouts de buffer)
+    const scanCount = 50; 
+    const integrationTime = 12000; 
 
+    // CRÍTICO: Añadido padding (8 bytes de ceros al final). 
+    // El firmware espera 16 bytes totales de payload + headers
     const payload = [
         (scanCount >> 24) & 0xFF, (scanCount >> 16) & 0xFF, (scanCount >> 8) & 0xFF, scanCount & 0xFF,
-        (integrationTime >> 24) & 0xFF, (integrationTime >> 16) & 0xFF, (integrationTime >> 8) & 0xFF, integrationTime & 0xFF
+        (integrationTime >> 24) & 0xFF, (integrationTime >> 16) & 0xFF, (integrationTime >> 8) & 0xFF, integrationTime & 0xFF,
+        0, 0, 0, 0, 0, 0, 0, 0 // PADDING NECESARIO
     ];
 
     this.log("Enviando Config (Sync)...");
@@ -161,14 +166,20 @@ export class MicroNIRBLEDriver {
     for(let i=0; i<3; i++) {
         configured = await this.send(CMD.SET_CONFIG, payload, false);
         if(configured) {
-           await this.waitForPacket(1000); 
-           break;
+           const ack = await this.waitForPacket(1500); 
+           // Verificamos que NO sea un NAK (0x15)
+           if (ack && ack.length > 2 && ack[2] !== 0x15) {
+               this.log("Configuración Aceptada.");
+               break;
+           } else if (ack && ack.length > 2 && ack[2] === 0x15) {
+               this.log("Config RECHAZADA (NAK 0x15). Reintentando...");
+               configured = false;
+           }
         }
-        this.log("Reintento Configuración...");
         await this.sleep(600);
     }
     
-    if (!configured) throw new Error("Fallo en configuración inicial (Reject)");
+    if (!configured) throw new Error("Fallo en configuración (NAK)");
 
     this.log("Sensor Online (Ready).");
     await this.sleep(200);
@@ -211,7 +222,6 @@ export class MicroNIRBLEDriver {
     if (!value) return;
 
     const chunk = new Uint8Array(value.buffer);
-    // LOG VERBOSE: Ver qué llega en HEX
     this.log(`RX <<< ${toHex(chunk)}`);
     
     const newBuffer = new Uint8Array(this.rxBuffer.length + chunk.length);
@@ -225,7 +235,7 @@ export class MicroNIRBLEDriver {
   private scanForPackets() {
     const stxIndex = this.rxBuffer.indexOf(0x02);
     if (stxIndex === -1) {
-       if (this.rxBuffer.length > 1024) { // Limite aumentado para espectros grandes
+       if (this.rxBuffer.length > 1024) { 
           this.log("Buffer overflow (limpieza)");
           this.rxBuffer = new Uint8Array(0);
        }
@@ -262,7 +272,6 @@ export class MicroNIRBLEDriver {
     const crc = calculateCrc8(rawPayload);
     const packet = new Uint8Array([0x02, ...rawPayload, crc, 0x03]);
     
-    // LOG VERBOSE: Ver qué sale
     if (!silent) this.log(`TX >>> Op ${opcode} (${packet.length}B)`);
 
     try {
@@ -303,6 +312,15 @@ export class MicroNIRBLEDriver {
   async setLamp(on: boolean): Promise<boolean> {
     this.isBusy = true; 
     const ok = await this.send(CMD.LAMP_CONTROL, [on ? 1 : 0]);
+    // Esperar respuesta para ver si dio NAK (0x15)
+    const resp = await this.waitForPacket(1000);
+    
+    if (resp && resp.length > 2 && resp[2] === 0x15) {
+        this.log("Error Lamp: Device Busy (0x15)");
+        this.isBusy = false;
+        return false;
+    }
+
     await this.sleep(on ? 2500 : 1000); 
     this.isBusy = false;
     return ok;
@@ -323,16 +341,21 @@ export class MicroNIRBLEDriver {
     this.rxBuffer = new Uint8Array(0);
     this.lastPacket = null;
 
-    // Opcode SCAN = 0x05
     if (!await this.send(CMD.SCAN)) { 
         this.isBusy = false; 
         return null; 
     }
     
-    // Esperamos mas tiempo (10s) para espectro completo por BLE
     const raw = await this.waitForPacket(10000);
     
     this.isBusy = false;
+    
+    // Check de NAK
+    if (raw && raw.length > 2 && raw[2] === 0x15) {
+        this.log("SCAN RECHAZADO (Device Busy/Unconfigured)");
+        return null;
+    }
+
     if (!raw) {
         this.log("Fallo: No llegó espectro");
         return null;
@@ -345,7 +368,6 @@ export class MicroNIRBLEDriver {
     
     const s = new Uint16Array(128);
     const view = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
-    // Protección contra buffer corto
     try {
         for(let j=0; j<128; j++) {
             const idx = offset + (j*2);
