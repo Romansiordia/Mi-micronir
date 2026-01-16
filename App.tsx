@@ -216,7 +216,7 @@ export default function App() {
             <ShieldCheck className="text-blue-500" />
             MicroNIR <span className="text-blue-400 bg-blue-500/10 px-2 rounded text-lg border border-blue-500/20">QUANTUM</span>
           </h1>
-          <p className="text-xs text-slate-500 font-mono mt-1 uppercase ml-1">v15.0 Protocol Safe • {connectionType.toUpperCase()}</p>
+          <p className="text-xs text-slate-500 font-mono mt-1 uppercase ml-1">Protocol Safe v15.2 • VIAVI Core • {connectionType.toUpperCase()}</p>
         </div>
         
         <div className="flex flex-col md:flex-row gap-4 items-center">
@@ -253,13 +253,13 @@ export default function App() {
                 disabled={isBusy} 
                 className={`px-5 py-3 rounded-xl font-bold border flex items-center gap-2 transition-all duration-500 ${
                   lamp 
-                    ? 'bg-yellow-400 text-slate-900 border-yellow-200 shadow-[0_0_15px_rgba(250,204,21,0.6)]' 
-                    : 'bg-slate-800 border-slate-700 text-slate-400 animate-pulse'
+                    ? 'bg-yellow-400 text-slate-900 border-yellow-200 shadow-[0_0_20px_rgba(250,204,21,0.7)]' 
+                    : 'bg-slate-800 border-slate-700 text-slate-400'
                 }`}
               >
-                <Zap size={18} fill={lamp ? "currentColor" : "none"} /> {lamp ? 'LÁMPARA ON' : 'ENCENDER LÁMPARA'}
+                <Zap size={18} fill={lamp ? "currentColor" : "none"} className={lamp ? "animate-pulse" : ""} /> {lamp ? 'LÁMPARA ON' : 'ENCENDER LÁMPARA'}
               </button>
-              <div className="bg-slate-800 px-5 py-3 rounded-xl flex items-center gap-2 border border-slate-700">
+              <div className="bg-slate-800 px-5 py-3 rounded-xl flex items-center gap-2 border border-slate-700 min-w-[100px] justify-center">
                 <Thermometer size={18} className={temp !== null ? "text-emerald-400" : "text-slate-600"}/>
                 <span className="font-mono font-bold text-lg">{temp !== null ? temp.toFixed(1) : '--'}°C</span>
               </div>
@@ -273,29 +273,29 @@ export default function App() {
           <div className="bg-slate-900/50 p-6 rounded-3xl border border-slate-800">
             <h3 className="text-xs font-black text-slate-500 uppercase tracking-widest mb-6">Secuencia de Calibración</h3>
             <div className="space-y-3">
-              <button disabled={status !== 'ready' || !lamp || isBusy} onClick={() => calibrate('dark')} className={`w-full p-4 rounded-xl border flex items-center justify-between ${darkRef ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-400' : 'bg-slate-800 text-slate-400'}`}>
+              <button disabled={status !== 'ready' || !lamp || isBusy} onClick={() => calibrate('dark')} className={`w-full p-4 rounded-xl border flex items-center justify-between transition-all ${darkRef ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-400' : 'bg-slate-800 text-slate-400'}`}>
                 <span>{(!lamp && status === 'ready') ? 'REQ. LÁMPARA ENCENDIDA' : '1. REF. OSCURA (TAPAR)'}</span>
                 {darkRef && <CheckCircle2 size={18} />}
               </button>
-              <button disabled={status !== 'ready' || !lamp || isBusy} onClick={() => calibrate('white')} className={`w-full p-4 rounded-xl border flex items-center justify-between ${whiteRef ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-400' : 'bg-slate-800 text-slate-400'}`}>
+              <button disabled={status !== 'ready' || !lamp || isBusy} onClick={() => calibrate('white')} className={`w-full p-4 rounded-xl border flex items-center justify-between transition-all ${whiteRef ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-400' : 'bg-slate-800 text-slate-400'}`}>
                 <span>{(!lamp && status === 'ready') ? 'REQ. LÁMPARA ENCENDIDA' : '2. REF. BLANCA (MUESTRA)'}</span>
                 {whiteRef && <CheckCircle2 size={18} />}
               </button>
             </div>
           </div>
-          <button disabled={!darkRef || !whiteRef || !lamp || isBusy} onClick={measure} className={`w-full py-8 rounded-3xl font-black text-xl uppercase flex items-center justify-center gap-3 ${(darkRef && whiteRef && lamp && !isBusy) ? 'bg-gradient-to-r from-blue-600 to-indigo-600 text-white' : 'bg-slate-800 text-slate-600'}`}>
+          <button disabled={!darkRef || !whiteRef || !lamp || isBusy} onClick={measure} className={`w-full py-8 rounded-3xl font-black text-xl uppercase flex items-center justify-center gap-3 transition-all ${(darkRef && whiteRef && lamp && !isBusy) ? 'bg-gradient-to-r from-blue-600 to-indigo-600 text-white shadow-lg shadow-blue-500/20' : 'bg-slate-800 text-slate-600'}`}>
             {isBusy ? <RefreshCw className="animate-spin" size={28} /> : <Activity size={28} />} Analizar Muestra
           </button>
-           <div className={`bg-slate-900 p-8 rounded-3xl border text-center ${prediction !== "--" ? 'border-emerald-500/30' : 'border-slate-800'}`}>
-               <span className="text-xs text-slate-500 font-bold uppercase block mb-2">Resultado Análisis</span>
+           <div className={`bg-slate-900 p-8 rounded-3xl border text-center transition-all ${prediction !== "--" ? 'border-emerald-500/30 bg-slate-900/80' : 'border-slate-800'}`}>
+               <span className="text-xs text-slate-500 font-bold uppercase block mb-2 tracking-tighter">Resultado Análisis de Proteína</span>
                <div className="flex items-baseline justify-center gap-1"><span className="text-7xl font-black text-white">{prediction}</span><span className="text-2xl text-slate-600 font-bold">%</span></div>
             </div>
         </div>
 
         <div className="lg:col-span-8 bg-slate-900/50 p-6 rounded-3xl border border-slate-800 flex flex-col min-h-[500px]">
           <div className="flex justify-between items-center mb-6 px-2">
-            <h3 className="text-xs font-black text-slate-500 uppercase tracking-widest"><BarChart3 size={14} className="inline mr-2" /> Espectro NIR</h3>
-            {aiAnalysis && <div className="bg-blue-500/10 px-4 py-2 rounded-xl border border-blue-500/20 text-[11px] text-blue-200">{aiAnalysis}</div>}
+            <h3 className="text-xs font-black text-slate-500 uppercase tracking-widest"><BarChart3 size={14} className="inline mr-2" /> Espectro NIR (900-1700nm)</h3>
+            {aiAnalysis && <div className="bg-blue-500/10 px-4 py-2 rounded-xl border border-blue-500/20 text-[11px] text-blue-200 animate-in fade-in slide-in-from-top-1">{aiAnalysis}</div>}
           </div>
           <div className="flex-1 w-full bg-slate-950/30 rounded-2xl border border-slate-800/50 p-4">
              <ResponsiveContainer width="100%" height="100%">
@@ -313,11 +313,11 @@ export default function App() {
 
       <div className={`fixed bottom-0 left-0 right-0 bg-slate-950/95 border-t border-slate-800 transition-all ${showLogs ? 'h-80' : 'h-10'}`}>
         <div className="flex items-center justify-between px-4 h-10 bg-slate-900 cursor-pointer" onClick={() => setShowLogs(!showLogs)}>
-            <div className="flex items-center gap-2 text-xs font-mono text-slate-400"><Terminal size={14} /> <b>TERMINAL</b></div>
-            <button onClick={(e) => { e.stopPropagation(); setLogs([]); }} className="text-slate-500"><Trash2 size={14} /></button>
+            <div className="flex items-center gap-2 text-xs font-mono text-slate-400"><Terminal size={14} /> <b>TERMINAL HARDWARE</b></div>
+            <button onClick={(e) => { e.stopPropagation(); setLogs([]); }} className="text-slate-500 hover:text-red-400"><Trash2 size={14} /></button>
         </div>
         {showLogs && (
-            <div className="flex-1 overflow-y-auto p-4 font-mono text-xs space-y-1">
+            <div className="flex-1 overflow-y-auto p-4 font-mono text-[10px] space-y-1">
                 {logs.map((log, i) => (
                     <div key={i} className={`break-all ${log.includes('RX') ? 'text-emerald-400' : log.includes('TX') ? 'text-blue-400' : log.includes('Error') ? 'text-red-400' : 'text-slate-400'}`}>{log}</div>
                 ))}

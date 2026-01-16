@@ -14,7 +14,7 @@ const CMD = {
   GET_INFO: 0x03,
   SCAN: 0x05,
   GET_TEMP: 0x06,
-  STATUS_TEMP_PCB: 0x07,
+  STATUS_REPORT: 0x18, // Comando 'X' mencionado en el doc
   PING: 0x14,
   RESET: 0x0F
 };
@@ -85,7 +85,7 @@ export class MicroNIRDriver {
       this.inEndpoint = alt.endpoints.find((e: any) => e.direction === 'in').endpointNumber;
       this.outEndpoint = alt.endpoints.find((e: any) => e.direction === 'out').endpointNumber;
       
-      this.log("Inicializando MicroNIR Pro...");
+      this.log("Handshake MicroNIR Pro...");
       await this.ctrl(0x00, 0x00, 0x00);
       await this.ctrl(0x03, 0x4138, 0x00);
       await this.ctrl(0x04, 0x0008, 0x00); 
@@ -95,7 +95,7 @@ export class MicroNIRDriver {
       await this.flushRx();
       await this.send(CMD.PING);
 
-      this.log("Hardware VIAVI/JDSU Listo.");
+      this.log("Hardware listo.");
       return "OK";
     } catch (error: any) {
       this.isConnected = false;
@@ -139,82 +139,53 @@ export class MicroNIRDriver {
     } catch (e) { return false; }
   }
 
-  private parseTemperature(buffer: Uint8Array, opcode: number): number | null {
-    const stxIdx = buffer.indexOf(0x02);
-    if (stxIdx === -1) return null;
-    
-    const opIdx = buffer.indexOf(opcode, stxIdx);
-    if (opIdx === -1 || opIdx + 2 >= buffer.length) return null;
-
-    const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
-    
-    // Telemetría Pro: Detector en +3, Board en +1
-    let tempDetector = view.getUint16(opIdx + 3, false);
-    let tempBoard = view.getUint16(opIdx + 1, false);
-
-    // Si los valores parecen Little Endian por error, los invertimos
-    if (tempDetector > 60000) tempDetector = ((tempDetector & 0xFF) << 8) | (tempDetector >> 8);
-    if (tempBoard > 60000) tempBoard = ((tempBoard & 0xFF) << 8) | (tempBoard >> 8);
-
-    let raw = (tempDetector > 500 && tempDetector < 55000) ? tempDetector : tempBoard;
-    if (raw === 0 || raw > 60000) return null;
-
-    let t = raw;
-    if (t > 10000) t /= 1000.0;
-    else if (t > 1000) t /= 100.0;
-    else if (t > 500) t /= 10.0;
-
-    return (t > 5 && t < 95) ? t : null;
+  private convertADT7320(raw: number): number {
+    // El doc menciona ADT7320: 13-bit signed fixed-point.
+    // Estructura: [D15-D3] es el dato. D15 es signo.
+    // Convertimos a 16 bits con signo real.
+    let val = (raw & 0xFFF8) >> 3; 
+    if (val & 0x1000) { // Si el bit 13 (signo) está activo
+      val -= 0x2000; 
+    }
+    return val / 16.0;
   }
 
   async getTemperature(): Promise<number | null> {
-    // Intentar GET_TEMP (0x06) primero
+    // Según SpectraDataPacket, la temperatura viene en el bloque extendido
     if (await this.send(CMD.GET_TEMP)) {
-        const resp = await this.readPacket(800);
+        const resp = await this.readPacket(1000);
         if (resp) {
-            const t = this.parseTemperature(resp, CMD.GET_TEMP);
-            if (t !== null) return t;
-        }
-    }
-
-    // Estrategia GET_INFO (0x03) - Muchos modelos Pro mandan telemetría aquí
-    await this.sleep(100);
-    if (await this.send(CMD.GET_INFO)) {
-        const resp = await this.readPacket(800);
-        if (resp && resp.length > 20) {
             const view = new DataView(resp.buffer, resp.byteOffset, resp.byteLength);
-            // Escaneo de posibles candidatos a temperatura en el paquete INFO
-            for (let i = 8; i < resp.length - 4; i += 2) {
-                const val = view.getUint16(i, false);
-                if (val > 25000 && val < 45000) return val / 1000.0;
-                if (val > 250 && val < 450) return val / 10.0;
+            // El offset suele ser fijo después de los píxeles en el paquete de 288 bytes
+            const tempIdx = resp.indexOf(CMD.GET_TEMP) + 1;
+            if (tempIdx > 0 && tempIdx + 2 < resp.length) {
+                const rawTemp = view.getUint16(tempIdx, false);
+                const t = this.convertADT7320(rawTemp);
+                if (t > 5 && t < 85) return t;
             }
         }
     }
-
     return null;
   }
 
   async setLamp(on: boolean): Promise<boolean> {
     const ok = await this.send(CMD.LAMP_CONTROL, [on ? 1 : 0]);
     if (on && ok) {
-        this.log("Calentando Lámpara (Dwell VIAVI)...");
-        // Los Pro requieren ~5 segundos de estabilización
-        for(let i=1; i<=5; i++) {
-            await this.sleep(1000);
-            await this.send(CMD.PING);
-            this.log(`Estabilizando... ${i}/5s`);
-        }
+        this.log("Calentando Lámpara (Dwell)...");
+        await this.sleep(3000);
+        // Verificamos estado con comando 'X' (STATUS_REPORT)
+        await this.send(CMD.STATUS_REPORT);
     }
     return ok;
   }
 
   async scan(): Promise<Uint16Array | null> {
     if (!await this.send(CMD.SCAN)) return null;
-    const raw = await this.readPacket(12000);
+    const raw = await this.readPacket(15000);
     if (!raw) return null;
     
-    let offset = raw.indexOf(0x05) + 1;
+    // PacketSize = 288 bytes. 128 píxeles * 2 bytes = 256 bytes.
+    let offset = raw.indexOf(CMD.SCAN) + 1;
     const s = new Uint16Array(128);
     const view = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
     for(let j=0; j<128; j++) {
@@ -235,9 +206,12 @@ export class MicroNIRDriver {
           const next = new Uint8Array(acc.length + chunk.length);
           next.set(acc); next.set(chunk, acc.length);
           acc = next;
-          if (acc.includes(0x03) && acc.includes(0x02)) return acc;
+          // Buscamos terminador ETX y longitud profesional
+          if (acc.includes(0x03) && acc.includes(0x02)) {
+              if (acc.length >= 288 || acc.length >= 64) return acc;
+          }
         }
-      } catch (e) { await this.sleep(30); }
+      } catch (e) { await this.sleep(20); }
     }
     return acc.length > 0 ? acc : null;
   }

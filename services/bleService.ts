@@ -155,7 +155,7 @@ export class MicroNIRBLEDriver {
       if (this.isConnected && !this.pendingResponse && !this.isBusy && !this.writeInProgress) { 
          this.send(CMD.PING, [], true).catch(() => {});
       }
-    }, 15000); 
+    }, 12000); 
   }
 
   private disconnectCleanly() {
@@ -247,6 +247,12 @@ export class MicroNIRBLEDriver {
     return null;
   }
 
+  private convertADT7320(raw: number): number {
+    let val = (raw & 0xFFF8) >> 3; 
+    if (val & 0x1000) val -= 0x2000; 
+    return val / 16.0;
+  }
+
   async getTemperature(): Promise<number | null> {
     for (let i = 0; i < 2; i++) {
         try {
@@ -254,18 +260,11 @@ export class MicroNIRBLEDriver {
                 const resp = await this.waitForPacket(2000); 
                 if (resp) {
                     const idx = resp.indexOf(CMD.GET_TEMP);
-                    if (idx !== -1 && idx + 4 < resp.length) {
+                    if (idx !== -1 && idx + 2 < resp.length) {
                         const view = new DataView(resp.buffer, resp.byteOffset, resp.byteLength);
-                        // Probamos offset de detector
-                        const tempDetector = view.getUint16(idx + 3, false);
-                        const tempBoard = view.getUint16(idx + 1, false);
-                        const raw = tempDetector > 0 ? tempDetector : tempBoard;
-                        
-                        if (raw > 0 && raw < 65000) {
-                            let t = raw;
-                            if (t > 10000) t /= 1000.0; else if (t > 1000) t /= 100.0;
-                            if (t > 5 && t < 95) return t;
-                        }
+                        const rawTemp = view.getUint16(idx + 1, false);
+                        const t = this.convertADT7320(rawTemp);
+                        if (t > 5 && t < 85) return t;
                     }
                 }
             }
@@ -281,10 +280,8 @@ export class MicroNIRBLEDriver {
     await this.waitForPacket(1500);
     if (on && ok) {
         this.log("Calentando sensor...");
-        for(let i=1; i<=8; i++) {
-            await this.sleep(600);
-            await this.send(CMD.PING, [], true); 
-        }
+        await this.sleep(4000);
+        await this.send(CMD.PING, [], true); 
     }
     this.isBusy = false;
     return ok;
@@ -308,7 +305,7 @@ export class MicroNIRBLEDriver {
     this.isBusy = false;
     if (!raw) return null;
     
-    let offset = raw.indexOf(0x05);
+    let offset = raw.indexOf(CMD.SCAN);
     if (offset === -1) offset = 3; else offset += 1;
     const s = new Uint16Array(128);
     const view = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
