@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { 
   Usb, Activity, RefreshCw, Zap, AlertCircle, CheckCircle2, 
   BarChart3, Settings2, ShieldCheck, Thermometer, Power, Bluetooth, XCircle, Terminal, Trash2, ShieldAlert
@@ -50,6 +50,41 @@ export default function App() {
     setLogs(prev => [`[${time}] ${msg}`, ...prev.slice(0, 199)]);
   };
 
+  // Efecto para monitoreo automático de temperatura
+  useEffect(() => {
+    let interval: any;
+
+    if (status === 'ready') {
+      const updateTemp = async () => {
+        // Solo pedimos temperatura si no estamos haciendo un scan o calibración
+        if (!isBusy) {
+          try {
+            const currentTemp = await activeDevice.getTemperature();
+            if (currentTemp !== null) {
+              setTemp(currentTemp);
+              // Solo logueamos si el cambio es relevante para no saturar la terminal
+              // addLogEntry(`Temperatura: ${currentTemp.toFixed(1)}°C`);
+            }
+          } catch (e) {
+            console.error("Error polling temperature", e);
+          }
+        }
+      };
+
+      // Primera ejecución inmediata
+      updateTemp();
+      
+      // Intervalo cada 10 segundos
+      interval = setInterval(updateTemp, 10000);
+    } else {
+      setTemp(null);
+    }
+
+    return () => {
+      if (interval) clearInterval(interval);
+    };
+  }, [status, activeDevice, isBusy]);
+
   useEffect(() => {
     const isSecure = window.location.protocol === 'https:' || window.location.hostname === 'localhost';
     if (!isSecure) {
@@ -80,6 +115,7 @@ export default function App() {
         setTemp(t);
         setStatus('ready');
         setStatusMsg(`Sensor Online (${connectionType.toUpperCase()})`);
+        addLogEntry("Conexión establecida correctamente.");
       } else {
         setStatus('error');
         setStatusMsg(res);
@@ -110,19 +146,28 @@ export default function App() {
   const toggleLamp = async () => {
     if (status !== 'ready' || isBusy) return;
     setIsBusy(true);
-    const ok = await activeDevice.setLamp(!lamp);
-    if (ok) setLamp(!lamp);
+    const newState = !lamp;
+    const ok = await activeDevice.setLamp(newState);
+    if (ok) {
+      setLamp(newState);
+      addLogEntry(`Lámpara ${newState ? 'ENCENDIDA' : 'APAGADA'}`);
+      // Pedimos temperatura inmediatamente después de cambiar la lámpara
+      const t = await activeDevice.getTemperature();
+      if (t !== null) setTemp(t);
+    }
     setIsBusy(false);
   };
 
   const calibrate = async (type: 'dark' | 'white') => {
     if (isBusy) return;
     setIsBusy(true);
+    addLogEntry(`Iniciando calibración ${type.toUpperCase()}...`);
     const data = await activeDevice.scan();
     if (data) {
       if (type === 'dark') setDarkRef(data);
       else setWhiteRef(data);
       setStatusMsg(`Calibración ${type} OK`);
+      addLogEntry(`Calibración ${type} exitosa.`);
     } else {
       setStatusMsg(`Error al leer ${type}`);
       addLogEntry(`Fallo calibración ${type} (Scan null)`);
@@ -133,6 +178,7 @@ export default function App() {
   const measure = async () => {
     if (isBusy) return;
     setIsBusy(true);
+    addLogEntry("Iniciando análisis de muestra...");
     const raw = await activeDevice.scan();
     if (raw && darkRef && whiteRef) {
       const plotData: WavelengthPoint[] = [];
@@ -149,10 +195,16 @@ export default function App() {
         score += absData[i] * CDM_MODEL.betaCoefficients[i];
       }
       setPrediction(score.toFixed(2));
+      addLogEntry(`Análisis completado. Predicción: ${score.toFixed(2)}%`);
       getAIInterpretation(plotData, score.toFixed(2), lamp ? 'ok' : 'off').then(setAiAnalysis);
     } else {
-       if(!raw) setStatusMsg("Error en escaneo");
-       else setStatusMsg("Falta Calibración");
+       if(!raw) {
+         setStatusMsg("Error en escaneo");
+         addLogEntry("Error: El equipo no devolvió datos espectrales.");
+       } else {
+         setStatusMsg("Falta Calibración");
+         addLogEntry("Error: Debes realizar Dark y White antes de analizar.");
+       }
     }
     setIsBusy(false);
   };
@@ -207,7 +259,10 @@ export default function App() {
               <button onClick={toggleLamp} disabled={isBusy} className={`px-5 py-3 rounded-xl font-bold border flex items-center gap-2 ${lamp ? 'bg-orange-500 text-white border-orange-400' : 'bg-slate-800 border-slate-700 text-slate-400 animate-pulse'}`}>
                 <Zap size={18} fill={lamp ? "currentColor" : "none"} /> {lamp ? 'LÁMPARA ON' : 'ENCENDER LÁMPARA'}
               </button>
-              <div className="bg-slate-800 px-5 py-3 rounded-xl flex items-center gap-2 border border-slate-700"><Thermometer size={18} className="text-emerald-400"/><span className="font-mono font-bold text-lg">{temp ? temp.toFixed(1) : '--'}°C</span></div>
+              <div className="bg-slate-800 px-5 py-3 rounded-xl flex items-center gap-2 border border-slate-700">
+                <Thermometer size={18} className={temp !== null ? "text-emerald-400" : "text-slate-600"}/>
+                <span className="font-mono font-bold text-lg">{temp !== null ? temp.toFixed(1) : '--'}°C</span>
+              </div>
             </div>
           )}
         </div>
@@ -232,7 +287,7 @@ export default function App() {
             {isBusy ? <RefreshCw className="animate-spin" size={28} /> : <Activity size={28} />} Analizar Muestra
           </button>
            <div className={`bg-slate-900 p-8 rounded-3xl border text-center ${prediction !== "--" ? 'border-emerald-500/30' : 'border-slate-800'}`}>
-               <span className="text-xs text-slate-500 font-bold uppercase block mb-2">Contenido de Proteína</span>
+               <span className="text-xs text-slate-500 font-bold uppercase block mb-2">Resultado Análisis</span>
                <div className="flex items-baseline justify-center gap-1"><span className="text-7xl font-black text-white">{prediction}</span><span className="text-2xl text-slate-600 font-bold">%</span></div>
             </div>
         </div>
