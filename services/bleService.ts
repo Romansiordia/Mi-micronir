@@ -67,6 +67,8 @@ const CMD = {
   GET_INFO: 0x03, 
   SCAN: 0x05,
   GET_TEMP: 0x06,
+  TEMP_INIT: 0x08,
+  PING: 0x14,
   RESET: 0x0F
 };
 
@@ -131,6 +133,9 @@ export class MicroNIRBLEDriver {
     this.isBusy = true;
     this.log("Sincronizando Firmware...");
     await this.send(CMD.GET_INFO, [], true);
+    await this.sleep(500);
+    // Inicialización térmica
+    await this.send(CMD.TEMP_INIT, [], true);
     await this.sleep(1000);
     const payload = [0x00, 0x64, 0x27, 0x10]; 
     await this.send(CMD.SET_CONFIG, payload);
@@ -152,9 +157,9 @@ export class MicroNIRBLEDriver {
     if (this.keepAliveInterval) clearInterval(this.keepAliveInterval);
     this.keepAliveInterval = setInterval(() => {
       if (this.isConnected && !this.pendingResponse && !this.isBusy && !this.writeInProgress) { 
-         this.getTemperature().catch(() => {});
+         this.send(CMD.PING, [], true).catch(() => {});
       }
-    }, 15000); 
+    }, 10000); 
   }
 
   private disconnectCleanly() {
@@ -247,20 +252,23 @@ export class MicroNIRBLEDriver {
   }
 
   async getTemperature(): Promise<number | null> {
-    // Reintentos agresivos para BLE
-    for (let i = 0; i < 4; i++) {
+    for (let i = 0; i < 3; i++) {
         try {
             if (await this.send(CMD.GET_TEMP, [], true)) {
                 const resp = await this.waitForPacket(2000); 
                 if (resp && resp.includes(CMD.GET_TEMP)) {
                     const idx = resp.indexOf(CMD.GET_TEMP);
                     const view = new DataView(resp.buffer, resp.byteOffset, resp.byteLength);
-                    const tempRaw = view.getUint16(idx + 1, false);
                     
-                    if (tempRaw > 0 && tempRaw < 65000) {
-                        let t = tempRaw;
-                        if (t > 1000) t /= 1000.0; else if (t > 500) t /= 100.0;
-                        if (t > 10 && t < 95) return t;
+                    // Parsing estructurado (Board en idx+1, Detector en idx+3)
+                    const tempDetector = (idx + 4 < resp.length) ? view.getUint16(idx + 3, false) : 0;
+                    const tempBoard = (idx + 2 < resp.length) ? view.getUint16(idx + 1, false) : 0;
+                    
+                    const raw = tempDetector > 0 ? tempDetector : tempBoard;
+                    if (raw > 0 && raw < 65000) {
+                        let t = raw;
+                        if (t > 10000) t /= 1000.0; else if (t > 1000) t /= 100.0;
+                        if (t > 5 && t < 95) return t;
                     }
                 }
             }
@@ -278,7 +286,7 @@ export class MicroNIRBLEDriver {
         this.log("Calentando sensor...");
         for(let i=1; i<=8; i++) {
             await this.sleep(600);
-            await this.send(CMD.GET_INFO, [], true); 
+            await this.send(CMD.PING, [], true); 
         }
     }
     this.isBusy = false;

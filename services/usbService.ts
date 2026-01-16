@@ -15,7 +15,9 @@ const CMD = {
   GET_INFO: 0x03,
   SCAN: 0x05,
   GET_TEMP: 0x06,
-  STATUS_TEMP_PCB: 0x07, // Registro específico para sensores ADT7320 en VIAVI
+  STATUS_TEMP_PCB: 0x07,
+  TEMP_INIT: 0x08,      // Comando detectado para inicialización térmica
+  PING: 0x14,           // Comando de Keep-Alive detectado
   RESET: 0x0F
 };
 
@@ -94,6 +96,11 @@ export class MicroNIRDriver {
       this.isConnected = true;
       await this.flushRx();
       
+      // Inicialización térmica específica para modelos Pro
+      await this.send(CMD.TEMP_INIT);
+      await this.sleep(200);
+      await this.send(CMD.PING);
+
       this.log("Hardware VIAVI/JDSU Listo.");
       return "OK";
     } catch (error: any) {
@@ -141,34 +148,43 @@ export class MicroNIRDriver {
   }
 
   async getTemperature(): Promise<number | null> {
-    // Implementación robusta de lectura de temperatura para sensor ADT7320
-    const strategies = [CMD.GET_TEMP, CMD.STATUS_TEMP_PCB, CMD.GET_INFO];
+    // Nueva lógica de extracción multivariable basada en el volcado de DLL
+    const strategies = [CMD.GET_TEMP, CMD.STATUS_TEMP_PCB];
     
     for (const cmd of strategies) {
         try {
             if (await this.send(cmd)) {
-                const resp = await this.readPacket(1200); 
-                if (resp && resp.length >= 5) {
-                    // Buscamos el opcode de respuesta en el paquete
+                const resp = await this.readPacket(1500); 
+                if (resp && resp.length >= 7) {
                     const idx = resp.indexOf(cmd);
                     if (idx !== -1 && idx + 2 < resp.length) {
                         const view = new DataView(resp.buffer, resp.byteOffset, resp.byteLength);
-                        const tempRaw = view.getUint16(idx + 1, false); // Big Endian
                         
-                        // Validación de rango físico (0 a 100 grados C)
-                        // Muchos firmwares VIAVI devuelven temp * 1000 o temp * 100
-                        if (tempRaw > 0 && tempRaw < 65000) {
-                            let processed = tempRaw;
-                            if (processed > 1000) processed /= 1000.0;
-                            else if (processed > 500) processed /= 100.0;
-                            
-                            if (processed > 10 && processed < 90) return processed;
-                        }
+                        // Los modelos Pro suelen enviar un paquete estructurado:
+                        // Byte idx+1, idx+2: Placa (Board)
+                        // Byte idx+3, idx+4: Detector (NIR)
+                        // Byte idx+5, idx+6: Frontal (Forward)
+                        
+                        const tempBoard = view.getUint16(idx + 1, false);
+                        const tempDetector = view.getUint16(idx + 3, false);
+                        const tempForward = (idx + 5 < resp.length) ? view.getUint16(idx + 5, false) : 0;
+
+                        // Seleccionamos el sensor más estable (Detector) o el que no sea cero
+                        let raw = tempDetector > 0 ? tempDetector : tempBoard;
+                        if (raw === 0) continue;
+
+                        // Conversión de formato VIAVI (normalmente 0.01C o 0.001C)
+                        let processed = raw;
+                        if (processed > 10000) processed /= 1000.0;
+                        else if (processed > 1000) processed /= 100.0;
+                        else if (processed > 500) processed /= 10.0;
+                        
+                        if (processed > 5 && processed < 95) return processed;
                     }
                 }
             }
         } catch (e) {}
-        await this.sleep(150);
+        await this.sleep(100);
     }
     return null;
   }
@@ -179,7 +195,7 @@ export class MicroNIRDriver {
         this.log("Estabilizando Lámpara (VIAVI)...");
         for(let i=0; i<6; i++) {
             await this.sleep(800);
-            await this.send(CMD.GET_INFO);
+            await this.send(CMD.PING); // Usamos PING en lugar de GET_INFO para no saturar
         }
     }
     return ok;
@@ -211,7 +227,6 @@ export class MicroNIRDriver {
           const next = new Uint8Array(acc.length + chunk.length);
           next.set(acc); next.set(chunk, acc.length);
           acc = next;
-          // Un paquete MicroNIR completo debe tener STX(0x02) y ETX(0x03)
           if (acc.includes(0x03) && acc.includes(0x02)) return acc;
         }
       } catch (e) { await this.sleep(30); }
