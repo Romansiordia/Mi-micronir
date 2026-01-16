@@ -125,7 +125,7 @@ export class MicroNIRBLEDriver {
 
       this.isConnected = true;
       
-      // Sincronización inicial
+      // Sincronización inicial con reintentos
       await this.sleep(1000);
       await this.softStartSensor();
       this.startKeepAlive();
@@ -133,75 +133,54 @@ export class MicroNIRBLEDriver {
       return "OK";
     } catch (error: any) {
       this.isConnected = false;
-      this.log(`Error de conexión: ${error.message}`);
+      this.log(`Error: ${error.message}`);
       return error.message || "Error BLE";
     }
   }
 
   private async softStartSensor() {
     this.isBusy = true;
-    this.log("Sincronizando parámetros MicroNIR 1700...");
+    this.log("Verificando MicroNIR 1700...");
 
-    // Paso 0: Limpiar canal con GET_INFO
-    await this.send(CMD.GET_INFO, [], true);
-    await this.sleep(800);
+    // Paso 1: Intentar despertar al sensor con GET_INFO (Ping)
+    let authenticated = false;
+    for (let i = 0; i < 3; i++) {
+        this.log(`Ping de sincronización ${i+1}/3...`);
+        await this.send(CMD.GET_INFO, [], true);
+        const resp = await this.waitForPacket(1500);
+        if (resp && resp[2] === CMD.GET_INFO) {
+            this.log("Sensor detectado y respondiendo.");
+            authenticated = true;
+            break;
+        }
+        await this.sleep(500);
+    }
 
-    const scanCount = 500; 
-    const integrationTime = 12500; 
+    if (!authenticated) {
+        throw new Error("El sensor no responde al comando de identificación.");
+    }
 
-    // Payload 16-bit (4 bytes): [ScanCount_H, ScanCount_L, IntTime_H, IntTime_L]
-    // Muchos modelos 1700 OnSite-W requieren este formato compacto
-    const payload16bit = [
+    // Paso 2: Intentar configurar parámetros, pero no bloquear si da NAK 0x15
+    this.log("Sincronizando parámetros de escaneo...");
+    const scanCount = 100; // Valor de seguridad inicial
+    const integrationTime = 10000; // 10ms
+    const payload = [
         (scanCount >> 8) & 0xFF, scanCount & 0xFF,
         (integrationTime >> 8) & 0xFF, integrationTime & 0xFF
     ];
 
-    // Payload 32-bit (8 bytes): [ScanCount_3, 2, 1, 0, IntTime_3, 2, 1, 0]
-    const payload32bit = [
-        (scanCount >> 24) & 0xFF, (scanCount >> 16) & 0xFF, (scanCount >> 8) & 0xFF, scanCount & 0xFF,
-        (integrationTime >> 24) & 0xFF, (integrationTime >> 16) & 0xFF, (integrationTime >> 8) & 0xFF, integrationTime & 0xFF
-    ];
-
-    let configured = false;
+    await this.send(CMD.SET_CONFIG, payload);
+    const ack = await this.waitForPacket(1500);
     
-    // Intento 1: Formato 16-bit (4 bytes) - El más probable para resolver NAK 0x15
-    this.log("Intento 1: Formato 16-bit (Compacto)...");
-    if (await this.send(CMD.SET_CONFIG, payload16bit)) {
-        const ack = await this.waitForPacket(2000);
-        if (ack && ack[2] !== 0x15) {
-            configured = true;
-        } else {
-            this.log("NAK 0x15 en 16-bit. Probando 32-bit...");
-        }
+    if (ack && ack[2] === 0x15) {
+        this.log("Aviso: Sensor denegó configuración (NAK 0x15). Usando valores internos.");
+    } else if (ack) {
+        this.log("Configuración de escaneo aplicada.");
+    } else {
+        this.log("Aviso: No hubo respuesta a la config. Intentando continuar...");
     }
 
-    // Intento 2: Formato 32-bit (8 bytes)
-    if (!configured) {
-        await this.sleep(1000);
-        this.log("Intento 2: Formato 32-bit (Estándar)...");
-        if (await this.send(CMD.SET_CONFIG, payload32bit)) {
-            const ack = await this.waitForPacket(2000);
-            if (ack && ack[2] !== 0x15) {
-                configured = true;
-            }
-        }
-    }
-
-    // Intento 3: Sin configuración (usar la que tenga el sensor por defecto)
-    if (!configured) {
-        this.log("Advertencia: No se pudo configurar. Intentando continuar con config actual...");
-        // Intentamos un GET_INFO para ver si sigue vivo
-        await this.send(CMD.GET_INFO, [], true);
-        const alive = await this.waitForPacket(1000);
-        if (alive) configured = true; 
-    }
-    
-    if (!configured) {
-        this.log("Error crítico: El sensor no responde a la inicialización.");
-        throw new Error("Fallo de Sincronización");
-    }
-
-    this.log("Sensor M1-0000343 Listo.");
+    this.log("Hardware Listo.");
     this.isBusy = false;
   }
 
@@ -291,7 +270,7 @@ export class MicroNIRBLEDriver {
       await this.txChar.writeValue(packet);
       return true;
     } catch (e: any) {
-      this.log(`Error TX: ${e.message}`);
+      this.log(`Error de transmisión: ${e.message}`);
       if (!silent) this.pendingResponse = false;
       return false;
     }
@@ -324,9 +303,10 @@ export class MicroNIRBLEDriver {
   async setLamp(on: boolean): Promise<boolean> {
     this.isBusy = true; 
     const ok = await this.send(CMD.LAMP_CONTROL, [on ? 1 : 0]);
-    await this.waitForPacket(2000);
-    if (on) {
-        this.log("Estabilizando lámpara (5s)...");
+    // Esperar respuesta de confirmación del hardware
+    const ack = await this.waitForPacket(2000);
+    if (on && ok) {
+        this.log("Calentando lámpara física (5s)...");
         await this.sleep(5000); 
     }
     this.isBusy = false;
@@ -343,23 +323,22 @@ export class MicroNIRBLEDriver {
 
   async scan(): Promise<Uint16Array | null> {
     this.isBusy = true;
-    this.log("Capturando espectro (500 scans)...");
+    this.log("Capturando espectro...");
     this.rxBuffer = new Uint8Array(0);
     this.lastPacket = null;
 
     if (!await this.send(CMD.SCAN)) { this.isBusy = false; return null; }
     
-    // 500 scans * 12.5ms = 6.25s de captura pura
     const raw = await this.waitForPacket(12000); 
     this.isBusy = false;
 
     if (!raw) {
-        this.log("Error: Tiempo de espera agotado.");
+        this.log("Error: Tiempo de espera de escaneo agotado.");
         return null;
     }
 
     if (raw[2] === 0x15) {
-        this.log("Error: El sensor rechazó el escaneo (NAK).");
+        this.log("Error: Escaneo denegado por el hardware.");
         return null;
     }
 
@@ -375,7 +354,7 @@ export class MicroNIRBLEDriver {
             if (idx + 1 < raw.length) s[j] = view.getUint16(idx, false);
         }
     } catch(err) {
-        this.log("Error de procesamiento de datos.");
+        this.log("Error de parseo espectral.");
     }
     return s;
   }
