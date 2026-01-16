@@ -24,8 +24,6 @@ interface BluetoothRemoteGATTCharacteristic extends EventTarget {
   properties: { write: boolean; writeWithoutResponse: boolean; notify: boolean; indicate: boolean; read: boolean; };
   value?: DataView;
   writeValue(value: BufferSource): Promise<void>;
-  writeValueWithResponse?(value: BufferSource): Promise<void>;
-  writeValueWithoutResponse?(value: BufferSource): Promise<void>;
   startNotifications(): Promise<BluetoothRemoteGATTCharacteristic>;
   stopNotifications(): Promise<BluetoothRemoteGATTCharacteristic>;
 }
@@ -114,7 +112,7 @@ export class MicroNIRBLEDriver {
       this.log("Conectando GATT...");
       this.server = await this.device.gatt!.connect();
       
-      this.log("Estabilizando (3s)...");
+      this.log("Estabilizando stack (3s)...");
       await this.sleep(3000); 
 
       const service = await this.server.getPrimaryService(BLE_CONFIG.serviceUUID);
@@ -127,7 +125,7 @@ export class MicroNIRBLEDriver {
 
       this.isConnected = true;
       
-      // Esperar un momento antes de la configuración inicial
+      // Sincronización inicial
       await this.sleep(1000);
       await this.softStartSensor();
       this.startKeepAlive();
@@ -135,82 +133,75 @@ export class MicroNIRBLEDriver {
       return "OK";
     } catch (error: any) {
       this.isConnected = false;
-      this.log(`Error: ${error.message}`);
+      this.log(`Error de conexión: ${error.message}`);
       return error.message || "Error BLE";
     }
   }
 
   private async softStartSensor() {
     this.isBusy = true;
-    this.log("Sincronizando con MicroNIR 1700...");
+    this.log("Sincronizando parámetros MicroNIR 1700...");
 
-    // Limpiar buffers
+    // Paso 0: Limpiar canal con GET_INFO
     await this.send(CMD.GET_INFO, [], true);
-    await this.sleep(1000);
+    await this.sleep(800);
 
     const scanCount = 500; 
     const integrationTime = 12500; 
 
-    // Payload A: Big Endian (Estándar 8 bytes)
-    const payloadBE = [
+    // Payload 16-bit (4 bytes): [ScanCount_H, ScanCount_L, IntTime_H, IntTime_L]
+    // Muchos modelos 1700 OnSite-W requieren este formato compacto
+    const payload16bit = [
+        (scanCount >> 8) & 0xFF, scanCount & 0xFF,
+        (integrationTime >> 8) & 0xFF, integrationTime & 0xFF
+    ];
+
+    // Payload 32-bit (8 bytes): [ScanCount_3, 2, 1, 0, IntTime_3, 2, 1, 0]
+    const payload32bit = [
         (scanCount >> 24) & 0xFF, (scanCount >> 16) & 0xFF, (scanCount >> 8) & 0xFF, scanCount & 0xFF,
         (integrationTime >> 24) & 0xFF, (integrationTime >> 16) & 0xFF, (integrationTime >> 8) & 0xFF, integrationTime & 0xFF
     ];
 
-    // Payload B: Little Endian (Frecuente en hardware industrial/OnSite-W)
-    const payloadLE = [
-        scanCount & 0xFF, (scanCount >> 8) & 0xFF, (scanCount >> 16) & 0xFF, (scanCount >> 24) & 0xFF,
-        integrationTime & 0xFF, (integrationTime >> 8) & 0xFF, (integrationTime >> 16) & 0xFF, (integrationTime >> 24) & 0xFF
-    ];
-
-    // Payload C: 12 bytes (4 count + 4 time + 4 padding) - Evita MTU issues de 16 bytes
-    const payload12 = [...payloadBE, 0, 0, 0, 0];
-
     let configured = false;
     
-    // Intento 1: Little Endian (Muchos sensores OnSite-W usan LE internamente)
-    this.log("Intento 1: Little Endian (8 bytes)...");
-    if (await this.send(CMD.SET_CONFIG, payloadLE)) {
-        const ack = await this.waitForPacket(2500);
+    // Intento 1: Formato 16-bit (4 bytes) - El más probable para resolver NAK 0x15
+    this.log("Intento 1: Formato 16-bit (Compacto)...");
+    if (await this.send(CMD.SET_CONFIG, payload16bit)) {
+        const ack = await this.waitForPacket(2000);
         if (ack && ack[2] !== 0x15) {
             configured = true;
         } else {
-            this.log("NAK 0x15 con LE. Probando Big Endian...");
+            this.log("NAK 0x15 en 16-bit. Probando 32-bit...");
         }
     }
 
-    // Intento 2: Big Endian
+    // Intento 2: Formato 32-bit (8 bytes)
     if (!configured) {
         await this.sleep(1000);
-        this.log("Intento 2: Big Endian (8 bytes)...");
-        if (await this.send(CMD.SET_CONFIG, payloadBE)) {
-            const ack = await this.waitForPacket(2500);
-            if (ack && ack[2] !== 0x15) {
-                configured = true;
-            } else {
-                this.log("NAK 0x15 con BE. Probando 12-byte payload...");
-            }
-        }
-    }
-
-    // Intento 3: Payload de 12 bytes (algunos firmwares requieren padding específico pero < 16b para GATT)
-    if (!configured) {
-        await this.sleep(1000);
-        this.log("Intento 3: Formato extendido (12 bytes)...");
-        if (await this.send(CMD.SET_CONFIG, payload12)) {
-            const ack = await this.waitForPacket(2500);
+        this.log("Intento 2: Formato 32-bit (Estándar)...");
+        if (await this.send(CMD.SET_CONFIG, payload32bit)) {
+            const ack = await this.waitForPacket(2000);
             if (ack && ack[2] !== 0x15) {
                 configured = true;
             }
         }
+    }
+
+    // Intento 3: Sin configuración (usar la que tenga el sensor por defecto)
+    if (!configured) {
+        this.log("Advertencia: No se pudo configurar. Intentando continuar con config actual...");
+        // Intentamos un GET_INFO para ver si sigue vivo
+        await this.send(CMD.GET_INFO, [], true);
+        const alive = await this.waitForPacket(1000);
+        if (alive) configured = true; 
     }
     
     if (!configured) {
-        this.log("Error crítico: El sensor denegó la configuración.");
-        throw new Error("NAK Config persistente");
+        this.log("Error crítico: El sensor no responde a la inicialización.");
+        throw new Error("Fallo de Sincronización");
     }
 
-    this.log("MicroNIR 1700 (M1-0000343) Listo.");
+    this.log("Sensor M1-0000343 Listo.");
     this.isBusy = false;
   }
 
@@ -294,24 +285,14 @@ export class MicroNIRBLEDriver {
     const crc = calculateCrc8(rawPayload);
     const packet = new Uint8Array([0x02, ...rawPayload, crc, 0x03]);
     
-    if (!silent) this.log(`TX >>> OP ${opcode.toString(16).toUpperCase()} (${packet.length} bytes: ${toHex(packet)})`);
+    if (!silent) this.log(`TX >>> OP ${opcode.toString(16).toUpperCase()} (${packet.length} bytes)`);
 
     try {
-      // Uso de writeValue() estándar con reintento ante fallos de buffer
       await this.txChar.writeValue(packet);
       return true;
     } catch (e: any) {
-      if (!silent) {
-          this.log(`Error GATT: ${e.message}. Reintentando sin respuesta...`);
-          try {
-              // Algunos dispositivos fallan en 'writeValue' si el stack está saturado
-              if (this.txChar.writeValueWithoutResponse) {
-                  await this.txChar.writeValueWithoutResponse(packet);
-                  return true;
-              }
-          } catch(e2) {}
-          this.pendingResponse = false;
-      }
+      this.log(`Error TX: ${e.message}`);
+      if (!silent) this.pendingResponse = false;
       return false;
     }
   }
@@ -343,9 +324,9 @@ export class MicroNIRBLEDriver {
   async setLamp(on: boolean): Promise<boolean> {
     this.isBusy = true; 
     const ok = await this.send(CMD.LAMP_CONTROL, [on ? 1 : 0]);
-    await this.waitForPacket(3000);
+    await this.waitForPacket(2000);
     if (on) {
-        this.log("Calentando lámpara (5s)...");
+        this.log("Estabilizando lámpara (5s)...");
         await this.sleep(5000); 
     }
     this.isBusy = false;
@@ -362,23 +343,23 @@ export class MicroNIRBLEDriver {
 
   async scan(): Promise<Uint16Array | null> {
     this.isBusy = true;
-    this.log("Capturando espectro (500 promedios)...");
+    this.log("Capturando espectro (500 scans)...");
     this.rxBuffer = new Uint8Array(0);
     this.lastPacket = null;
 
     if (!await this.send(CMD.SCAN)) { this.isBusy = false; return null; }
     
-    // Con 500 scans a 12.5ms, el hardware tarda 6.25s. Damos margen de 15s.
-    const raw = await this.waitForPacket(15000); 
+    // 500 scans * 12.5ms = 6.25s de captura pura
+    const raw = await this.waitForPacket(12000); 
     this.isBusy = false;
 
     if (!raw) {
-        this.log("Error: Timeout en lectura de espectro.");
+        this.log("Error: Tiempo de espera agotado.");
         return null;
     }
 
     if (raw[2] === 0x15) {
-        this.log("Error: Escaneo rechazado por el sensor (NAK).");
+        this.log("Error: El sensor rechazó el escaneo (NAK).");
         return null;
     }
 
@@ -394,7 +375,7 @@ export class MicroNIRBLEDriver {
             if (idx + 1 < raw.length) s[j] = view.getUint16(idx, false);
         }
     } catch(err) {
-        this.log("Error parseando espectro.");
+        this.log("Error de procesamiento de datos.");
     }
     return s;
   }
