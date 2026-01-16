@@ -2,7 +2,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { 
   Usb, Activity, RefreshCw, Zap, AlertCircle, CheckCircle2, 
-  BarChart3, Settings2, ShieldCheck, Thermometer, Power, Bluetooth, XCircle, Terminal, Trash2, ShieldAlert
+  BarChart3, Settings2, ShieldCheck, Thermometer, Power, Bluetooth, XCircle, Terminal, Trash2, ShieldAlert, MousePointerClick
 } from 'lucide-react';
 import { 
   AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer
@@ -31,6 +31,7 @@ export default function App() {
   const [temp, setTemp] = useState<number | null>(null);
   const [lamp, setLamp] = useState(false);
   const [isBusy, setIsBusy] = useState(false);
+  const [isWaitingTrigger, setIsWaitingTrigger] = useState(false);
   const [compatibilityError, setCompatibilityError] = useState<string | null>(null);
   
   const [darkRef, setDarkRef] = useState<Uint16Array | null>(null);
@@ -52,31 +53,20 @@ export default function App() {
 
   useEffect(() => {
     let interval: any;
-
-    if (status === 'ready') {
+    if (status === 'ready' && !isWaitingTrigger) {
       const updateTemp = async () => {
         if (!isBusy) {
           try {
             const currentTemp = await activeDevice.getTemperature();
-            if (currentTemp !== null) {
-              setTemp(currentTemp);
-            }
-          } catch (e) {
-            console.error("Error polling temperature", e);
-          }
+            if (currentTemp !== null) setTemp(currentTemp);
+          } catch (e) {}
         }
       };
-
       updateTemp();
       interval = setInterval(updateTemp, 10000);
-    } else {
-      setTemp(null);
     }
-
-    return () => {
-      if (interval) clearInterval(interval);
-    };
-  }, [status, activeDevice, isBusy]);
+    return () => { if (interval) clearInterval(interval); };
+  }, [status, activeDevice, isBusy, isWaitingTrigger]);
 
   useEffect(() => {
     const isSecure = window.location.protocol === 'https:' || window.location.hostname === 'localhost';
@@ -108,7 +98,7 @@ export default function App() {
         setTemp(t);
         setStatus('ready');
         setStatusMsg(`Sensor Online (${connectionType.toUpperCase()})`);
-        addLogEntry("Conexión establecida correctamente.");
+        addLogEntry("Conexión establecida. Hardware Trigger activado.");
       } else {
         setStatus('error');
         setStatusMsg(res);
@@ -144,8 +134,6 @@ export default function App() {
     if (ok) {
       setLamp(newState);
       addLogEntry(`Lámpara ${newState ? 'ENCENDIDA' : 'APAGADA'}`);
-      const t = await activeDevice.getTemperature();
-      if (t !== null) setTemp(t);
     }
     setIsBusy(false);
   };
@@ -153,8 +141,12 @@ export default function App() {
   const calibrate = async (type: 'dark' | 'white') => {
     if (isBusy) return;
     setIsBusy(true);
+    setIsWaitingTrigger(true);
     addLogEntry(`Iniciando calibración ${type.toUpperCase()}...`);
+    
     const data = await activeDevice.scan();
+    setIsWaitingTrigger(false);
+    
     if (data) {
       if (type === 'dark') setDarkRef(data);
       else setWhiteRef(data);
@@ -162,7 +154,6 @@ export default function App() {
       addLogEntry(`Calibración ${type} exitosa.`);
     } else {
       setStatusMsg(`Error al leer ${type}`);
-      addLogEntry(`Fallo calibración ${type} (Scan null)`);
     }
     setIsBusy(false);
   };
@@ -170,8 +161,12 @@ export default function App() {
   const measure = async () => {
     if (isBusy) return;
     setIsBusy(true);
-    addLogEntry("Iniciando análisis de muestra...");
+    setIsWaitingTrigger(true);
+    addLogEntry("Armando equipo para análisis...");
+    
     const raw = await activeDevice.scan();
+    setIsWaitingTrigger(false);
+    
     if (raw && darkRef && whiteRef) {
       const plotData: WavelengthPoint[] = [];
       const absData: number[] = [];
@@ -191,11 +186,9 @@ export default function App() {
       getAIInterpretation(plotData, score.toFixed(2), lamp ? 'ok' : 'off').then(setAiAnalysis);
     } else {
        if(!raw) {
-         setStatusMsg("Error en escaneo");
-         addLogEntry("Error: El equipo no devolvió datos espectrales.");
+         addLogEntry("Error: Timeout o disparo fallido.");
        } else {
-         setStatusMsg("Falta Calibración");
-         addLogEntry("Error: Debes realizar Dark y White antes de analizar.");
+         addLogEntry("Error: Faltan referencias DARK/WHITE.");
        }
     }
     setIsBusy(false);
@@ -210,13 +203,28 @@ export default function App() {
         </div>
       )}
 
+      {isWaitingTrigger && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-md">
+            <div className="bg-blue-600 p-8 rounded-3xl border border-blue-400 shadow-[0_0_50px_rgba(37,99,235,0.5)] text-center animate-bounce">
+                <MousePointerClick size={64} className="mx-auto mb-4 text-white" />
+                <h2 className="text-2xl font-black text-white">EQUIPO ARMADO</h2>
+                <p className="text-blue-100 mt-2 font-bold uppercase tracking-widest">Presiona el botón físico en tu MicroNIR</p>
+                <div className="mt-4 flex justify-center gap-1">
+                    <div className="w-2 h-2 bg-white rounded-full animate-ping"></div>
+                    <div className="w-2 h-2 bg-white rounded-full animate-ping [animation-delay:0.2s]"></div>
+                    <div className="w-2 h-2 bg-white rounded-full animate-ping [animation-delay:0.4s]"></div>
+                </div>
+            </div>
+        </div>
+      )}
+
       <header className="flex flex-col md:flex-row justify-between items-center mb-8 bg-slate-900/80 backdrop-blur p-6 rounded-2xl border border-slate-800 shadow-xl">
         <div className="mb-4 md:mb-0">
           <h1 className="text-2xl font-black text-white tracking-tight flex items-center gap-3">
             <ShieldCheck className="text-blue-500" />
             MicroNIR <span className="text-blue-400 bg-blue-500/10 px-2 rounded text-lg border border-blue-500/20">QUANTUM</span>
           </h1>
-          <p className="text-xs text-slate-500 font-mono mt-1 uppercase ml-1">Protocol Safe v15.2 • VIAVI Core • {connectionType.toUpperCase()}</p>
+          <p className="text-xs text-slate-500 font-mono mt-1 uppercase ml-1">Hardware Trigger Mode • VIAVI Core v15.3</p>
         </div>
         
         <div className="flex flex-col md:flex-row gap-4 items-center">
@@ -226,13 +234,6 @@ export default function App() {
             </p>
           </div>
           
-          {status === 'disconnected' && (
-            <div className="flex bg-slate-800 rounded-lg p-1 border border-slate-700">
-              <button onClick={() => setConnectionType('usb')} className={`px-3 py-1 rounded text-xs font-bold transition-all ${connectionType === 'usb' ? 'bg-blue-600 text-white' : 'text-slate-400'}`}><Usb size={12} /></button>
-              <button onClick={() => setConnectionType('ble')} className={`px-3 py-1 rounded text-xs font-bold transition-all ${connectionType === 'ble' ? 'bg-indigo-600 text-white' : 'text-slate-400'}`}><Bluetooth size={12} /></button>
-            </div>
-          )}
-          
           {status === 'disconnected' || status === 'error' ? (
              <div className="flex gap-2">
                 <button onClick={connect} disabled={isBusy} className="bg-blue-600 hover:bg-blue-500 text-white px-6 py-3 rounded-xl font-bold flex items-center gap-2">
@@ -240,7 +241,7 @@ export default function App() {
                     {status === 'error' ? 'REINTENTAR' : 'CONECTAR'}
                 </button>
                 {status === 'error' && (
-                    <button onClick={hardReset} className="bg-slate-800 text-slate-400 px-3 py-3 rounded-xl hover:bg-slate-700" title="Hard Reset Sensor">
+                    <button onClick={hardReset} className="bg-slate-800 text-slate-400 px-3 py-3 rounded-xl hover:bg-slate-700">
                         <Trash2 size={20} />
                     </button>
                 )}
@@ -257,7 +258,7 @@ export default function App() {
                     : 'bg-slate-800 border-slate-700 text-slate-400'
                 }`}
               >
-                <Zap size={18} fill={lamp ? "currentColor" : "none"} className={lamp ? "animate-pulse" : ""} /> {lamp ? 'LÁMPARA ON' : 'ENCENDER LÁMPARA'}
+                <Zap size={18} fill={lamp ? "currentColor" : "none"} /> {lamp ? 'LÁMPARA ON' : 'ENCENDER LÁMPARA'}
               </button>
               <div className="bg-slate-800 px-5 py-3 rounded-xl flex items-center gap-2 border border-slate-700 min-w-[100px] justify-center">
                 <Thermometer size={18} className={temp !== null ? "text-emerald-400" : "text-slate-600"}/>
@@ -271,14 +272,14 @@ export default function App() {
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         <div className="lg:col-span-4 space-y-6">
           <div className="bg-slate-900/50 p-6 rounded-3xl border border-slate-800">
-            <h3 className="text-xs font-black text-slate-500 uppercase tracking-widest mb-6">Secuencia de Calibración</h3>
+            <h3 className="text-xs font-black text-slate-500 uppercase tracking-widest mb-6">Secuencia de Calibración (Modo Botón)</h3>
             <div className="space-y-3">
               <button disabled={status !== 'ready' || !lamp || isBusy} onClick={() => calibrate('dark')} className={`w-full p-4 rounded-xl border flex items-center justify-between transition-all ${darkRef ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-400' : 'bg-slate-800 text-slate-400'}`}>
-                <span>{(!lamp && status === 'ready') ? 'REQ. LÁMPARA ENCENDIDA' : '1. REF. OSCURA (TAPAR)'}</span>
+                <span>1. REF. OSCURA (TAPAR)</span>
                 {darkRef && <CheckCircle2 size={18} />}
               </button>
               <button disabled={status !== 'ready' || !lamp || isBusy} onClick={() => calibrate('white')} className={`w-full p-4 rounded-xl border flex items-center justify-between transition-all ${whiteRef ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-400' : 'bg-slate-800 text-slate-400'}`}>
-                <span>{(!lamp && status === 'ready') ? 'REQ. LÁMPARA ENCENDIDA' : '2. REF. BLANCA (MUESTRA)'}</span>
+                <span>2. REF. BLANCA (MUESTRA)</span>
                 {whiteRef && <CheckCircle2 size={18} />}
               </button>
             </div>
@@ -313,7 +314,7 @@ export default function App() {
 
       <div className={`fixed bottom-0 left-0 right-0 bg-slate-950/95 border-t border-slate-800 transition-all ${showLogs ? 'h-80' : 'h-10'}`}>
         <div className="flex items-center justify-between px-4 h-10 bg-slate-900 cursor-pointer" onClick={() => setShowLogs(!showLogs)}>
-            <div className="flex items-center gap-2 text-xs font-mono text-slate-400"><Terminal size={14} /> <b>TERMINAL HARDWARE</b></div>
+            <div className="flex items-center gap-2 text-xs font-mono text-slate-400"><Terminal size={14} /> <b>TERMINAL HARDWARE (Hardware Trigger)</b></div>
             <button onClick={(e) => { e.stopPropagation(); setLogs([]); }} className="text-slate-500 hover:text-red-400"><Trash2 size={14} /></button>
         </div>
         {showLogs && (

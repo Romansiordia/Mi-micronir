@@ -13,6 +13,7 @@ const CMD = {
   LAMP_CONTROL: 0x01,
   SET_CONFIG: 0x02,    
   GET_INFO: 0x03,
+  SET_TRIGGER: 0x04, // 0 = Software, 1 = Hardware (Botón)
   SCAN: 0x05,
   GET_TEMP: 0x06,
   STATUS_REPORT: 0x18, 
@@ -20,14 +21,19 @@ const CMD = {
   RESET: 0x0F
 };
 
-// Payload de Configuración de Diagnóstico:
-// [Intensity(1), Freq(2), Exposure(4), Scans(4)]
-// 100% (0x64), 10kHz (0x2710), 12500us (0x000030D4), 50 Scans (0x00000032)
+/** 
+ * Payload de Configuración Little Endian:
+ * [Intensity(1), Freq(2), Exposure(4), Scans(4)]
+ * 100% (0x64)
+ * 10kHz (0x10, 0x27)
+ * 5000us / 5ms (0x88, 0x13, 0x00, 0x00)
+ * 50 Scans (0x32, 0x00, 0x00, 0x00)
+ */
 const DIAGNOSTIC_CONFIG = [
     0x64,               // Intensity 100%
-    0x27, 0x10,         // Freq 10000 Hz
-    0x00, 0x00, 0x30, 0xD4, // Exposure 12500 us (12.5 ms)
-    0x00, 0x00, 0x00, 0x32  // Scan Count 50 (Modo de Diagnóstico)
+    0x10, 0x27,         // Freq 10000 Hz (Little Endian)
+    0x88, 0x13, 0x00, 0x00, // Exposure 5000 us (5ms)
+    0x32, 0x00, 0x00, 0x00  // Scan Count 50
 ];
 
 const CRC8_TABLE = new Uint8Array([
@@ -96,7 +102,7 @@ export class MicroNIRDriver {
       this.inEndpoint = alt.endpoints.find((e: any) => e.direction === 'in').endpointNumber;
       this.outEndpoint = alt.endpoints.find((e: any) => e.direction === 'out').endpointNumber;
       
-      this.log("Handshake MicroNIR Pro...");
+      this.log("Handshake VIAVI Advanced...");
       await this.ctrl(0x00, 0x00, 0x00);
       await this.ctrl(0x03, 0x4138, 0x00);
       await this.ctrl(0x04, 0x0008, 0x00); 
@@ -105,14 +111,12 @@ export class MicroNIRDriver {
       this.isConnected = true;
       await this.flushRx();
       
-      await this.send(CMD.PING);
-      await this.sleep(100);
-      
-      this.log("Modo Diagnóstico: 12.5ms / 50 Scans...");
-      await this.send(CMD.SET_CONFIG, DIAGNOSTIC_CONFIG); 
-      await this.sleep(300);
+      this.log("Configurando Modo Botón Físico...");
+      await this.send(CMD.SET_CONFIG, DIAGNOSTIC_CONFIG);
+      await this.send(CMD.SET_TRIGGER, [0x01]); // 0x01 = External/Button
+      await this.sleep(200);
 
-      this.log("Hardware VIAVI Pro Listo.");
+      this.log("Equipo Armado. Listo.");
       return "OK";
     } catch (error: any) {
       this.isConnected = false;
@@ -123,6 +127,7 @@ export class MicroNIRDriver {
   async disconnect(): Promise<void> {
     if (this.device) {
       try {
+        await this.send(CMD.LAMP_CONTROL, [0]);
         await this.device.close();
       } catch (e) {}
     }
@@ -133,15 +138,14 @@ export class MicroNIRDriver {
 
   async resetHardware(): Promise<boolean> {
     if (!this.device) return false;
-    const ok = await this.send(CMD.RESET);
-    if (ok) { await this.sleep(4000); }
-    return ok;
+    await this.send(CMD.RESET);
+    await this.sleep(4000);
+    return true;
   }
 
   async flushRx() {
     try {
         await this.device.transferIn(this.inEndpoint, 64);
-        await this.sleep(50);
     } catch(e) {}
   }
 
@@ -156,22 +160,16 @@ export class MicroNIRDriver {
     } catch (e) { return false; }
   }
 
-  private convertADT7320(raw: number): number {
-    let val = (raw & 0xFFF8) >> 3; 
-    if (val & 0x1000) val -= 0x2000; 
-    return val / 16.0;
-  }
-
   async getTemperature(): Promise<number | null> {
     if (await this.send(CMD.GET_TEMP)) {
         const resp = await this.readPacket(1000);
         if (resp) {
-            const view = new DataView(resp.buffer, resp.byteOffset, resp.byteLength);
             const tempIdx = resp.indexOf(CMD.GET_TEMP) + 1;
-            if (tempIdx > 0 && tempIdx + 2 < resp.length) {
-                const rawTemp = view.getUint16(tempIdx, false);
-                const t = this.convertADT7320(rawTemp);
-                if (t > 5 && t < 85) return t;
+            if (tempIdx > 0 && tempIdx + 2 <= resp.length) {
+                const view = new DataView(resp.buffer, resp.byteOffset, resp.byteLength);
+                let val = (view.getUint16(tempIdx, false) & 0xFFF8) >> 3;
+                if (val & 0x1000) val -= 0x2000;
+                return val / 16.0;
             }
         }
     }
@@ -179,35 +177,29 @@ export class MicroNIRDriver {
   }
 
   async setLamp(on: boolean): Promise<boolean> {
-    if (on) {
-        await this.send(CMD.SET_CONFIG, DIAGNOSTIC_CONFIG);
-        await this.sleep(200);
-    }
-
     const ok = await this.send(CMD.LAMP_CONTROL, [on ? 1 : 0]);
-    
     if (on && ok) {
-        this.log("Calentando Lámpara...");
-        for(let i=1; i<=5; i++) {
-            await this.sleep(1000);
-            await this.send(CMD.STATUS_REPORT);
-            this.log(`Estabilizando filamento... ${i}/5s`);
-        }
+        this.log("Estabilizando lámpara (5s)...");
+        await this.sleep(5000);
     }
     return ok;
   }
 
   async scan(): Promise<Uint16Array | null> {
     await this.flushRx();
-    await this.send(CMD.SET_CONFIG, DIAGNOSTIC_CONFIG);
-    await this.sleep(100);
-
+    this.log("ARMANDO SENSOR: Esperando presión del botón físico...");
+    
+    // Mandamos la orden de escanear. El equipo se quedará pausado hasta que presiones su botón.
     if (!await this.send(CMD.SCAN)) return null;
-    this.log("Capturando espectro (50 scans rápidos)...");
     
-    const raw = await this.readPacket(20000); 
-    if (!raw) return null;
+    // Aumentamos el tiempo de espera a 40 segundos para darte tiempo a presionar el botón
+    const raw = await this.readPacket(40000); 
+    if (!raw) {
+        this.log("Error: No se detectó el disparo del botón (Timeout).");
+        return null;
+    }
     
+    this.log("¡Disparo detectado! Procesando datos...");
     let offset = raw.indexOf(CMD.SCAN) + 1;
     const s = new Uint16Array(128);
     const view = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
@@ -229,11 +221,10 @@ export class MicroNIRDriver {
           const next = new Uint8Array(acc.length + chunk.length);
           next.set(acc); next.set(chunk, acc.length);
           acc = next;
-          if (acc.includes(0x03) && acc.includes(0x02)) {
-             if (acc.length >= 288 || (acc.length >= 64 && acc[1] < 10)) return acc;
-          }
+          // Si tenemos el byte final 0x03 y longitud suficiente
+          if (acc.includes(0x03) && acc.length >= 260) return acc;
         }
-      } catch (e) { await this.sleep(50); }
+      } catch (e) { await this.sleep(100); }
     }
     return acc.length > 0 ? acc : null;
   }
