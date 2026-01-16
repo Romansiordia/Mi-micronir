@@ -4,7 +4,7 @@ import { USB_CONFIG } from "../constants";
 declare global {
   interface Navigator {
     usb: {
-      requestDevice(options: { filters: { vendorId: number }[] }): Promise<any>;
+      requestDevice(options: { filters: { vendorId: number, productId?: number }[] }): Promise<any>;
     };
   }
 }
@@ -15,6 +15,7 @@ const CMD = {
   GET_INFO: 0x03,
   SCAN: 0x05,
   GET_TEMP: 0x06,
+  STATUS_TEMP_PCB: 0x07, // Inferido de metadata STATUS_TEMP_PCB
   RESET: 0x0F
 };
 
@@ -68,7 +69,14 @@ export class MicroNIRDriver {
   async connect(): Promise<string> {
     try {
       if (!navigator.usb) return "Usa Chrome/Edge";
-      this.device = await navigator.usb.requestDevice({ filters: [{ vendorId: USB_CONFIG.vendorId }] });
+      // Filtro extendido con IDs de VIAVI
+      this.device = await navigator.usb.requestDevice({ 
+        filters: [
+            { vendorId: USB_CONFIG.vendorId },
+            { vendorId: USB_CONFIG.viaviVendorId, productId: USB_CONFIG.viaviProductId }
+        ] 
+      });
+      
       await this.device.open();
       if (this.device.configuration === null) await this.device.selectConfiguration(1);
       const intf = this.device.configuration.interfaces[0];
@@ -78,16 +86,16 @@ export class MicroNIRDriver {
       this.inEndpoint = alt.endpoints.find((e: any) => e.direction === 'in').endpointNumber;
       this.outEndpoint = alt.endpoints.find((e: any) => e.direction === 'out').endpointNumber;
       
-      this.log("Inicializando UART FTDI...");
-      await this.ctrl(0x00, 0x00, 0x00); // Reset
-      await this.ctrl(0x03, 0x4138, 0x00); // Baud 115200 exact
-      await this.ctrl(0x04, 0x0008, 0x00); // 8N1
-      await this.ctrl(0x09, 0x02, 0x00);   // Latency
+      this.log("Inicializando MicroNIR Pro...");
+      await this.ctrl(0x00, 0x00, 0x00); // Reset FTDI
+      await this.ctrl(0x03, 0x4138, 0x00); // Baudrate oficial
+      await this.ctrl(0x04, 0x0008, 0x00); 
+      await this.ctrl(0x09, 0x02, 0x00);   
 
       this.isConnected = true;
       await this.flushRx();
       
-      this.log("USB Listo.");
+      this.log("Hardware VIAVI/JDSU Listo.");
       return "OK";
     } catch (error: any) {
       this.isConnected = false;
@@ -134,33 +142,38 @@ export class MicroNIRDriver {
   }
 
   async getTemperature(): Promise<number | null> {
-    // Implementación con 3 reintentos para evitar fallos por ocupación de bus
+    // 3 reintentos con doble estrategia (Opcode 0x06 y 0x07 para PCB)
     for (let i = 0; i < 3; i++) {
         try {
-            if (await this.send(CMD.GET_TEMP)) {
-                const resp = await this.readPacket(2000); // Timeout extendido a 2s
-                if (resp && resp.includes(0x06)) {
-                    const offset = resp.indexOf(0x06);
+            const cmdToUse = i === 2 ? CMD.STATUS_TEMP_PCB : CMD.GET_TEMP;
+            if (await this.send(cmdToUse)) {
+                const resp = await this.readPacket(2000); 
+                if (resp && (resp.includes(0x06) || resp.includes(0x07))) {
+                    const opcodeFound = resp.includes(0x06) ? 0x06 : 0x07;
+                    const offset = resp.indexOf(opcodeFound);
                     const view = new DataView(resp.buffer, resp.byteOffset, resp.byteLength);
+                    
+                    // Lógica ADT7320: 16-bit Big Endian
                     const tempRaw = view.getUint16(offset + 1, false);
-                    if (tempRaw > 0 && tempRaw < 10000) {
+                    if (tempRaw > 0 && tempRaw < 0xFFFF) {
                         return tempRaw / 1000.0;
                     }
                 }
             }
         } catch (e) {}
-        await this.sleep(300); // Pausa entre reintentos
+        await this.sleep(350);
     }
     return null;
   }
 
   async setLamp(on: boolean): Promise<boolean> {
+    // Envío de comando con pequeño delay para estabilizar PWM detectado en metadata
     const ok = await this.send(CMD.LAMP_CONTROL, [on ? 1 : 0]);
     if (on && ok) {
-        this.log("Calentando (USB)...");
-        for(let i=0; i<5; i++) {
-            await this.sleep(1000);
-            await this.send(CMD.GET_INFO);
+        this.log("Estabilizando Lámpara (VIAVI)...");
+        for(let i=0; i<6; i++) {
+            await this.sleep(800);
+            await this.send(CMD.GET_INFO); // Poll para mantener el bus activo
         }
     }
     return ok;
@@ -168,7 +181,7 @@ export class MicroNIRDriver {
 
   async scan(): Promise<Uint16Array | null> {
     if (!await this.send(CMD.SCAN)) return null;
-    const raw = await this.readPacket(10000);
+    const raw = await this.readPacket(12000);
     if (!raw) return null;
     
     let offset = raw.indexOf(0x05) + 1;

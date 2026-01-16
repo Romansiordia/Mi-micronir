@@ -95,7 +95,7 @@ export class MicroNIRBLEDriver {
       if (!navigator.bluetooth) return "Navegador incompatible";
       await this.disconnect(); 
 
-      this.log("Buscando dispositivo...");
+      this.log("Buscando MicroNIR Wireless...");
       this.device = await navigator.bluetooth.requestDevice({
         filters: [{ namePrefix: BLE_CONFIG.namePrefix }],
         optionalServices: [BLE_CONFIG.serviceUUID]
@@ -103,17 +103,17 @@ export class MicroNIRBLEDriver {
 
       this.device.addEventListener('gattserverdisconnected', this.onDisconnected);
       
-      this.log("Conectando...");
+      this.log("Conectando GATT...");
       this.server = await this.device.gatt!.connect();
       
-      this.log("Estabilizando (3s)...");
+      this.log("Estabilizando...");
       await this.sleep(3000); 
 
       const service = await this.server.getPrimaryService(BLE_CONFIG.serviceUUID);
       this.txChar = await service.getCharacteristic(BLE_CONFIG.txCharUUID);
       this.rxChar = await service.getCharacteristic(BLE_CONFIG.rxCharUUID);
 
-      this.log("Escuchando datos...");
+      this.log("Iniciando Notificaciones...");
       await this.rxChar.startNotifications();
       this.rxChar.addEventListener('characteristicvaluechanged', this.handleNotifications);
 
@@ -132,13 +132,12 @@ export class MicroNIRBLEDriver {
 
   private async softStartSensor() {
     this.isBusy = true;
-    this.log("Sincronizando firmware...");
+    this.log("Sincronizando Firmware...");
     await this.send(CMD.GET_INFO, [], true);
     await this.sleep(1000);
     const payload = [0x00, 0x64, 0x27, 0x10]; 
     await this.send(CMD.SET_CONFIG, payload);
     await this.waitForPacket(1500);
-    this.log("Hardware preparado.");
     this.isBusy = false;
   }
 
@@ -173,7 +172,7 @@ export class MicroNIRBLEDriver {
   }
 
   private onDisconnected = () => {
-    this.log("Desconectado por el hardware.");
+    this.log("Conexión perdida.");
     this.disconnectCleanly();
   };
 
@@ -252,22 +251,22 @@ export class MicroNIRBLEDriver {
   }
 
   async getTemperature(): Promise<number | null> {
-    // Implementación robusta con 3 reintentos para BLE
+    // 3 reintentos robustos para BLE con timeout extendido a 2.5s
     for (let i = 0; i < 3; i++) {
         try {
             if (await this.send(CMD.GET_TEMP, [], true)) {
-                const resp = await this.waitForPacket(2000); // Timeout extendido
+                const resp = await this.waitForPacket(2500); 
                 if (resp && resp.includes(0x06)) {
                     const offset = resp.indexOf(0x06);
                     const view = new DataView(resp.buffer, resp.byteOffset, resp.byteLength);
-                    const tempRaw = view.getUint16(offset + 1, false);
-                    if (tempRaw > 0 && tempRaw < 10000) {
+                    const tempRaw = view.getUint16(offset + 1, false); // ADT7320 Big Endian
+                    if (tempRaw > 0 && tempRaw < 0xFFFF) {
                         return tempRaw / 1000.0;
                     }
                 }
             }
         } catch (e) {}
-        await this.sleep(300);
+        await this.sleep(400);
     }
     return null;
   }
@@ -277,13 +276,11 @@ export class MicroNIRBLEDriver {
     const ok = await this.send(CMD.LAMP_CONTROL, [on ? 1 : 0]);
     await this.waitForPacket(1500);
     if (on && ok) {
-        this.log("Iniciando lámpara...");
-        for(let i=1; i<=10; i++) {
-            await this.sleep(500);
+        this.log("Calentando sensor...");
+        for(let i=1; i<=8; i++) {
+            await this.sleep(600);
             await this.send(CMD.GET_INFO, [], true); 
-            if(i % 2 === 0) this.log(`Calentando: ${i*10}%...`);
         }
-        this.log("Lámpara estable.");
     }
     this.isBusy = false;
     return ok;
@@ -299,16 +296,14 @@ export class MicroNIRBLEDriver {
 
   async scan(): Promise<Uint16Array | null> {
     this.isBusy = true;
-    this.log("Capturando espectro...");
+    this.log("Scan iniciado...");
     this.rxBuffer = new Uint8Array(0);
     this.lastPacket = null;
     if (!await this.send(CMD.SCAN)) { this.isBusy = false; return null; }
-    const raw = await this.waitForPacket(12000); 
+    const raw = await this.waitForPacket(15000); 
     this.isBusy = false;
-    if (!raw) {
-        this.log("Error: Tiempo de captura agotado.");
-        return null;
-    }
+    if (!raw) return null;
+    
     let offset = raw.indexOf(0x05);
     if (offset === -1) offset = 3; else offset += 1;
     const s = new Uint16Array(128);
@@ -318,9 +313,7 @@ export class MicroNIRBLEDriver {
             const idx = offset + (j*2);
             if (idx + 1 < raw.length) s[j] = view.getUint16(idx, false);
         }
-    } catch(err) {
-        this.log("Error de procesamiento.");
-    }
+    } catch(err) {}
     return s;
   }
 }

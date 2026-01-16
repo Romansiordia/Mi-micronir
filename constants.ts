@@ -29,6 +29,8 @@ export const CDM_MODEL: ChemometricModel = {
 
 export const USB_CONFIG = {
   vendorId: 0x0403,
+  viaviVendorId: 0x158E, // Nuevo ID detectado
+  viaviProductId: 0x2801, // Nuevo ID detectado
   deviceName: "MicroNIR On-Site-W",
   firmwareVersion: "2.5.1-stable"
 };
