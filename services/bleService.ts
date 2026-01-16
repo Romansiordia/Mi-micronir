@@ -133,15 +133,11 @@ export class MicroNIRBLEDriver {
   private async softStartSensor() {
     this.isBusy = true;
     this.log("Sincronizando firmware...");
-    
-    // Ping inicial
     await this.send(CMD.GET_INFO, [], true);
     await this.sleep(1000);
-
-    const payload = [0x00, 0x64, 0x27, 0x10]; // 100 scans, 10ms
+    const payload = [0x00, 0x64, 0x27, 0x10]; 
     await this.send(CMD.SET_CONFIG, payload);
     await this.waitForPacket(1500);
-
     this.log("Hardware preparado.");
     this.isBusy = false;
   }
@@ -185,7 +181,6 @@ export class MicroNIRBLEDriver {
     const value = (event.target as BluetoothRemoteGATTCharacteristic).value;
     if (!value) return;
     const chunk = new Uint8Array(value.buffer);
-    
     const newBuffer = new Uint8Array(this.rxBuffer.length + chunk.length);
     newBuffer.set(this.rxBuffer);
     newBuffer.set(chunk, this.rxBuffer.length);
@@ -199,7 +194,6 @@ export class MicroNIRBLEDriver {
        if (this.rxBuffer.length > 4096) this.rxBuffer = new Uint8Array(0);
        return;
     }
-
     for (let i = stxIndex + 1; i < this.rxBuffer.length; i++) {
         if (this.rxBuffer[i] === 0x03) {
             const candidate = this.rxBuffer.slice(stxIndex, i + 1);
@@ -219,22 +213,17 @@ export class MicroNIRBLEDriver {
 
   async send(opcode: number, data: number[] = [], silent = false): Promise<boolean> {
     if (!this.isConnected || !this.txChar) return false;
-    
     let retries = 3;
     while (this.writeInProgress && retries > 0) {
         await this.sleep(100);
         retries--;
     }
-
     if (!silent) { this.lastPacket = null; this.pendingResponse = true; }
-
     const len = data.length + 1;
     const rawPayload = new Uint8Array([len, opcode, ...data]);
     const crc = calculateCrc8(rawPayload);
     const packet = new Uint8Array([0x02, ...rawPayload, crc, 0x03]);
-    
     if (!silent) this.log(`TX >>> OP ${opcode.toString(16).toUpperCase()}`);
-
     this.writeInProgress = true;
     try {
       await this.txChar.writeValue(packet);
@@ -263,12 +252,22 @@ export class MicroNIRBLEDriver {
   }
 
   async getTemperature(): Promise<number | null> {
-    if (!await this.send(CMD.GET_TEMP, [], true)) return null;
-    const resp = await this.waitForPacket(1500);
-    if (resp && resp.includes(0x06)) {
-        const offset = resp.indexOf(0x06);
-        const view = new DataView(resp.buffer, resp.byteOffset, resp.byteLength);
-        return view.getUint16(offset + 1, false) / 1000.0;
+    // Implementación robusta con 3 reintentos para BLE
+    for (let i = 0; i < 3; i++) {
+        try {
+            if (await this.send(CMD.GET_TEMP, [], true)) {
+                const resp = await this.waitForPacket(2000); // Timeout extendido
+                if (resp && resp.includes(0x06)) {
+                    const offset = resp.indexOf(0x06);
+                    const view = new DataView(resp.buffer, resp.byteOffset, resp.byteLength);
+                    const tempRaw = view.getUint16(offset + 1, false);
+                    if (tempRaw > 0 && tempRaw < 10000) {
+                        return tempRaw / 1000.0;
+                    }
+                }
+            }
+        } catch (e) {}
+        await this.sleep(300);
     }
     return null;
   }
@@ -277,13 +276,11 @@ export class MicroNIRBLEDriver {
     this.isBusy = true; 
     const ok = await this.send(CMD.LAMP_CONTROL, [on ? 1 : 0]);
     await this.waitForPacket(1500);
-    
     if (on && ok) {
         this.log("Iniciando lámpara...");
-        // Bucle de Heartbeat para evitar timeout de hardware (5 segundos de espera activa)
         for(let i=1; i<=10; i++) {
             await this.sleep(500);
-            await this.send(CMD.GET_INFO, [], true); // Mantiene el canal BLE vivo
+            await this.send(CMD.GET_INFO, [], true); 
             if(i % 2 === 0) this.log(`Calentando: ${i*10}%...`);
         }
         this.log("Lámpara estable.");
@@ -305,20 +302,15 @@ export class MicroNIRBLEDriver {
     this.log("Capturando espectro...");
     this.rxBuffer = new Uint8Array(0);
     this.lastPacket = null;
-
     if (!await this.send(CMD.SCAN)) { this.isBusy = false; return null; }
-    
     const raw = await this.waitForPacket(12000); 
     this.isBusy = false;
-
     if (!raw) {
         this.log("Error: Tiempo de captura agotado.");
         return null;
     }
-
     let offset = raw.indexOf(0x05);
     if (offset === -1) offset = 3; else offset += 1;
-
     const s = new Uint16Array(128);
     const view = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
     try {

@@ -95,7 +95,6 @@ export class MicroNIRDriver {
     }
   }
 
-  // Implementation of disconnect to satisfy IDeviceDriver interface
   async disconnect(): Promise<void> {
     if (this.device) {
       try {
@@ -107,7 +106,6 @@ export class MicroNIRDriver {
     this.log("USB Desconectado.");
   }
 
-  // Implementation of resetHardware to satisfy IDeviceDriver interface
   async resetHardware(): Promise<boolean> {
     if (!this.device) return false;
     const ok = await this.send(CMD.RESET);
@@ -136,13 +134,22 @@ export class MicroNIRDriver {
   }
 
   async getTemperature(): Promise<number | null> {
-    if (await this.send(CMD.GET_TEMP)) {
-      const resp = await this.readPacket(1000);
-      if (resp && resp.includes(0x06)) {
-        const offset = resp.indexOf(0x06);
-        const view = new DataView(resp.buffer, resp.byteOffset, resp.byteLength);
-        return view.getUint16(offset + 1, false) / 1000.0;
-      }
+    // Implementación con 3 reintentos para evitar fallos por ocupación de bus
+    for (let i = 0; i < 3; i++) {
+        try {
+            if (await this.send(CMD.GET_TEMP)) {
+                const resp = await this.readPacket(2000); // Timeout extendido a 2s
+                if (resp && resp.includes(0x06)) {
+                    const offset = resp.indexOf(0x06);
+                    const view = new DataView(resp.buffer, resp.byteOffset, resp.byteLength);
+                    const tempRaw = view.getUint16(offset + 1, false);
+                    if (tempRaw > 0 && tempRaw < 10000) {
+                        return tempRaw / 1000.0;
+                    }
+                }
+            }
+        } catch (e) {}
+        await this.sleep(300); // Pausa entre reintentos
     }
     return null;
   }
