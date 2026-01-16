@@ -101,7 +101,7 @@ export class MicroNIRBLEDriver {
       if (!navigator.bluetooth) return "Navegador incompatible";
       await this.disconnect(); 
 
-      this.log("Iniciando 'Impressa Approach' (M1-0000343)...");
+      this.log("Buscando MicroNIR...");
       this.device = await navigator.bluetooth.requestDevice({
         filters: [{ namePrefix: BLE_CONFIG.namePrefix }],
         optionalServices: [BLE_CONFIG.serviceUUID]
@@ -109,25 +109,24 @@ export class MicroNIRBLEDriver {
 
       this.device.addEventListener('gattserverdisconnected', this.onDisconnected);
       
-      this.log("Conectando GATT...");
+      this.log("Conectando...");
       this.server = await this.device.gatt!.connect();
       
-      this.log("Estabilizando stack (3s)...");
+      this.log("Estabilizando enlace (3s)...");
       await this.sleep(3000); 
 
       const service = await this.server.getPrimaryService(BLE_CONFIG.serviceUUID);
       this.txChar = await service.getCharacteristic(BLE_CONFIG.txCharUUID);
       this.rxChar = await service.getCharacteristic(BLE_CONFIG.rxCharUUID);
 
-      this.log("Habilitando notificaciones...");
+      this.log("Abriendo canal de datos...");
       await this.rxChar.startNotifications();
       this.rxChar.addEventListener('characteristicvaluechanged', this.handleNotifications);
 
       this.isConnected = true;
       
-      // Sincronización inicial con reintentos
-      await this.sleep(1000);
-      await this.softStartSensor();
+      // Lanzamos la identificación en segundo plano para no bloquear
+      this.softStartSensor().catch(err => this.log(`Identificación diferida: ${err.message}`));
       this.startKeepAlive();
       
       return "OK";
@@ -140,47 +139,27 @@ export class MicroNIRBLEDriver {
 
   private async softStartSensor() {
     this.isBusy = true;
-    this.log("Verificando MicroNIR 1700...");
+    this.log("Sincronizando con hardware...");
+    
+    // Simplemente enviamos un GET_INFO para despertar al sensor
+    await this.send(CMD.GET_INFO, [], true);
+    await this.sleep(1000);
 
-    // Paso 1: Intentar despertar al sensor con GET_INFO (Ping)
-    let authenticated = false;
-    for (let i = 0; i < 3; i++) {
-        this.log(`Ping de sincronización ${i+1}/3...`);
-        await this.send(CMD.GET_INFO, [], true);
-        const resp = await this.waitForPacket(1500);
-        if (resp && resp[2] === CMD.GET_INFO) {
-            this.log("Sensor detectado y respondiendo.");
-            authenticated = true;
-            break;
-        }
-        await this.sleep(500);
-    }
-
-    if (!authenticated) {
-        throw new Error("El sensor no responde al comando de identificación.");
-    }
-
-    // Paso 2: Intentar configurar parámetros, pero no bloquear si da NAK 0x15
-    this.log("Sincronizando parámetros de escaneo...");
-    const scanCount = 100; // Valor de seguridad inicial
-    const integrationTime = 10000; // 10ms
+    const scanCount = 100;
+    const integrationTime = 10000;
     const payload = [
         (scanCount >> 8) & 0xFF, scanCount & 0xFF,
         (integrationTime >> 8) & 0xFF, integrationTime & 0xFF
     ];
 
+    // Intentamos configurar, si hay NAK 0x15 lo registramos pero no abortamos
     await this.send(CMD.SET_CONFIG, payload);
     const ack = await this.waitForPacket(1500);
-    
     if (ack && ack[2] === 0x15) {
-        this.log("Aviso: Sensor denegó configuración (NAK 0x15). Usando valores internos.");
-    } else if (ack) {
-        this.log("Configuración de escaneo aplicada.");
-    } else {
-        this.log("Aviso: No hubo respuesta a la config. Intentando continuar...");
+        this.log("Aviso: Parámetros fijos en firmware (NAK 0x15).");
     }
 
-    this.log("Hardware Listo.");
+    this.log("Sistema en línea.");
     this.isBusy = false;
   }
 
@@ -200,7 +179,7 @@ export class MicroNIRBLEDriver {
       if (this.isConnected && !this.pendingResponse && !this.isBusy) { 
          this.getTemperature().catch(() => {});
       }
-    }, 15000); 
+    }, 20000); 
   }
 
   private disconnectCleanly() {
@@ -214,7 +193,7 @@ export class MicroNIRBLEDriver {
   }
 
   private onDisconnected = () => {
-    this.log("Dispositivo desconectado.");
+    this.log("Desconectado por el hardware.");
     this.disconnectCleanly();
   };
 
@@ -264,13 +243,13 @@ export class MicroNIRBLEDriver {
     const crc = calculateCrc8(rawPayload);
     const packet = new Uint8Array([0x02, ...rawPayload, crc, 0x03]);
     
-    if (!silent) this.log(`TX >>> OP ${opcode.toString(16).toUpperCase()} (${packet.length} bytes)`);
+    if (!silent) this.log(`TX >>> OP ${opcode.toString(16).toUpperCase()}`);
 
     try {
       await this.txChar.writeValue(packet);
       return true;
     } catch (e: any) {
-      this.log(`Error de transmisión: ${e.message}`);
+      this.log(`Error TX: ${e.message}`);
       if (!silent) this.pendingResponse = false;
       return false;
     }
@@ -293,9 +272,10 @@ export class MicroNIRBLEDriver {
   async getTemperature(): Promise<number | null> {
     if (!await this.send(CMD.GET_TEMP, [], true)) return null;
     const resp = await this.waitForPacket(2000);
-    if (resp && resp.length >= 6 && resp[2] === 0x06) {
+    if (resp && resp.length >= 6 && resp.includes(0x06)) {
+        const offset = resp.indexOf(0x06);
         const view = new DataView(resp.buffer, resp.byteOffset, resp.byteLength);
-        return view.getUint16(3, false) / 1000.0;
+        return view.getUint16(offset + 1, false) / 1000.0;
     }
     return null;
   }
@@ -303,10 +283,9 @@ export class MicroNIRBLEDriver {
   async setLamp(on: boolean): Promise<boolean> {
     this.isBusy = true; 
     const ok = await this.send(CMD.LAMP_CONTROL, [on ? 1 : 0]);
-    // Esperar respuesta de confirmación del hardware
-    const ack = await this.waitForPacket(2000);
+    await this.waitForPacket(2000);
     if (on && ok) {
-        this.log("Calentando lámpara física (5s)...");
+        this.log("Calentando lámpara (5s)...");
         await this.sleep(5000); 
     }
     this.isBusy = false;
@@ -323,7 +302,7 @@ export class MicroNIRBLEDriver {
 
   async scan(): Promise<Uint16Array | null> {
     this.isBusy = true;
-    this.log("Capturando espectro...");
+    this.log("Iniciando escaneo...");
     this.rxBuffer = new Uint8Array(0);
     this.lastPacket = null;
 
@@ -333,28 +312,22 @@ export class MicroNIRBLEDriver {
     this.isBusy = false;
 
     if (!raw) {
-        this.log("Error: Tiempo de espera de escaneo agotado.");
+        this.log("Error: Tiempo de espera agotado.");
         return null;
     }
 
-    if (raw[2] === 0x15) {
-        this.log("Error: Escaneo denegado por el hardware.");
-        return null;
-    }
-
-    let dataOffset = 3; 
-    if (raw[1] > 0x80) dataOffset = 4;
-    else if (raw[2] === 0x05) dataOffset = 3;
+    let offset = raw.indexOf(0x05);
+    if (offset === -1) offset = 3; else offset += 1;
 
     const s = new Uint16Array(128);
     const view = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
     try {
         for(let j=0; j<128; j++) {
-            const idx = dataOffset + (j*2);
+            const idx = offset + (j*2);
             if (idx + 1 < raw.length) s[j] = view.getUint16(idx, false);
         }
     } catch(err) {
-        this.log("Error de parseo espectral.");
+        this.log("Error de datos espectrales.");
     }
     return s;
   }

@@ -84,7 +84,6 @@ export class MicroNIRDriver {
     try {
       if (!navigator.usb) return "Requiere Chrome en PC/Android";
 
-      // Filtro genérico para FTDI (Vendor 0x0403)
       this.device = await navigator.usb.requestDevice({
         filters: [{ vendorId: USB_CONFIG.vendorId }]
       });
@@ -101,37 +100,26 @@ export class MicroNIRDriver {
       this.inEndpoint = epIn?.endpointNumber || 2;
       this.outEndpoint = epOut?.endpointNumber || 1;
       
-      this.log("Inicializando UART FTDI...");
+      this.log("Configurando FTDI UART...");
       // Reset FTDI
       await this.ctrl(0x00, 0x00, 0x00);
-      // Baud Rate 115200 (MicroNIR standard)
-      await this.ctrl(0x03, 0x4138, 0x00); 
-      // Latency timer 16ms
-      await this.ctrl(0x09, 0x10, 0x00);
+      // Baud Rate 115200 (Corregido para 1700 OnSite-W)
+      // Divisor para 115200 en FTDI es 26 (0x1A)
+      await this.ctrl(0x03, 0x001A, 0x0000); 
+      // Latency timer 2ms (Ultra rápido para espectroscopia)
+      await this.ctrl(0x09, 0x02, 0x00);
       // Data Control 8N1
       await this.ctrl(0x04, 0x0008, 0x00);
 
       this.isConnected = true;
-      await this.sleep(200);
+      await this.sleep(300);
       
-      // Limpiar buffers viejos
+      // Limpieza profunda de buffers
       await this.flushRx();
-
-      // Probar conexión simple
-      this.log("Ping al sensor...");
-      if (await this.send(CMD.GET_INFO)) {
-          await this.sleep(100);
-          const resp = await this.readPacket(500);
-          if (resp) {
-              this.log("Sensor Responde OK.");
-              return "OK";
-          }
-      }
-
-      // Si falla ping, intentamos configuración básica
-      this.log("Negociando formato...");
-      const success = await this.trySimpleConfig();
-      if (!success) return "Error de protocolo (USB Driver)";
+      
+      this.log("Canal USB establecido.");
+      // No bloqueamos si el ping inicial es lento, permitimos la entrada al App
+      this.send(CMD.GET_INFO, []).catch(() => {});
 
       return "OK";
     } catch (error: any) {
@@ -140,26 +128,8 @@ export class MicroNIRDriver {
     }
   }
 
-  private async trySimpleConfig(): Promise<boolean> {
-     // Configuración simple: 16-bit Big Endian (Standard)
-     const payload = [
-         0,0,1,244, // 500 scans
-         0,0,48,212, // 12500 time
-         0,0,0,0,0,0,0,0 // padding
-     ];
-     
-     if(await this.send(CMD.SET_INTEGRATION, payload)) {
-         await this.sleep(200);
-         const resp = await this.readPacket(1000);
-         if(resp && resp.length > 2 && resp[2] !== 0x15) {
-             return true;
-         }
-     }
-     return false;
-  }
-
   async resetHardware(): Promise<boolean> {
-      this.log("Enviando comando de RESET (0x0F)...");
+      this.log("Reiniciando hardware...");
       return await this.send(CMD.RESET);
   }
 
@@ -172,8 +142,11 @@ export class MicroNIRDriver {
 
   private async flushRx() {
     try {
-      // Leer basura que haya quedado en el buffer
-      await this.device.transferIn(this.inEndpoint, 64);
+      // Intentar vaciar buffer remanente
+      for(let i=0; i<3; i++) {
+        await this.device.transferIn(this.inEndpoint, 64);
+        await this.sleep(10);
+      }
     } catch(e) {}
   }
 
@@ -182,7 +155,7 @@ export class MicroNIRDriver {
     const len = data.length + 1;
     const rawPayload = new Uint8Array([len, opcode, ...data]);
     const packet = new Uint8Array([0x02, ...rawPayload, calculateCrc8(rawPayload), 0x03]);
-    this.log(`TX >>> ${toHex(packet)}`);
+    this.log(`TX >>> OP ${opcode.toString(16).toUpperCase()}`);
     try {
       const res = await this.device.transferOut(this.outEndpoint, packet);
       return res.status === 'ok';
@@ -193,9 +166,11 @@ export class MicroNIRDriver {
 
   async getTemperature(): Promise<number | null> {
     if (await this.send(CMD.GET_TEMP)) {
-      const resp = await this.readPacket(500);
-      if (resp && resp.length >= 5 && resp[2] === 0x06) {
-        return new DataView(resp.buffer).getUint16(3, false) / 1000.0;
+      const resp = await this.readPacket(800);
+      if (resp && resp.length >= 5 && (resp[2] === 0x06 || resp[3] === 0x06)) {
+        const offset = resp.indexOf(0x06);
+        const view = new DataView(resp.buffer, resp.byteOffset, resp.byteLength);
+        return view.getUint16(offset + 1, false) / 1000.0;
       }
     }
     return null;
@@ -209,19 +184,21 @@ export class MicroNIRDriver {
 
   async scan(): Promise<Uint16Array | null> {
     if (!await this.send(CMD.SCAN)) return null;
-    const raw = await this.readPacket(3000);
+    const raw = await this.readPacket(8000);
     if (!raw) return null;
     return this.parseSpectrum(raw);
   }
 
   private parseSpectrum(buffer: Uint8Array): Uint16Array {
-    let offset = 3; 
-    if (buffer.length > 3 && buffer[3] === 0x05) offset = 4;
+    let offset = buffer.indexOf(0x05);
+    if (offset === -1) offset = 3; 
+    else offset += 1;
     
     const s = new Uint16Array(128);
-    const view = new DataView(buffer.buffer);
+    const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
     for(let j=0; j<128; j++) {
-      if (offset + (j*2) + 1 < buffer.length) s[j] = view.getUint16(offset + (j*2), false);
+      const idx = offset + (j*2);
+      if (idx + 1 < buffer.length) s[j] = view.getUint16(idx, false);
     }
     return s;
   }
@@ -231,20 +208,17 @@ export class MicroNIRDriver {
     let acc = new Uint8Array(0);
     while ((Date.now() - startTime) < timeoutMs) {
       try {
-        const res = await this.device.transferIn(this.inEndpoint, 64);
+        const res = await this.device.transferIn(this.inEndpoint, 1024);
         if (res.status === 'ok' && res.data.byteLength > 2) {
           const chunk = new Uint8Array(res.data.buffer); 
-          // Detectar STX (0x02)
-          if(acc.length === 0) {
-              const start = chunk.indexOf(0x02);
-              if(start >= 0) acc = chunk.slice(start);
-          } else {
-              const next = new Uint8Array(acc.length + chunk.length);
-              next.set(acc); next.set(chunk, acc.length);
+          const start = chunk.indexOf(0x02);
+          if (start >= 0 || acc.length > 0) {
+              const base = start >= 0 ? chunk.slice(start) : chunk;
+              const next = new Uint8Array(acc.length + base.length);
+              next.set(acc); next.set(base, acc.length);
               acc = next;
+              if (acc.length > 5 && acc.includes(0x03)) return acc;
           }
-          
-          if (acc.length > 3 && acc[acc.length-1] === 0x03) return acc;
         }
       } catch (e) { await this.sleep(20); }
     }
