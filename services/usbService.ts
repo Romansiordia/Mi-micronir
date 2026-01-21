@@ -131,13 +131,19 @@ export class MicroNIRDriver {
     return null;
   }
 
-  async scan(): Promise<Uint16Array | null> {
-    this.log("!!! MODO PRO 128: LECTURA DIRECTA 0x04 !!!");
+  async scan(isDark: boolean = false): Promise<Uint16Array | null> {
+    this.log(isDark ? ">>> INICIANDO ESCANEO DARK <<<" : "!!! MODO PRO 128: LECTURA DIRECTA 0x04 !!!");
     
-    this.log("Hardware: Lámpara -> ENCENDIDA");
-    await this.writeCommand(0x01, [0x01]);
-    await this.readValidatedPacket(500);
-    await this.sleep(1000);
+    if (!isDark) {
+      this.log("Hardware: Lámpara -> ENCENDIDA");
+      await this.writeCommand(0x01, [0x01]);
+      await this.readValidatedPacket(500);
+      await this.sleep(1000);
+    } else {
+      this.log("Hardware: Lámpara -> APAGADA para modo DARK");
+      await this.writeCommand(0x01, [0x00]);
+      await this.readValidatedPacket(500);
+    }
     
     this.log("Hardware: Configurando 10ms (Pro V3.2)...");
     await this.purgeBuffers();
@@ -147,18 +153,15 @@ export class MicroNIRDriver {
     this.log("Disparando Scan (0x05)...");
     await this.writeCommand(0x05, [0x01]);
     
-    // Esperamos el flag 0x64 (Sensor Ready)
     const signal = await this.readValidatedPacket(4000);
     
     if (signal && signal[2] === 0x18 && signal[3] === 0x64) {
         this.log("¡0x64 Detectado! Ejecutando volcado directo (0x04)...");
-        // NOTA: No vaciamos buffers aquí para preservar los datos que ya vienen entrando
         await this.writeCommand(0x04);
         
         const data = await this.readValidatedPacket(5000);
         if (data) {
             const s = new Uint16Array(128);
-            // Tolerancia Pro: Saltamos cabecera extendida si el paquete es de gran tamaño
             const offset = data.length > 260 ? 5 : 3;
             
             for(let j=0; j<128; j++) {
@@ -167,11 +170,11 @@ export class MicroNIRDriver {
                     s[j] = (data[idx] << 8) | data[idx+1];
                 }
             }
-            this.log(`>>> ESCANEO COMPLETADO (Offset: ${offset}, Bytes: ${data.length})`);
+            this.log(`>>> ESCANEO COMPLETADO (Bytes: ${data.length})`);
             return s;
         }
     }
-    this.log(">>> ERROR: El detector no respondió al handshake 0x04.");
+    this.log(">>> ERROR: El detector no respondió.");
     return null;
   }
 
@@ -241,12 +244,6 @@ export class MicroNIRDriver {
       this.isConnected = false;
       return error.message;
     }
-  }
-
-  async getHardwareStatus() {
-      await this.writeCommand(0x18);
-      const pkt = await this.readValidatedPacket(800);
-      return pkt ? pkt[3] : null;
   }
 
   async abortOperation() {
