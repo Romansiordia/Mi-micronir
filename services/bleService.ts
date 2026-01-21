@@ -11,17 +11,28 @@ interface BluetoothRemoteGATTServer {
   connected: boolean;
   connect(): Promise<BluetoothRemoteGATTServer>;
   disconnect(): void;
-  getPrimaryService(service: string): Promise<BluetoothRemoteGATTService>;
+  getPrimaryService(service: string | number): Promise<BluetoothRemoteGATTService>;
+  getPrimaryServices(): Promise<BluetoothRemoteGATTService[]>;
 }
 
 interface BluetoothRemoteGATTService {
-  getCharacteristic(characteristic: string): Promise<BluetoothRemoteGATTCharacteristic>;
+  uuid: string;
+  getCharacteristic(characteristic: string | number): Promise<BluetoothRemoteGATTCharacteristic>;
+  getCharacteristics(): Promise<BluetoothRemoteGATTCharacteristic[]>;
 }
 
 interface BluetoothRemoteGATTCharacteristic extends EventTarget {
   uuid: string;
   value?: DataView;
+  properties: {
+      write: boolean;
+      writeWithoutResponse: boolean;
+      notify: boolean;
+      indicate: boolean;
+      read: boolean;
+  };
   writeValue(value: BufferSource): Promise<void>;
+  writeValueWithResponse?(value: BufferSource): Promise<void>;
   startNotifications(): Promise<BluetoothRemoteGATTCharacteristic>;
   stopNotifications(): Promise<BluetoothRemoteGATTCharacteristic>;
 }
@@ -63,22 +74,11 @@ function calculateCrc8(data: Uint8Array): number {
 
 const CMD = {
   LAMP_CONTROL: 0x01,
-  SET_CONFIG: 0x02, 
-  GET_INFO: 0x03, 
   SCAN: 0x05,
   GET_TEMP: 0x06,
-  STATUS_REPORT: 0x18,
   PING: 0x14,
   RESET: 0x0F
 };
-
-// Configuración de Diagnóstico (50 scans)
-const DIAGNOSTIC_CONFIG = [
-    0x64,               // Intensity 100%
-    0x27, 0x10,         // Freq 10000 Hz
-    0x00, 0x00, 0x30, 0xD4, // Exposure 12500 us (12.5 ms)
-    0x00, 0x00, 0x00, 0x32  // Scan Count 50
-];
 
 export class MicroNIRBLEDriver {
   private device: BluetoothDevice | null = null;
@@ -86,11 +86,6 @@ export class MicroNIRBLEDriver {
   private txChar: BluetoothRemoteGATTCharacteristic | null = null;
   private rxChar: BluetoothRemoteGATTCharacteristic | null = null;
   
-  private keepAliveInterval: any = null;
-  private pendingResponse = false;
-  private isBusy = false; 
-  private writeInProgress = false; 
-
   public isConnected = false;
   private rxBuffer: Uint8Array = new Uint8Array(0);
   private lastPacket: Uint8Array | null = null;
@@ -102,236 +97,204 @@ export class MicroNIRBLEDriver {
 
   async connect(): Promise<string> {
     try {
-      if (!navigator.bluetooth) return "Navegador incompatible";
-      await this.disconnect(); 
-
-      this.log("Buscando MicroNIR Wireless...");
+      if (!navigator.bluetooth) return "Navegador incompatible con Bluetooth.";
+      
+      this.log("Buscando equipos MicroNIR...");
+      
+      // SOLUCIÓN: Usar UUIDs completos de 128 bits y evitar strings cortos inválidos
       this.device = await navigator.bluetooth.requestDevice({
-        filters: [{ namePrefix: BLE_CONFIG.namePrefix }],
-        optionalServices: [BLE_CONFIG.serviceUUID]
+        filters: [
+            { namePrefix: "MicroNIR" },
+            { namePrefix: "VIAVI" }
+        ],
+        optionalServices: [
+            BLE_CONFIG.serviceUUID, 
+            BLE_CONFIG.nordicService,
+            '0000fee9-0000-1000-8000-00805f9b34fb', // Alias para FEE9
+            '0000180a-0000-1000-8000-00805f9b34fb'  // Device Information
+        ]
       });
 
-      this.device.addEventListener('gattserverdisconnected', this.onDisconnected);
+      this.log(`Conectando a: ${this.device.name}...`);
       this.server = await this.device.gatt!.connect();
       
-      this.log("Estabilizando enlace...");
-      await this.sleep(3000); 
+      this.log("Mapeando servicios del hardware...");
+      const services = await this.server.getPrimaryServices();
+      this.log(`Encontrados ${services.length} servicios.`);
+      
+      let mainService: BluetoothRemoteGATTService | null = null;
 
-      const service = await this.server.getPrimaryService(BLE_CONFIG.serviceUUID);
-      this.txChar = await service.getCharacteristic(BLE_CONFIG.txCharUUID);
-      this.rxChar = await service.getCharacteristic(BLE_CONFIG.rxCharUUID);
+      // Intentar encontrar el servicio por UUID conocido
+      for (const s of services) {
+          const uuid = s.uuid.toLowerCase();
+          this.log(`- Servicio: ${uuid}`);
+          if (uuid.includes('ff01') || uuid.includes('6e400001')) {
+              mainService = s;
+              break;
+          }
+      }
 
+      // Si no encontramos por UUID, usamos el primer servicio que no sea estándar de batería/info
+      if (!mainService && services.length > 0) {
+          this.log("UUID específico no hallado. Buscando servicio de datos genérico...");
+          mainService = services.find(s => !s.uuid.includes('180a') && !s.uuid.includes('1800')) || services[0];
+      }
+
+      if (!mainService) throw new Error("No se halló un servicio de datos válido.");
+
+      this.log(`Usando servicio: ${mainService.uuid}`);
+      const characteristics = await mainService.getCharacteristics();
+      this.log(`Encontradas ${characteristics.length} características.`);
+
+      // Mapeo dinámico de TX y RX basándose en propiedades
+      for (const char of characteristics) {
+          const props = char.properties;
+          this.log(`- Char: ${char.uuid} [Write:${props.write}, Notify:${props.notify}]`);
+          
+          if ((props.write || props.writeWithoutResponse) && !this.txChar) {
+              this.txChar = char;
+          }
+          if ((props.notify || props.indicate) && !this.rxChar) {
+              this.rxChar = char;
+          }
+      }
+
+      if (!this.txChar || !this.rxChar) {
+          throw new Error("No se pudieron mapear los canales de entrada/salida.");
+      }
+
+      this.log("Configurando canal de respuesta...");
       await this.rxChar.startNotifications();
-      this.rxChar.addEventListener('characteristicvaluechanged', this.handleNotifications);
+      this.rxChar.addEventListener('characteristicvaluechanged', this.onDataReceived);
 
       this.isConnected = true;
-      await this.sleep(500);
-      await this.softStartSensor();
-      this.startKeepAlive();
+      this.log("SINCRONIZACIÓN EXITOSA.");
+      
+      // Despertar sensor
+      await this.send(CMD.PING, [], true);
       
       return "OK";
     } catch (error: any) {
+      this.log(`ERROR DE ENLACE: ${error.message}`);
       this.isConnected = false;
-      this.log(`Error: ${error.message}`);
-      return error.message || "Error BLE";
+      return error.message;
     }
   }
 
-  private async softStartSensor() {
-    this.isBusy = true;
-    this.log("Iniciando modo diagnóstico (50 scans)...");
-    await this.send(CMD.GET_INFO, [], true);
-    await this.sleep(500);
-    await this.send(CMD.SET_CONFIG, DIAGNOSTIC_CONFIG);
-    await this.waitForPacket(2000);
-    this.log("Hardware listo para lectura rápida.");
-    this.isBusy = false;
-  }
-
-  async disconnect(): Promise<void> {
-    if (this.server && this.server.connected) {
-        if (this.rxChar) {
-            try { await this.rxChar.stopNotifications(); } catch(e){}
-        }
-        this.server.disconnect();
-    }
-    this.disconnectCleanly();
-  }
-
-  private startKeepAlive() {
-    if (this.keepAliveInterval) clearInterval(this.keepAliveInterval);
-    this.keepAliveInterval = setInterval(() => {
-      if (this.isConnected && !this.pendingResponse && !this.isBusy && !this.writeInProgress) { 
-         this.send(CMD.PING, [], true).catch(() => {});
-      }
-    }, 15000); 
-  }
-
-  private disconnectCleanly() {
-    this.isConnected = false;
-    this.isBusy = false;
-    this.writeInProgress = false;
-    this.pendingResponse = false;
-    if (this.keepAliveInterval) clearInterval(this.keepAliveInterval);
-    this.rxBuffer = new Uint8Array(0);
-    this.txChar = null;
-    this.rxChar = null;
-  }
-
-  private onDisconnected = () => {
-    this.log("Desconexión detectada.");
-    this.disconnectCleanly();
-  };
-
-  private handleNotifications = (event: Event) => {
+  private onDataReceived = (event: Event) => {
     const value = (event.target as BluetoothRemoteGATTCharacteristic).value;
     if (!value) return;
     const chunk = new Uint8Array(value.buffer);
-    const newBuffer = new Uint8Array(this.rxBuffer.length + chunk.length);
-    newBuffer.set(this.rxBuffer);
-    newBuffer.set(chunk, this.rxBuffer.length);
-    this.rxBuffer = newBuffer;
-    this.scanForPackets();
+    
+    const combined = new Uint8Array(this.rxBuffer.length + chunk.length);
+    combined.set(this.rxBuffer);
+    combined.set(chunk, this.rxBuffer.length);
+    this.rxBuffer = combined;
+    
+    this.processBuffer();
   };
 
-  private scanForPackets() {
-    let stxIndex = this.rxBuffer.indexOf(0x02);
-    if (stxIndex === -1) {
-       if (this.rxBuffer.length > 8192) this.rxBuffer = new Uint8Array(0);
-       return;
+  private processBuffer() {
+    let stx = this.rxBuffer.indexOf(0x02);
+    if (stx === -1) {
+        if (this.rxBuffer.length > 1024) this.rxBuffer = new Uint8Array(0);
+        return;
     }
-    for (let i = stxIndex + 1; i < this.rxBuffer.length; i++) {
-        if (this.rxBuffer[i] === 0x03) {
-            const candidate = this.rxBuffer.slice(stxIndex, i + 1);
-            if (candidate.length >= 5) {
-                const payloadForCrc = candidate.slice(1, candidate.length - 2);
-                const packetCrc = candidate[candidate.length - 2];
-                if (calculateCrc8(payloadForCrc) === packetCrc) {
-                    this.lastPacket = candidate;
-                    this.pendingResponse = false;
-                    this.rxBuffer = this.rxBuffer.slice(i + 1);
-                    return;
-                }
+
+    let etx = this.rxBuffer.indexOf(0x03, stx + 1);
+    while (etx !== -1) {
+        const pkt = this.rxBuffer.slice(stx, etx + 1);
+        if (pkt.length >= 5) {
+            const payload = pkt.slice(1, pkt.length - 2);
+            const crc = pkt[pkt.length - 2];
+            if (calculateCrc8(payload) === crc) {
+                this.lastPacket = pkt;
+                this.rxBuffer = this.rxBuffer.slice(etx + 1);
+                stx = this.rxBuffer.indexOf(0x02);
+                if (stx === -1) break;
+                etx = this.rxBuffer.indexOf(0x03, stx + 1);
+                continue;
             }
         }
+        this.rxBuffer = this.rxBuffer.slice(stx + 1);
+        stx = this.rxBuffer.indexOf(0x02);
+        if (stx === -1) break;
+        etx = this.rxBuffer.indexOf(0x03, stx + 1);
     }
   }
 
   async send(opcode: number, data: number[] = [], silent = false): Promise<boolean> {
     if (!this.isConnected || !this.txChar) return false;
-    let retries = 3;
-    while (this.writeInProgress && retries > 0) {
-        await this.sleep(100);
-        retries--;
-    }
-    if (!silent) { this.lastPacket = null; this.pendingResponse = true; }
+    
     const len = data.length + 1;
-    const rawPayload = new Uint8Array([len, opcode, ...data]);
-    const crc = calculateCrc8(rawPayload);
-    const packet = new Uint8Array([0x02, ...rawPayload, crc, 0x03]);
-    this.writeInProgress = true;
+    const payload = new Uint8Array([len, opcode, ...data]);
+    const crc = calculateCrc8(payload);
+    const packet = new Uint8Array([0x02, ...payload, crc, 0x03]);
+    
     try {
-      await this.txChar.writeValue(packet);
-      await this.sleep(80);
-      return true;
-    } catch (e: any) {
-      if (!silent) this.pendingResponse = false;
-      return false;
-    } finally {
-      this.writeInProgress = false;
-    }
-  }
-
-  private async waitForPacket(timeoutMs: number): Promise<Uint8Array | null> {
-    const start = Date.now();
-    while ((Date.now() - start) < timeoutMs) {
-      if (!this.pendingResponse && this.lastPacket) {
-        const pkt = this.lastPacket;
-        this.lastPacket = null;
-        return pkt;
+      if (this.txChar.writeValueWithResponse) {
+        await this.txChar.writeValueWithResponse(packet);
+      } else {
+        await this.txChar.writeValue(packet);
       }
-      await this.sleep(50);
+      return true;
+    } catch (e) {
+      return false;
     }
-    this.pendingResponse = false;
-    return null;
   }
 
-  private convertADT7320(raw: number): number {
-    let val = (raw & 0xFFF8) >> 3; 
-    if (val & 0x1000) val -= 0x2000; 
-    return val / 16.0;
+  private async waitForPacket(timeout: number): Promise<Uint8Array | null> {
+    const start = Date.now();
+    while (Date.now() - start < timeout) {
+      if (this.lastPacket) {
+        const p = this.lastPacket;
+        this.lastPacket = null;
+        return p;
+      }
+      await this.sleep(20);
+    }
+    return null;
   }
 
   async getTemperature(): Promise<number | null> {
-    try {
-        if (await this.send(CMD.GET_TEMP, [], true)) {
-            const resp = await this.waitForPacket(3000); 
-            if (resp) {
-                const idx = resp.indexOf(CMD.GET_TEMP);
-                if (idx !== -1 && idx + 2 < resp.length) {
-                    const view = new DataView(resp.buffer, resp.byteOffset, resp.byteLength);
-                    const rawTemp = view.getUint16(idx + 1, false);
-                    const t = this.convertADT7320(rawTemp);
-                    if (t > 5 && t < 85) return t;
-                }
+    if (await this.send(CMD.GET_TEMP)) {
+        const resp = await this.waitForPacket(1000);
+        if (resp) {
+            const idx = resp.indexOf(CMD.GET_TEMP);
+            if (idx !== -1 && idx + 2 < resp.length) {
+                const raw = (resp[idx+1] << 8) | resp[idx+2];
+                return ((raw & 0xFFF8) >> 3) / 16.0;
             }
         }
-    } catch (e) {}
+    }
     return null;
   }
 
-  async setLamp(on: boolean): Promise<boolean> {
-    this.isBusy = true; 
-    if (on) {
-        await this.send(CMD.SET_CONFIG, DIAGNOSTIC_CONFIG);
-        await this.sleep(300);
+  async scan(): Promise<Uint16Array | null> {
+    this.log("Capturando espectro (Wireless)...");
+    if (!await this.send(CMD.SCAN)) return null;
+    const raw = await this.waitForPacket(10000);
+    if (!raw) return null;
+    
+    const offset = raw.indexOf(CMD.SCAN) + 1;
+    const s = new Uint16Array(128);
+    for(let j=0; j<128; j++) {
+        const idx = offset + (j*2);
+        if (idx + 1 < raw.length) s[j] = (raw[idx] << 8) | raw[idx+1];
     }
+    return s;
+  }
 
+  async setLamp(on: boolean): Promise<boolean> {
     const ok = await this.send(CMD.LAMP_CONTROL, [on ? 1 : 0]);
-    await this.waitForPacket(2000);
-    if (on && ok) {
-        this.log("Calentando filamento...");
-        await this.sleep(5000);
-        await this.send(CMD.STATUS_REPORT, [], true); 
-    }
-    this.isBusy = false;
+    if (on && ok) await this.sleep(2000);
     return ok;
   }
 
-  async resetHardware(): Promise<boolean> {
-      this.isBusy = true;
-      const ok = await this.send(CMD.RESET);
-      await this.sleep(5000);
-      this.isBusy = false;
-      return ok;
-  }
-
-  async scan(): Promise<Uint16Array | null> {
-    this.isBusy = true;
-    this.log("Capturando espectro (50 scans rápidos)...");
-    this.rxBuffer = new Uint8Array(0);
-    this.lastPacket = null;
-
-    await this.send(CMD.SET_CONFIG, DIAGNOSTIC_CONFIG);
-    await this.sleep(200);
-
-    if (!await this.send(CMD.SCAN)) { this.isBusy = false; return null; }
-    
-    const raw = await this.waitForPacket(20000); 
-    this.isBusy = false;
-    if (!raw) return null;
-    
-    let offset = raw.indexOf(CMD.SCAN);
-    if (offset === -1) offset = 3; else offset += 1;
-    const s = new Uint16Array(128);
-    const view = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
-    try {
-        for(let j=0; j<128; j++) {
-            const idx = offset + (j*2);
-            if (idx + 1 < raw.length) s[j] = view.getUint16(idx, false);
-        }
-    } catch(err) {}
-    return s;
+  async resetHardware(): Promise<void> {
+      await this.send(CMD.RESET);
+      if (this.server) this.server.disconnect();
+      this.isConnected = false;
   }
 }
 
