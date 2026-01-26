@@ -20,7 +20,14 @@ export interface ChemometricModel {
   wavelengths: number[];
 }
 
-export type LampStatus = 'ok' | 'error_nan' | 'off' | 'unknown';
+// Nuevo tipo para el resultado del modelo predictivo
+export interface PredictionResult {
+  moisture: number;
+  protein: number;
+  fat: number;
+}
+
+export type LampStatus = 'ok' | 'error_nan' | 'off' | 'unknown' | 'saturated';
 
 export interface DeviceInfo {
   serialNumber: string;

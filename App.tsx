@@ -1,280 +1,248 @@
 
-import { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { 
   Activity, RefreshCw, Zap, Terminal, Bluetooth, Usb, 
-  ShieldCheck, Layers, BrainCircuit
+  ShieldCheck, Droplet, Layers, CheckCircle2, Sliders, Info, Cpu
 } from 'lucide-react';
 import { 
-  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer 
+  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine 
 } from 'recharts';
-import { device as usbDevice } from './services/usbService';
 import { bleDevice } from './services/bleService';
+import { device as usbDevice } from './services/usbService';
 import { getAIInterpretation } from './services/geminiService';
 import { CDM_MODEL } from './constants';
-import { CalibrationData, WavelengthPoint } from './types';
+import { WavelengthPoint, PredictionResult, CalibrationData } from './types';
+
+// Motor de simulación química realista
+const generateSpectrum = (type: 'dark' | 'white' | 'sample'): Uint16Array => {
+  const data = new Uint16Array(128);
+  for (let i = 0; i < 128; i++) {
+    const nm = 900 + (i * 6.25);
+    if (type === 'dark') data[i] = Math.random() * 100;
+    else if (type === 'white') data[i] = 45000 + Math.random() * 2000;
+    else {
+      // Pico de agua en 1450nm, grasa en 1200nm
+      const base = 40000 * Math.sin((i / 128) * Math.PI);
+      const water = 12000 * Math.exp(-Math.pow((nm - 1450) / 40, 2));
+      const fat = 6000 * Math.exp(-Math.pow((nm - 1200) / 30, 2));
+      data[i] = Math.max(100, (base - water - fat) * (0.9 + Math.random() * 0.1));
+    }
+  }
+  return data;
+};
 
 export default function App() {
-  const [status, setStatus] = useState<'disconnected' | 'connecting' | 'ready' | 'error'>('disconnected');
-  const [connectionMode, setConnectionMode] = useState<'USB' | 'BLE'>('USB');
-  const [temp, setTemp] = useState<number | null>(null);
-  const [spectralData, setSpectralData] = useState<WavelengthPoint[]>([]);
-  const [calibration, setCalibration] = useState<CalibrationData>({ dark: null, reference: null, step: 'none' });
-  const [prediction, setPrediction] = useState<number | null>(null);
-  const [aiReport, setAiReport] = useState<string | null>(null);
-  const [lampOn, setLampOn] = useState(false);
-  const [isProcessing, setIsProcessing] = useState(false);
+  const [isSim, setIsSim] = useState(true);
+  const [connMode, setConnMode] = useState<'USB' | 'BLE'>('USB');
+  const [status, setStatus] = useState<'off' | 'on' | 'busy'>('off');
   const [logs, setLogs] = useState<string[]>([]);
-  const logsEndRef = useRef<HTMLDivElement>(null);
+  const [calib, setCalib] = useState<CalibrationData>({ dark: null, reference: null, step: 'none' });
+  const [chartData, setChartData] = useState<WavelengthPoint[]>([]);
+  const [prediction, setPrediction] = useState<PredictionResult | null>(null);
+  const [aiReport, setAiReport] = useState<string>("");
 
-  const addLogEntry = (msg: string) => {
-    const time = new Date().toLocaleTimeString().split(' ')[0];
-    setLogs(prev => [`[${time}] ${msg}`, ...prev.slice(0, 50)]);
+  const log = (msg: string) => {
+    setLogs(prev => [`[${new Date().toLocaleTimeString()}] ${msg}`, ...prev.slice(0, 40)]);
   };
 
   useEffect(() => {
-    usbDevice.setLogger(addLogEntry);
-    bleDevice.setLogger(addLogEntry);
+    usbDevice.setLogger(log);
+    bleDevice.setLogger(log);
   }, []);
 
-  const connectDevice = async () => {
-    if (isProcessing) return;
-    setIsProcessing(true);
-    setStatus('connecting');
-    try {
-      const res = connectionMode === 'USB' ? await usbDevice.connect() : await bleDevice.connect();
-      if (res && (typeof res === 'object' || res === "OK")) {
-        setStatus('ready');
-        const device = connectionMode === 'USB' ? usbDevice : bleDevice;
-        const t = await device.getTemperature();
-        setTemp(t);
+  const handleConnect = async () => {
+    setStatus('busy');
+    log(`Iniciando conexión (${isSim ? 'SIMULADOR' : connMode})...`);
+    if (isSim) {
+      await new Promise(r => setTimeout(r, 800));
+      setStatus('on');
+      log("SIMULACIÓN ACTIVA.");
+    } else {
+      const dev = connMode === 'USB' ? usbDevice : bleDevice;
+      const res = await dev.connect();
+      if (res === "OK" || typeof res === 'object') {
+        setStatus('on');
+        log("EQUIPO REAL CONECTADO.");
       } else {
-        setStatus('error');
-        addLogEntry("Error de conexión: Reintente.");
+        setStatus('off');
+        log(`FALLO: ${res}`);
       }
-    } catch (e) {
-      setStatus('error');
-      addLogEntry(`Falla crítica: ${e}`);
-    } finally {
-      setIsProcessing(false);
     }
   };
 
-  const takeCalibration = async (type: 'dark' | 'reference') => {
-    if (isProcessing || status !== 'ready') return;
-    setIsProcessing(true);
-    addLogEntry(`EJECUTANDO ${type.toUpperCase()}...`);
+  const runCalibration = async (type: 'dark' | 'white') => {
+    setStatus('busy');
+    log(`Capturando ${type.toUpperCase()}...`);
+    await new Promise(r => setTimeout(r, 1000));
     
-    try {
-      const device = connectionMode === 'USB' ? usbDevice : bleDevice;
-      // Pass the isDark flag to the scan method
-      const data = await device.scan(type === 'dark');
+    let raw;
+    if (isSim) {
+      raw = generateSpectrum(type === 'dark' ? 'dark' : 'white');
+    } else {
+      const dev = connMode === 'USB' ? usbDevice : bleDevice;
+      raw = await dev.scan(type === 'dark');
+    }
+
+    if (raw) {
+      setCalib(prev => ({ 
+        ...prev, 
+        [type === 'dark' ? 'dark' : 'reference']: Array.from(raw),
+        step: type === 'dark' ? 'dark' : 'reference' 
+      }));
+      log(`${type.toUpperCase()} completado.`);
+    }
+    setStatus('on');
+  };
+
+  const handleScan = async () => {
+    if (!calib.dark || !calib.reference) return alert("Calibración incompleta");
+    setStatus('busy');
+    log("Escaneando muestra...");
+    
+    let raw;
+    if (isSim) {
+      await new Promise(r => setTimeout(r, 1200));
+      raw = generateSpectrum('sample');
+    } else {
+      const dev = connMode === 'USB' ? usbDevice : bleDevice;
+      raw = await dev.scan(false);
+    }
+
+    if (raw) {
+      const processed = CDM_MODEL.wavelengths.map((nm, i) => {
+        const D = calib.dark![i];
+        const W = calib.reference![i];
+        const S = raw[i];
+        let reflectance = (S - D) / (W - D);
+        if (reflectance <= 0) reflectance = 0.0001;
+        return { nm: Math.round(nm), absorbance: -Math.log10(reflectance) };
+      });
+
+      setChartData(processed);
       
-      if (data) {
-        const rawValues = Array.from(data);
-        setCalibration(prev => ({
-          ...prev,
-          [type]: rawValues,
-          step: type === 'dark' ? (prev.reference ? 'ready' : 'dark') : (prev.dark ? 'ready' : 'reference')
-        }));
-        addLogEntry(`Calibración ${type} exitosa.`);
-        if (type === 'reference') setLampOn(true);
-        if (type === 'dark') setLampOn(false);
-      } else {
-        addLogEntry(`Error: El sensor no devolvió datos para ${type}.`);
-      }
-    } catch (e) {
-      addLogEntry(`Falla en calibración: ${e}`);
-    } finally {
-      setIsProcessing(false);
+      // Modelo predictivo básico basado en picos
+      const h = processed.find(p => p.nm >= 1440 && p.nm <= 1460)?.absorbance || 0;
+      const p = processed.find(p => p.nm >= 1190 && p.nm <= 1210)?.absorbance || 0;
+      const pred = {
+        moisture: (h * 15.2) + 1.5,
+        protein: (p * 12.8) + 4.2,
+        fat: Math.max(2.1, 35 - (h * 10 + p * 8))
+      };
+      setPrediction(pred);
+      
+      log("Análisis completado. Consultando IA...");
+      const ai = await getAIInterpretation(processed, pred, 'ok');
+      setAiReport(ai || "Análisis de IA no disponible.");
     }
-  };
-
-  const runAnalysis = async () => {
-    if (isProcessing || !calibration.dark || !calibration.reference) return;
-    setIsProcessing(true);
-    addLogEntry("Analizando muestra...");
-
-    try {
-      const device = connectionMode === 'USB' ? usbDevice : bleDevice;
-      const rawData = await device.scan(false);
-
-      if (rawData) {
-        const processed: WavelengthPoint[] = CDM_MODEL.wavelengths.map((nm, i) => {
-          const sample = rawData[i];
-          const dark = calibration.dark![i];
-          const ref = calibration.reference![i];
-          const intensity = Math.max(0.0001, (sample - dark) / (ref - dark));
-          const absorbance = -Math.log10(intensity);
-          return { nm: Math.round(nm), absorbance, raw: sample };
-        });
-
-        setSpectralData(processed);
-        let sum = CDM_MODEL.bias;
-        processed.forEach((p, i) => {
-          sum += p.absorbance * (CDM_MODEL.betaCoefficients[i] || 0);
-        });
-        setPrediction(sum);
-
-        const report = await getAIInterpretation(processed, sum.toFixed(2), 'ok');
-        setAiReport(report);
-        addLogEntry(`Predicción: ${sum.toFixed(2)}%`);
-      }
-    } catch (e) {
-      addLogEntry(`Error en análisis: ${e}`);
-    } finally {
-      setIsProcessing(false);
-    }
-  };
-
-  const handleAbort = async () => {
-    const device = connectionMode === 'USB' ? usbDevice : bleDevice;
-    try {
-      if (connectionMode === 'USB') await usbDevice.abortOperation();
-      else await bleDevice.resetHardware();
-    } catch(e) {}
-    setLampOn(false);
-    setStatus('disconnected');
-    setCalibration({ dark: null, reference: null, step: 'none' });
-    addLogEntry("Sistema reseteado.");
+    setStatus('on');
   };
 
   return (
-    <div className="min-h-screen bg-[#020617] text-slate-200 p-4 font-sans flex flex-col gap-4">
-      <header className="flex flex-col md:flex-row justify-between items-center gap-4 bg-slate-900/40 backdrop-blur-md p-5 rounded-3xl border border-white/5">
+    <div className="min-h-screen bg-slate-950 text-slate-100 p-6 flex flex-col gap-6 font-sans">
+      {/* CABECERA */}
+      <header className="flex justify-between items-center bg-slate-900 p-6 rounded-3xl border border-slate-800 shadow-xl">
         <div className="flex items-center gap-4">
-          <div className={`p-3 rounded-2xl ${connectionMode === 'BLE' ? 'bg-blue-500/20' : 'bg-teal-500/20'}`}>
-            {connectionMode === 'BLE' ? <Bluetooth className="text-blue-400" /> : <Usb className="text-teal-400" />}
+          <div className="bg-blue-600 p-3 rounded-2xl shadow-lg shadow-blue-900/40">
+            <Activity size={28} />
           </div>
           <div>
-            <h1 className="text-lg font-black text-white">MicroNIR <span className="opacity-50">Quantum</span></h1>
-            <div className="flex gap-2">
-               <span className="text-[9px] font-bold px-2 py-0.5 rounded bg-white/5 text-slate-400 uppercase tracking-widest">{connectionMode} LINK</span>
-               {temp && <span className="text-[9px] font-bold px-2 py-0.5 rounded bg-orange-500/20 text-orange-400">{temp.toFixed(1)}°C</span>}
-            </div>
+            <h1 className="text-2xl font-black tracking-tight uppercase">QualiControl <span className="text-blue-500">v1.0</span></h1>
+            <p className="text-xs font-bold text-slate-500 tracking-widest uppercase">Sistema de Espectroscopia Base</p>
           </div>
         </div>
 
-        <div className="flex gap-3">
-          {status !== 'ready' ? (
-            <div className="flex gap-2">
-              <select 
-                value={connectionMode} 
-                onChange={(e) => setConnectionMode(e.target.value as 'USB' | 'BLE')}
-                className="bg-slate-800 border-none rounded-xl text-xs font-bold px-3 focus:ring-0"
-              >
-                <option value="USB">MODO USB</option>
-                <option value="BLE">MODO BLE</option>
-              </select>
-              <button onClick={connectDevice} disabled={isProcessing} className="px-6 py-2 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 rounded-xl font-bold text-sm transition-all flex items-center gap-2">
-                <RefreshCw className={isProcessing ? 'animate-spin' : ''} size={16} />
-                {isProcessing ? 'CONECTANDO...' : 'CONECTAR'}
-              </button>
-            </div>
+        <div className="flex items-center gap-4">
+          <div className="flex items-center bg-slate-800 px-4 py-2 rounded-xl border border-slate-700">
+            <input type="checkbox" id="sim" checked={isSim} onChange={e => setIsSim(e.target.checked)} className="w-4 h-4 accent-blue-500 cursor-pointer" />
+            <label htmlFor="sim" className="ml-2 text-[10px] font-black uppercase text-slate-400">Simulación</label>
+          </div>
+          
+          {status === 'off' ? (
+            <button onClick={handleConnect} disabled={status === 'busy'} className="bg-blue-600 hover:bg-blue-500 px-6 py-3 rounded-xl font-bold flex items-center gap-2 transition-all active:scale-95 shadow-lg shadow-blue-900/20">
+              <Cpu size={18} /> CONECTAR
+            </button>
           ) : (
             <div className="flex gap-2">
-                <button 
-                  onClick={() => takeCalibration('dark')} 
-                  disabled={isProcessing} 
-                  className="px-4 py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-30 rounded-xl text-xs font-bold border border-white/5 transition-all"
-                >
-                  CALIBRAR DARK
-                </button>
-                <button 
-                  onClick={() => takeCalibration('reference')} 
-                  disabled={isProcessing} 
-                  className="px-4 py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-30 rounded-xl text-xs font-bold border border-white/5 transition-all"
-                >
-                  CALIBRAR WHITE
-                </button>
-                <button 
-                  onClick={runAnalysis} 
-                  disabled={isProcessing || !calibration.dark || !calibration.reference} 
-                  className="px-6 py-2 bg-teal-600 hover:bg-teal-500 disabled:bg-slate-800 disabled:text-slate-600 rounded-xl text-xs font-black shadow-lg shadow-teal-900/20 flex items-center gap-2 transition-all"
-                >
-                   <Zap size={14} /> ANALIZAR MUESTRA
-                </button>
+              <button onClick={() => runCalibration('dark')} disabled={status === 'busy'} className={`px-4 py-3 rounded-xl font-bold text-xs uppercase border ${calib.dark ? 'bg-emerald-900/30 border-emerald-500 text-emerald-400' : 'bg-slate-800 border-slate-700'}`}>DARK</button>
+              <button onClick={() => runCalibration('white')} disabled={status === 'busy' || !calib.dark} className={`px-4 py-3 rounded-xl font-bold text-xs uppercase border ${calib.reference ? 'bg-emerald-900/30 border-emerald-500 text-emerald-400' : 'bg-slate-800 border-slate-700'}`}>WHITE</button>
+              <button onClick={handleScan} disabled={status === 'busy' || !calib.reference} className="bg-indigo-600 hover:bg-indigo-500 px-6 py-3 rounded-xl font-bold flex items-center gap-2 shadow-lg shadow-indigo-900/20">
+                <Zap size={18} /> ESCANEAR
+              </button>
             </div>
           )}
         </div>
       </header>
 
-      <main className="grid grid-cols-1 lg:grid-cols-12 gap-4 flex-1 overflow-hidden">
-        <div className="lg:col-span-8 flex flex-col gap-4 overflow-hidden">
-          <div className="flex-1 bg-slate-900/20 rounded-[2rem] border border-white/5 p-6 min-h-[400px] flex flex-col">
-            <div className="flex justify-between items-center mb-6">
-               <h2 className="text-[10px] font-black text-slate-500 uppercase tracking-widest flex items-center gap-2">
-                 <Activity size={14} className="text-teal-500" /> Espectro de Absorbancia (NIR)
-               </h2>
-            </div>
-            <div className="flex-1 w-full">
-              <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={spectralData}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} />
-                  <XAxis dataKey="nm" stroke="#475569" fontSize={10} />
-                  <YAxis stroke="#475569" fontSize={10} />
-                  <Tooltip contentStyle={{ backgroundColor: '#0f172a', border: '1px solid #1e293b', fontSize: '10px' }} />
-                  <Line type="monotone" dataKey="absorbance" stroke="#2dd4bf" strokeWidth={3} dot={false} animationDuration={300} />
-                </LineChart>
-              </ResponsiveContainer>
-            </div>
+      {/* CONTENIDO PRINCIPAL */}
+      <main className="grid grid-cols-1 lg:grid-cols-12 gap-6 flex-1">
+        
+        {/* LADO IZQUIERDO: Gráfico y Resultados */}
+        <div className="lg:col-span-8 flex flex-col gap-6">
+          {/* Tarjetas de Resultados */}
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <ResultCard title="Humedad" value={prediction ? `${prediction.moisture.toFixed(2)}%` : '--.--%'} icon={<Droplet className="text-blue-400"/>} color="blue" />
+            <ResultCard title="Proteína" value={prediction ? `${prediction.protein.toFixed(2)}%` : '--.--%'} icon={<Activity className="text-purple-400"/>} color="purple" />
+            <ResultCard title="Grasa" value={prediction ? `${prediction.fat.toFixed(2)}%` : '--.--%'} icon={<Layers className="text-amber-400"/>} color="amber" />
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-            <div className="bg-slate-900/40 p-6 rounded-3xl border border-white/5 flex flex-col items-center justify-center text-center">
-               <span className="text-[9px] font-black text-slate-500 uppercase mb-2">Predicción Final</span>
-               <div className="text-4xl font-black text-white">
-                  {prediction !== null ? `${prediction.toFixed(2)}%` : '--.--'}
-               </div>
-               <span className="text-[8px] text-teal-500 font-bold mt-2 uppercase">{CDM_MODEL.name}</span>
-            </div>
-            
-            <div className="md:col-span-2 bg-gradient-to-br from-blue-600/10 to-transparent p-6 rounded-3xl border border-blue-500/20 relative overflow-hidden">
-               <BrainCircuit className="absolute -right-4 -bottom-4 text-blue-500/10" size={100} />
-               <h3 className="text-[10px] font-black text-blue-400 uppercase tracking-widest mb-3 flex items-center gap-2">
-                 <ShieldCheck size={14} /> Diagnóstico Gemini AI
-               </h3>
-               <p className="text-sm text-slate-300 leading-relaxed italic">
-                 {aiReport || "Listo para análisis."}
-               </p>
-            </div>
+          {/* Gráfico */}
+          <div className="flex-1 bg-slate-900 p-8 rounded-[2.5rem] border border-slate-800 shadow-inner relative min-h-[400px]">
+            <h3 className="absolute top-6 left-8 text-xs font-black text-slate-500 uppercase tracking-widest">Espectro de Absorbancia (nm)</h3>
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={chartData}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} />
+                <XAxis dataKey="nm" stroke="#475569" fontSize={10} tickMargin={10} domain={[900, 1700]} />
+                <YAxis stroke="#475569" fontSize={10} tickMargin={10} />
+                <Tooltip contentStyle={{ backgroundColor: '#0f172a', border: 'none', borderRadius: '12px' }} />
+                <ReferenceLine x={1200} stroke="#f59e0b" strokeDasharray="3 3" label={{ position: 'top', value: 'Grasa', fill: '#f59e0b', fontSize: 10 }} />
+                <ReferenceLine x={1450} stroke="#3b82f6" strokeDasharray="3 3" label={{ position: 'top', value: 'Agua', fill: '#3b82f6', fontSize: 10 }} />
+                <Line type="monotone" dataKey="absorbance" stroke="#3b82f6" strokeWidth={3} dot={false} animationDuration={400} />
+              </LineChart>
+            </ResponsiveContainer>
           </div>
         </div>
 
-        <div className="lg:col-span-4 flex flex-col gap-4 overflow-hidden">
-          <div className="bg-slate-900/40 rounded-3xl border border-white/5 p-6">
-            <h3 className="text-[10px] font-black text-slate-500 uppercase tracking-widest mb-4 flex items-center gap-2">
-              <Layers size={14} /> Estado del Sistema
-            </h3>
-            <div className="space-y-3 text-xs">
-               <div className="flex justify-between items-center p-3 bg-white/5 rounded-xl">
-                  <span>Calibración DARK</span>
-                  <div className={`w-2 h-2 rounded-full ${calibration.dark ? 'bg-green-500' : 'bg-red-500'}`} />
-               </div>
-               <div className="flex justify-between items-center p-3 bg-white/5 rounded-xl">
-                  <span>Referencia WHITE</span>
-                  <div className={`w-2 h-2 rounded-full ${calibration.reference ? 'bg-green-500' : 'bg-red-500'}`} />
-               </div>
-            </div>
-            <button onClick={handleAbort} className="w-full mt-4 p-3 rounded-xl border border-red-500/20 bg-red-500/5 text-red-500 text-[10px] font-black hover:bg-red-500/10 transition-all">
-               DESCONECTAR / RESET
-            </button>
+        {/* LADO DERECHO: IA y Logs */}
+        <div className="lg:col-span-4 flex flex-col gap-6">
+          <div className="bg-indigo-900/20 border border-indigo-500/30 p-8 rounded-[2.5rem] shadow-2xl">
+            <h4 className="text-[10px] font-black text-indigo-400 uppercase tracking-[0.2em] mb-4 flex items-center gap-2">
+              <ShieldCheck size={16} /> Diagnóstico Gemini IA
+            </h4>
+            <p className="text-sm text-slate-300 italic leading-relaxed">
+              {aiReport || "Inicie un escaneo para recibir el análisis detallado de la muestra."}
+            </p>
           </div>
 
-          <div className="flex-1 bg-black/40 rounded-3xl border border-white/5 flex flex-col overflow-hidden">
-            <div className="p-4 border-b border-white/5 bg-white/5 flex items-center justify-between uppercase text-[9px] font-black text-slate-500">
-               <span className="flex items-center gap-2"><Terminal size={12} /> Log de Eventos</span>
+          <div className="flex-1 bg-black/40 rounded-[2.5rem] border border-slate-800 flex flex-col overflow-hidden">
+            <div className="p-4 bg-slate-900/50 border-b border-slate-800 flex items-center gap-2 text-[10px] font-black text-slate-500 uppercase">
+              <Terminal size={12} /> Terminal de Sistema
             </div>
-            <div className="flex-1 overflow-y-auto p-4 font-mono text-[10px] space-y-1">
-               {logs.map((log, i) => (
-                  <div key={i} className={`p-1 ${log.includes('ERROR') ? 'text-red-400' : 'text-slate-500'}`}>
-                    {log}
-                  </div>
-               ))}
-               <div ref={logsEndRef} />
+            <div className="flex-1 overflow-y-auto p-6 font-mono text-[10px] space-y-2 text-slate-400">
+              {logs.map((msg, i) => (
+                <div key={i} className={msg.includes('ERROR') ? 'text-red-400' : msg.includes('OK') ? 'text-emerald-400' : ''}>{msg}</div>
+              ))}
+              {logs.length === 0 && <div className="opacity-20 italic">Listo para conexión...</div>}
             </div>
           </div>
         </div>
       </main>
+    </div>
+  );
+}
+
+function ResultCard({ title, value, icon, color }: any) {
+  const themes: any = {
+    blue: "bg-blue-500/5 border-blue-500/20",
+    purple: "bg-purple-500/5 border-purple-500/20",
+    amber: "bg-amber-500/5 border-amber-500/20"
+  };
+  return (
+    <div className={`p-6 rounded-3xl border ${themes[color]} flex items-center justify-between`}>
+      <div>
+        <span className="text-[10px] font-black uppercase text-slate-500 tracking-widest">{title}</span>
+        <div className="text-3xl font-black mt-1">{value}</div>
+      </div>
+      <div className="p-3 bg-slate-950/50 rounded-2xl">{icon}</div>
     </div>
   );
 }
